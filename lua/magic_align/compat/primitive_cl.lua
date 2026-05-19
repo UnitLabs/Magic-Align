@@ -9,6 +9,8 @@ local isangle = M.IsAngleLike
 local toVector = M.ToVector
 local toAngle = M.ToAngle
 
+local APPEARANCE_SYNC_INTERVAL = 0.15
+
 M.Compat = Compat
 
 hook.Remove("PostDrawTranslucentRenderables", "MagicAlignPrimitiveCompatGhosts")
@@ -23,6 +25,78 @@ end
 local function cloneAng(a)
     if not isangle(a) then return end
     return M.CopyAnglePrecise(a)
+end
+
+local function setVec(dst, src)
+    if not isvector(src) then return end
+    if not isvector(dst) then
+        return cloneVec(src)
+    end
+
+    dst.x = src.x
+    dst.y = src.y
+    dst.z = src.z
+
+    return dst
+end
+
+local function setAng(dst, src)
+    if not isangle(src) then return end
+    if not isangle(dst) then
+        return cloneAng(src)
+    end
+
+    dst.p = src.p
+    dst.y = src.y
+    dst.r = src.r
+
+    return dst
+end
+
+local function angleApprox(a, b, eps)
+    if not isangle(a) or not isangle(b) then return false end
+
+    eps = tonumber(eps) or M.UI_COMPARE_EPSILON
+    return math.abs(math.AngleDifference(a.p, b.p)) <= eps
+        and math.abs(math.AngleDifference(a.y, b.y)) <= eps
+        and math.abs(math.AngleDifference(a.r, b.r)) <= eps
+end
+
+local function vectorApprox(a, b, eps)
+    if isfunction(M.VectorApprox) then
+        return M.VectorApprox(a, b, eps)
+    end
+
+    if not isvector(a) or not isvector(b) then return false end
+
+    eps = tonumber(eps) or M.UI_COMPARE_EPSILON or 0.0001
+    return math.abs(a.x - b.x) <= eps
+        and math.abs(a.y - b.y) <= eps
+        and math.abs(a.z - b.z) <= eps
+end
+
+local function invalidateGhostSyncCache(ghost)
+    if not IsValid(ghost) then return end
+
+    ghost._magicAlignPos = nil
+    ghost._magicAlignAng = nil
+    ghost._magicAlignSkin = nil
+    ghost._magicAlignMaterial = nil
+    ghost._magicAlignCollisionGroup = nil
+    ghost._magicAlignModelScale = nil
+    ghost._magicAlignRenderFX = nil
+    ghost._magicAlignBodygroups = nil
+    ghost._magicAlignSubMaterials = nil
+    ghost._magicAlignSubMaterialCount = nil
+    ghost._magicAlignColorR = nil
+    ghost._magicAlignColorG = nil
+    ghost._magicAlignColorB = nil
+    ghost._magicAlignColorA = nil
+    ghost._magicAlignRenderMode = nil
+
+    local materials = isfunction(ghost.GetMaterials) and ghost:GetMaterials() or nil
+    ghost._magicAlignSubMaterialSlots = materials and #materials or 0
+    ghost._magicAlignNeedsBoneSetup = true
 end
 
 local function cloneValue(value)
@@ -76,6 +150,7 @@ local function removeGhostEntity(entry)
 
     entry.ghost = nil
     entry.revision = nil
+    entry.nextAppearanceSync = nil
     entry.failed = nil
 end
 
@@ -160,9 +235,13 @@ local function ensureGhostEntity(entry)
         ghost:Activate()
     end
 
+    local materials = ghost:GetMaterials()
+    ghost._magicAlignSubMaterialSlots = materials and #materials or 0
+    ghost._magicAlignNeedsBoneSetup = true
     entry.ghost = ghost
     entry.failed = nil
     entry.revision = nil
+    entry.nextAppearanceSync = 0
 
     return ghost
 end
@@ -173,63 +252,137 @@ local function syncGhostEntity(entry)
     if not IsValid(src) or not IsValid(ghost) then return false end
     if not isvector(entry.pos) or not isangle(entry.ang) then return false end
 
-    local revision = primitiveRevision(src)
-    if entry.revision ~= revision then
-        if isfunction(src.PrimitiveGetKeys) then
-            local keys = src:PrimitiveGetKeys()
-            if istable(keys) then
-                for name, value in pairs(keys) do
-                    local setter = ghost["Set" .. name]
-                    if isfunction(setter) then
-                        setter(ghost, cloneValue(value))
+    local needsBoneSetup = ghost._magicAlignNeedsBoneSetup == true
+    local now = RealTime()
+
+    if entry.revision == nil or (entry.nextAppearanceSync or 0) <= now then
+        local revision = primitiveRevision(src)
+        if entry.revision ~= revision then
+            if isfunction(src.PrimitiveGetKeys) then
+                local keys = src:PrimitiveGetKeys()
+                if istable(keys) then
+                    for name, value in pairs(keys) do
+                        local setter = ghost["Set" .. name]
+                        if isfunction(setter) then
+                            setter(ghost, cloneValue(value))
+                        end
                     end
                 end
             end
+
+            if isfunction(ghost.PrimitiveReconstruct) then
+                ghost:PrimitiveReconstruct()
+                invalidateGhostSyncCache(ghost)
+            end
+
+            entry.revision = revision
+            needsBoneSetup = true
         end
 
-        if isfunction(ghost.PrimitiveReconstruct) then
-            ghost:PrimitiveReconstruct()
+        local model = src:GetModel()
+        if isstring(model) and model ~= "" and isfunction(ghost.SetModel) and ghost:GetModel() ~= model then
+            ghost:SetModel(model)
+            invalidateGhostSyncCache(ghost)
+            needsBoneSetup = true
         end
 
-        entry.revision = revision
+        local skin = src:GetSkin() or 0
+        if ghost._magicAlignSkin ~= skin then
+            ghost:SetSkin(skin)
+            ghost._magicAlignSkin = skin
+            needsBoneSetup = true
+        end
+
+        local material = src:GetMaterial() or ""
+        if ghost._magicAlignMaterial ~= material then
+            ghost:SetMaterial(material)
+            ghost._magicAlignMaterial = material
+        end
+
+        local collisionGroup = src:GetCollisionGroup()
+        if ghost._magicAlignCollisionGroup ~= collisionGroup then
+            ghost:SetCollisionGroup(collisionGroup)
+            ghost._magicAlignCollisionGroup = collisionGroup
+        end
+
+        local modelScale = math.max(tonumber(src:GetModelScale() or 1) or 1, M.MODEL_SCALE_EPSILON)
+        if ghost._magicAlignModelScale ~= modelScale then
+            ghost:SetModelScale(modelScale, 0)
+            ghost._magicAlignModelScale = modelScale
+            needsBoneSetup = true
+        end
+
+        if isfunction(src.GetRenderFX) and isfunction(ghost.SetRenderFX) then
+            local renderFX = src:GetRenderFX()
+            if ghost._magicAlignRenderFX ~= renderFX then
+                ghost:SetRenderFX(renderFX)
+                ghost._magicAlignRenderFX = renderFX
+            end
+        end
+
+        local bodygroups = ghost._magicAlignBodygroups or {}
+        ghost._magicAlignBodygroups = bodygroups
+        for i = 0, src:GetNumBodyGroups() - 1 do
+            local bodygroup = src:GetBodygroup(i)
+            if bodygroups[i] ~= bodygroup then
+                ghost:SetBodygroup(i, bodygroup)
+                bodygroups[i] = bodygroup
+                needsBoneSetup = true
+            end
+        end
+
+        local subMaterials = ghost._magicAlignSubMaterials or {}
+        ghost._magicAlignSubMaterials = subMaterials
+        local srcMaterials = src:GetMaterials()
+        local subCount = math.max(
+            srcMaterials and #srcMaterials or 0,
+            ghost._magicAlignSubMaterialSlots or 0,
+            ghost._magicAlignSubMaterialCount or 0
+        )
+        for i = 0, subCount - 1 do
+            local subMaterial = src:GetSubMaterial(i) or ""
+            if subMaterials[i] ~= subMaterial then
+                ghost:SetSubMaterial(i, subMaterial)
+                subMaterials[i] = subMaterial
+                needsBoneSetup = true
+            end
+        end
+        ghost._magicAlignSubMaterialCount = subCount
+
+        entry.nextAppearanceSync = now + APPEARANCE_SYNC_INTERVAL
     end
 
-    local srcColor = src:GetColor()
-    local color = entry.color or Color(srcColor.r, srcColor.g, srcColor.b, 120)
-    local model = src:GetModel()
-
-    if isstring(model) and model ~= "" and isfunction(ghost.SetModel) and ghost:GetModel() ~= model then
-        ghost:SetModel(model)
+    if not isvector(ghost._magicAlignPos) or not vectorApprox(ghost._magicAlignPos, entry.pos) then
+        ghost:SetPos(toVector(entry.pos))
+        ghost._magicAlignPos = setVec(ghost._magicAlignPos, entry.pos)
     end
 
-    ghost:SetPos(toVector(entry.pos))
-    ghost:SetAngles(toAngle(entry.ang))
-    ghost:SetSkin(src:GetSkin() or 0)
-    ghost:SetMaterial(src:GetMaterial() or "")
-    ghost:SetColor(color)
-    ghost:SetRenderMode(previewRenderMode(src, color.a or 255))
-    ghost:SetCollisionGroup(src:GetCollisionGroup())
-    ghost:SetModelScale(math.max(tonumber(src:GetModelScale() or 1) or 1, M.MODEL_SCALE_EPSILON), 0)
-
-    if isfunction(src.GetRenderFX) and isfunction(ghost.SetRenderFX) then
-        ghost:SetRenderFX(src:GetRenderFX())
+    if not angleApprox(ghost._magicAlignAng, entry.ang) then
+        ghost:SetAngles(toAngle(entry.ang))
+        ghost._magicAlignAng = setAng(ghost._magicAlignAng, entry.ang)
     end
 
-    for i = 0, src:GetNumBodyGroups() - 1 do
-        ghost:SetBodygroup(i, src:GetBodygroup(i))
+    local color = entry.color
+    if color and (ghost._magicAlignColorR ~= color.r
+        or ghost._magicAlignColorG ~= color.g
+        or ghost._magicAlignColorB ~= color.b
+        or ghost._magicAlignColorA ~= color.a) then
+        ghost:SetColor(color)
+        ghost._magicAlignColorR = color.r
+        ghost._magicAlignColorG = color.g
+        ghost._magicAlignColorB = color.b
+        ghost._magicAlignColorA = color.a
     end
 
-    local subCount = math.max(
-        src:GetMaterials() and #src:GetMaterials() or 0,
-        ghost:GetMaterials() and #ghost:GetMaterials() or 0
-    )
-
-    for i = 0, subCount - 1 do
-        ghost:SetSubMaterial(i, src:GetSubMaterial(i) or "")
+    local renderMode = previewRenderMode(src, color and color.a or 255)
+    if ghost._magicAlignRenderMode ~= renderMode then
+        ghost:SetRenderMode(renderMode)
+        ghost._magicAlignRenderMode = renderMode
     end
 
-    if isfunction(ghost.SetupBones) then
+    if needsBoneSetup and isfunction(ghost.SetupBones) then
         ghost:SetupBones()
+        ghost._magicAlignNeedsBoneSetup = false
     end
 
     ghost:SetNoDraw(false)
@@ -247,13 +400,6 @@ local function refreshGhostEntry(entry)
 
     ghost:SetNoDraw(true)
     return false
-end
-
-local function hideGhostEntry(entry)
-    if not istable(entry) then return end
-    if IsValid(entry.ghost) then
-        entry.ghost:SetNoDraw(true)
-    end
 end
 
 function Compat.ClearGhost(state, ent)
@@ -299,9 +445,13 @@ function Compat.SetGhost(state, ent, pos, ang, alphaFn, linked)
     local alpha = isfunction(alphaFn) and alphaFn(srcColor.a) or tonumber(alphaFn) or 120
 
     entry.ent = ent
-    entry.pos = cloneVec(pos)
-    entry.ang = cloneAng(ang)
-    entry.color = Color(srcColor.r, srcColor.g, srcColor.b, math.Clamp(alpha, 0, 255))
+    entry.pos = setVec(entry.pos, pos)
+    entry.ang = setAng(entry.ang, ang)
+    entry.color = entry.color or Color(255, 255, 255, 255)
+    entry.color.r = srcColor.r
+    entry.color.g = srcColor.g
+    entry.color.b = srcColor.b
+    entry.color.a = math.Clamp(alpha, 0, 255)
     entry.failed = nil
 
     if linked then
@@ -314,37 +464,6 @@ function Compat.SetGhost(state, ent, pos, ang, alphaFn, linked)
 
     return true
 end
-
-hook.Add("Think", "MagicAlignPrimitiveCompatGhostsThink", function()
-    local state = M.ClientState
-    if not istable(state) then return end
-
-    local ghosts = state.compatGhosts
-    if not istable(ghosts) then return end
-
-    local ply = LocalPlayer()
-    if not (IsValid(ply) and M.GetActiveMagicAlignTool and M.GetActiveMagicAlignTool(ply)) then
-        hideGhostEntry(ghosts.main)
-
-        for _, entry in pairs(ghosts.linked or {}) do
-            hideGhostEntry(entry)
-        end
-
-        return
-    end
-
-    if ghosts.main and not refreshGhostEntry(ghosts.main) then
-        removeGhostEntity(ghosts.main)
-        ghosts.main = nil
-    end
-
-    for ent, entry in pairs(ghosts.linked or {}) do
-        if not refreshGhostEntry(entry) then
-            removeGhostEntity(entry)
-            ghosts.linked[ent] = nil
-        end
-    end
-end)
 
 if istable(M.ClientState) then
     Compat.ClearGhosts(M.ClientState)

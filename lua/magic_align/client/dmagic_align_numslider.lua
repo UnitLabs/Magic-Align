@@ -51,11 +51,30 @@ local function cloneColor(color, alpha)
     return Color(color.r or 255, color.g or 255, color.b or 255, alpha or color.a or 255)
 end
 
-local function getEditorPalette()
+local function accentShade(color, offset, alpha)
+    color = color or color_white
+    return Color(
+        math.Clamp((color.r or 255) + offset, 0, 255),
+        math.Clamp((color.g or 255) + offset, 0, 255),
+        math.Clamp((color.b or 255) + offset, 0, 255),
+        alpha or color.a or 255
+    )
+end
+
+local function sliderAccentColors(panel)
+    local accent = panel and panel.MagicAlignAccentColor or nil
+    if not istable(accent) then
+        return theme.track, theme.knob, theme.knobHover, theme.knobBorder
+    end
+
+    return cloneColor(accent, 150), cloneColor(accent, 245), accentShade(accent, 24, 255), accentShade(accent, -96, 255)
+end
+
+local function getEditorPalette(panel)
     local client = M.Client or {}
     local menuColors = client.menuColors or {}
     local colors = client.colors or {}
-    local accentSource = colors.preview or menuColors.tabActiveLine or theme.inputBorder
+    local accentSource = panel and panel.MagicAlignAccentColor or colors.preview or menuColors.tabActiveLine or theme.inputBorder
 
     return {
         bg = cloneColor(menuColors.panelSoft or Color(243, 243, 243)),
@@ -562,14 +581,16 @@ function PANEL:Init()
     end
     self.Slider.Paint = function(_, w, h)
         local y = math.floor(h * 0.5) - 2
-        draw.RoundedBox(4, 0, y, w, 4, self:IsFormulaLocked() and theme.trackDisabled or theme.track)
+        local trackColor = sliderAccentColors(self)
+        draw.RoundedBox(4, 0, y, w, 4, self:IsFormulaLocked() and theme.trackDisabled or trackColor)
     end
 
     if IsValid(self.Slider.Knob) then
         self.Slider.Knob.Paint = function(knob, w, h)
             local locked = self:IsFormulaLocked()
-            local fill = locked and theme.knobDisabled or (knob:IsHovered() and theme.knobHover or theme.knob)
-            local border = locked and theme.knobBorderDisabled or theme.knobBorder
+            local _, knobColor, knobHoverColor, knobBorderColor = sliderAccentColors(self)
+            local fill = locked and theme.knobDisabled or (knob:IsHovered() and knobHoverColor or knobColor)
+            local border = locked and theme.knobBorderDisabled or knobBorderColor
             draw.RoundedBox(5, 0, 0, w, h, fill)
             surface.SetDrawColor(border)
             surface.DrawOutlinedRect(0, 0, w, h, 1)
@@ -1874,7 +1895,7 @@ function PANEL:PollTextAreaDoubleClick()
 end
 
 function PANEL:PaintTextEntry(textarea, w, h)
-    local palette = getEditorPalette()
+    local palette = getEditorPalette(self)
     local background = theme.input
     local border = palette.inputBorder
     local textColor = textarea:GetTextColor() or palette.text
@@ -2175,6 +2196,14 @@ end
 function PANEL:BackgroundFormulaThink()
     self:EnsureRuntimeState()
     self:ReevaluateFormula()
+end
+
+function PANEL:SetAccentColor(color)
+    self.MagicAlignAccentColor = istable(color) and cloneColor(color, color.a or 255) or nil
+
+    if IsValid(self.Slider) then
+        self.Slider:InvalidateLayout(true)
+    end
 end
 
 function PANEL:SetMinMax(min, max)

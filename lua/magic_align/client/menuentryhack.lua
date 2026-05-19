@@ -14,9 +14,19 @@ local ENABLE_CVAR = "magic_align_highlight_context_menu"
 local SCAN_ID = "MagicAlignMenuEntryLetterOverlay"
 local TOGGLE_CALLBACK_ID = SCAN_ID .. "Toggle"
 local OVERLAY_VERSION = 5
+local colors = client.colors or {}
+
+local function solidColor(color, fallback, alpha)
+    color = color or fallback
+    return Color(color.r, color.g, color.b, alpha or color.a or 255)
+end
+
+local sourceAccent = solidColor(colors.source, Color(255, 190, 80))
+local targetAccent = solidColor(colors.target, Color(80, 220, 255))
+
 local LETTERS = {
-    { prefix = "", letter = "M", color = Color(240, 167, 68), disabled = Color(240, 167, 68, 120) },
-    { prefix = "Magic ", letter = "A", color = Color(82, 158, 238), disabled = Color(82, 158, 238, 120) }
+    { prefix = "", letter = "M", color = sourceAccent, disabled = solidColor(sourceAccent, nil, 120) },
+    { prefix = "Magic ", letter = "A", color = targetAccent, disabled = solidColor(targetAccent, nil, 120) }
 }
 
 local function resolvedText(value)

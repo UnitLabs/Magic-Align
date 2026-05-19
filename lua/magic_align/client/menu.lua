@@ -153,6 +153,8 @@ local persistedMenuConVars = {
     "magic_align_grid_label_percent",
     "magic_align_grid_label_reduce_fraction",
     "magic_align_grid_alpha",
+    "magic_align_world_bsp_snap",
+    "magic_align_world_bsp_budget_ms",
     "magic_align_display_rounding",
     "magic_align_preview_occluded",
     "magic_align_preview_occluded_r",
@@ -413,6 +415,26 @@ local menuColors = {
 
 client.menuColors = menuColors
 client.updateSessionTabTitles = updateSessionTabTitles
+
+local function solidColor(color, fallback)
+    color = color or fallback
+    return Color(color.r, color.g, color.b, 255)
+end
+
+local clientColors = client.colors or {}
+local menuAccentColors = {
+    source = solidColor(clientColors.source, Color(255, 190, 80)),
+    target = solidColor(clientColors.target, Color(80, 220, 255)),
+    axis = solidColor(clientColors.axis, Color(92, 220, 148)),
+    world = Color(128, 134, 144)
+}
+
+local spaceTabAccent = {
+    prop1 = menuAccentColors.source,
+    prop2 = menuAccentColors.target,
+    points = menuAccentColors.axis,
+    world = menuAccentColors.world
+}
 
 local function wrapLabelText(text, font, maxWidth)
     text = tostring(text or "")
@@ -930,7 +952,7 @@ local function stylePropertyTab(tabButton)
         surface.DrawOutlinedRect(0, 0, w, h - 1, 1)
 
         if self:IsActive() then
-            surface.SetDrawColor(menuColors.tabActiveLine)
+            surface.SetDrawColor(spaceTabAccent[self.MagicAlignSpace] or menuColors.tabActiveLine)
             surface.DrawRect(1, h - 3, w - 2, 3)
         end
     end
@@ -1297,6 +1319,9 @@ local function createAnchorPercentSlider(parent, label, convar, accent)
     slider:SetInputSnap("label", nil)
     slider:SetInputDecimals("text", nil)
     slider:SetInputSnap("text", nil)
+    if isfunction(slider.SetAccentColor) then
+        slider:SetAccentColor(accent)
+    end
     slider.NormalizeValue = function(self, value, source)
         local normalized = isfunction(baseNormalizeValue) and baseNormalizeValue(self, value, source) or tonumber(value) or 0
         if source == "text" then
@@ -1687,7 +1712,7 @@ local function createAnchorBoard(parent)
         side = "from",
         anchorConVar = "magic_align_from_anchor",
         priorityConVar = "magic_align_from_priority",
-        accent = Color(240, 167, 68)
+        accent = menuAccentColors.source
     })
 
     local toColumn = createAnchorColumn(board, {
@@ -1695,7 +1720,7 @@ local function createAnchorBoard(parent)
         side = "to",
         anchorConVar = "magic_align_to_anchor",
         priorityConVar = "magic_align_to_priority",
-        accent = Color(82, 158, 238)
+        accent = menuAccentColors.target
     })
 
     board.PerformLayout = function(self, w, h)
@@ -1718,13 +1743,13 @@ local function createInterpolationBoard(parent)
     local fromColumn = createInterpolationColumn(board, {
         title = "Move From",
         side = "from",
-        accent = Color(240, 167, 68)
+        accent = menuAccentColors.source
     })
 
     local toColumn = createInterpolationColumn(board, {
         title = "Move To",
         side = "to",
-        accent = Color(82, 158, 238)
+        accent = menuAccentColors.target
     })
 
     board.PerformLayout = function(self, w, h)
@@ -1800,6 +1825,9 @@ function TOOL.BuildCPanel(panel)
             slider:SetInputSnap("label", 0.001)
             slider:SetInputDecimals("text", nil)
             slider:SetInputSnap("text", nil)
+            if isfunction(slider.SetAccentColor) then
+                slider:SetAccentColor(spaceTabAccent[space])
+            end
             stylePanelSlider(slider, {
                 labelWide = 46,
                 textWide = 56,
@@ -1844,6 +1872,7 @@ function TOOL.BuildCPanel(panel)
         end
 
         local tab = sheet:AddSheet(spaceLabels[space] or space, holder)
+        tab.Tab.MagicAlignSpace = space
         stylePropertyTab(tab.Tab)
 
         M.ClientTabs[space] = tab.Tab
@@ -2082,6 +2111,7 @@ function TOOL.BuildCPanel(panel)
     addStyledSlider(gridCategoryContent, "Grid B Min", "magic_align_grid_b_min", 2, 24, 0, { labelWide = 72, textWide = 56, tall = 30 })
     addStyledSlider(gridCategoryContent, "Min Len", "magic_align_min_length", 0, 12, 0, { labelWide = 72, textWide = 56, tall = 30 })
     addStyledSlider(gridCategoryContent, "Grid Alpha", "magic_align_grid_alpha", 0, 255, 0, { labelWide = 72, textWide = 56, tall = 30 })
+    addStyledCheckBox(gridCategoryContent, "World BSP Surface Snap", "magic_align_world_bsp_snap")
     gridCategoryContent:AddItem(createInlineCheckBoxRow(gridCategoryContent, {
         { label = "Grid Labels as Percent", convar = "magic_align_grid_label_percent" },
         { label = "Reduce Fractions", convar = "magic_align_grid_label_reduce_fraction" }
@@ -2174,6 +2204,21 @@ function TOOL.BuildCPanel(panel)
 
     addStyledCheckBox(performanceCategoryContent, "Show Hidden Preview", "magic_align_preview_occluded")
     performanceCategoryContent:AddItem(createPreviewOccludedColorPicker(performanceCategoryContent), 8)
+    addStyledSlider(
+        performanceCategoryContent,
+        "World Caching Budget MS",
+        "magic_align_world_bsp_budget_ms",
+        0.1,
+        8,
+        1,
+        { labelWide = 152, textWide = 56, tall = 30 }
+    )
+    performanceCategoryContent:AddItem(createHelpLabel(
+        performanceCategoryContent,
+        "Coroutine cache budget per frame in milliseconds.",
+        nil,
+        true
+    ), 0)
 
     performanceCategoryContent.Think = function()
         if not ringQualitySlider:IsEditing() then

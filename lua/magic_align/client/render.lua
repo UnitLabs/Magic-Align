@@ -54,7 +54,8 @@ local GRID_CONFIG = {
     alphaSecondary = 64,
     snapLineAlpha = 255,
     snapLabelAlpha = 235,
-    snapLabelInset = 1.6
+    snapLabelInset = 1.6,
+    bspSurfacePush = 0.12
 }
 local TRANSLATION_CONFIG = {
     axisTickCount = 21,
@@ -106,6 +107,8 @@ local stripeTrianglePatternMaterial
 local stripePatternScreenMaterial
 local stripePatternReady = false
 local shapeCache = {}
+local shapeCacheRebuildQueue = {}
+local shapeCacheRebuildScheduled = false
 local shapeMetricCache = {}
 local shapeWhiteMaterial
 local reusableCirclePolyCache = {}
@@ -114,6 +117,11 @@ local reusableRingQuad = {
     { x = 0, y = 0, u = 0, v = 0 },
     { x = 0, y = 0, u = 0, v = 0 },
     { x = 0, y = 0, u = 0, v = 0 }
+}
+local reusableRotationRings = {
+    { key = "roll" },
+    { key = "pitch" },
+    { key = "yaw" }
 }
 local ensureStripePatternMaterial
 
@@ -239,6 +247,7 @@ unitCircle = circlePointsForSegments(RENDER_CONFIG.circleSegments)
 
 local ZERO_VEC = VectorP(0, 0, 0)
 local ZERO_ANG = AngleP(0, 0, 0)
+local BILLBOARD_FALLBACK_VIEW_DIR = VectorP(0, 0, 1)
 
 local function setVec(out, value)
     if not isvector(value) then return end
@@ -300,10 +309,16 @@ local function ringQualityIndex(tool)
     return math.Clamp(math.Round(tonumber(raw) or client.defaultRingQualityIndex), 1, math.max(#client.ringQualityPresets, 1))
 end
 
-local function ringRenderSettingsForTool(tool)
-    return client.ringQualityPresets[ringQualityIndex(tool)]
+local function ringRenderSettingsForIndex(index)
+    index = math.Clamp(math.Round(tonumber(index) or client.defaultRingQualityIndex), 1, math.max(#client.ringQualityPresets, 1))
+
+    return client.ringQualityPresets[index]
         or client.ringQualityPresets[client.defaultRingQualityIndex]
         or client.ringQualityPresets[1]
+end
+
+local function ringRenderSettingsForTool(tool)
+    return ringRenderSettingsForIndex(ringQualityIndex(tool))
 end
 
 local function activeRingRenderSettings()
@@ -555,6 +570,33 @@ local function rebuildShapeCacheEntry(entry)
     entry.ready = true
 end
 
+local function scheduleShapeCacheRebuild()
+    if shapeCacheRebuildScheduled then return end
+
+    shapeCacheRebuildScheduled = true
+    hook.Add("PostRender", SHAPE_CONFIG.rebuildHook, function()
+        shapeCacheRebuildScheduled = false
+
+        for entry in pairs(shapeCacheRebuildQueue) do
+            shapeCacheRebuildQueue[entry] = nil
+            rebuildShapeCacheEntry(entry)
+        end
+
+        if next(shapeCacheRebuildQueue) then
+            scheduleShapeCacheRebuild()
+        else
+            hook.Remove("PostRender", SHAPE_CONFIG.rebuildHook)
+        end
+    end)
+end
+
+local function queueShapeCacheEntryRebuild(entry)
+    if not entry or entry.ready then return end
+
+    shapeCacheRebuildQueue[entry] = true
+    scheduleShapeCacheRebuild()
+end
+
 local function ensureCachedShape(shapeKind, rtSize, innerRatio, segments)
     rtSize = math.max(math.Round(tonumber(rtSize) or 0), 1)
     if rtSize <= 0 then return end
@@ -611,7 +653,8 @@ local function ensureCachedShape(shapeKind, rtSize, innerRatio, segments)
     end
 
     if not entry.ready then
-        rebuildShapeCacheEntry(entry)
+        queueShapeCacheEntryRebuild(entry)
+        return
     end
 
     return entry
@@ -640,17 +683,15 @@ local function ensureCachedCircleSprite(settings, outerRadius, innerRadius, rtSi
     if outerRadius <= 0 then return end
 
     local segments = segmentsOverride or circleSpriteSegments(settings)
-    return {
-        fill = ensureCachedShape("disc", rtSize, nil, segments),
-        outline = ensureCachedShape("ring", rtSize, innerRadius / math.max(outerRadius, 1e-6), segments)
-    }
+    return ensureCachedShape("disc", rtSize, nil, segments),
+        ensureCachedShape("ring", rtSize, innerRadius / math.max(outerRadius, 1e-6), segments)
 end
 
-local function drawCachedCircleSpriteRect2D(outerRadius, spriteCache, color)
-    if not spriteCache or not spriteCache.fill or not spriteCache.outline then return false end
+local function drawCachedCircleSpriteRect2D(outerRadius, fillEntry, outlineEntry, color)
+    if not fillEntry or not outlineEntry then return false end
 
-    drawCachedShapeRect2D(outerRadius, spriteCache.fill, cappedAlpha(color, 220))
-    drawCachedShapeRect2D(outerRadius, spriteCache.outline, cappedAlpha(color, 255))
+    drawCachedShapeRect2D(outerRadius, fillEntry, cappedAlpha(color, 220))
+    drawCachedShapeRect2D(outerRadius, outlineEntry, cappedAlpha(color, 255))
     return true
 end
 
@@ -711,28 +752,25 @@ local function drawCachedShapePlane(origin, axisA, axisB, outerRadius, entry, co
     )
 end
 
-local function queueShapeCacheWarmup(tool)
-    hook.Remove("PostRender", SHAPE_CONFIG.rebuildHook)
-
-    local settings = tool and ringRenderSettingsForTool(tool) or activeRingRenderSettings()
+local function queueShapeCacheWarmup(tool, qualityIndex)
+    local settings = qualityIndex ~= nil and ringRenderSettingsForIndex(qualityIndex)
+        or tool and ringRenderSettingsForTool(tool)
+        or activeRingRenderSettings()
     if not settings or settings.realtime then
         return
     end
 
-    hook.Add("PostRender", SHAPE_CONFIG.rebuildHook, function()
-        local ringSize = ringRtSize(settings)
-        local circleSize = circleSpriteRtSize(settings)
-        local ringSegments = ringRenderSegments(settings)
-        local circleSegments = circleSpriteSegments(settings)
+    local ringSize = ringRtSize(settings)
+    local circleSize = circleSpriteRtSize(settings)
+    local ringSegments = ringRenderSegments(settings)
+    local circleSegments = circleSpriteSegments(settings)
 
-        if ringSize then
-            ensureCachedShape("disc", ringSize, nil, ringSegments)
-        end
-        if circleSize then
-            ensureCachedShape("disc", circleSize, nil, circleSegments)
-        end
-        hook.Remove("PostRender", SHAPE_CONFIG.rebuildHook)
-    end)
+    if ringSize then
+        ensureCachedShape("disc", ringSize, nil, ringSegments)
+    end
+    if circleSize then
+        ensureCachedShape("disc", circleSize, nil, circleSegments)
+    end
 end
 
 local function selectionColor(state)
@@ -1074,7 +1112,7 @@ local function drawRing2DByRadii(outerRadius, innerRadius, color, segments)
     drawRing2DByRadiiAt(0, 0, outerRadius, innerRadius, color, circlePointsForSegments(segments or RENDER_CONFIG.circleSegments))
 end
 
-local function drawBillboard(worldPos, painter, viewerPos)
+local function beginBillboard(worldPos, viewerPos)
     if not isvector(worldPos) then return end
 
     viewerPos = isvector(viewerPos)
@@ -1082,7 +1120,7 @@ local function drawBillboard(worldPos, painter, viewerPos)
         or (IsValid(LocalPlayer()) and LocalPlayer():GetShootPos() or EyePos())
     local toViewer = viewerPos - worldPos
     if toViewer:LengthSqr() < 1e-8 then
-        toViewer = VectorP(0, 0, 1)
+        toViewer = BILLBOARD_FALLBACK_VIEW_DIR
     else
         toViewer:Normalize()
     end
@@ -1097,8 +1135,7 @@ local function drawBillboard(worldPos, painter, viewerPos)
 
     -- Eine einzelne, zum Viewport gedrehte 3D2D-Flaeche reicht hier aus.
     cam.Start3D2D(drawPos, drawAng, RENDER_CONFIG.billboardScale)
-        painter()
-    cam.End3D2D()
+    return true
 end
 
 local function drawCircleSprite(worldPos, radius, color, settings, viewerPos)
@@ -1109,17 +1146,20 @@ local function drawCircleSprite(worldPos, radius, color, settings, viewerPos)
     local circleSegments = circleSpriteSegments(settings)
     local cachedCircleRtSize = circleSpriteRtSize(settings)
 
-    drawBillboard(worldPos, function()
-        if settings and not settings.realtime and cachedCircleRtSize then
-            local spriteCache = ensureCachedCircleSprite(settings, pixelRadius, primaryInnerRadius, cachedCircleRtSize, circleSegments)
-            if drawCachedCircleSpriteRect2D(pixelRadius, spriteCache, color) then
-                return
-            end
-        end
+    if not beginBillboard(worldPos, viewerPos) then return end
 
+    local drewCached = false
+    if settings and not settings.realtime and cachedCircleRtSize then
+        local fillEntry, outlineEntry = ensureCachedCircleSprite(settings, pixelRadius, primaryInnerRadius, cachedCircleRtSize, circleSegments)
+        drewCached = drawCachedCircleSpriteRect2D(pixelRadius, fillEntry, outlineEntry, color) == true
+    end
+
+    if not drewCached then
         drawCircle2D(pixelRadius, cappedAlpha(color, 220), circleSegments)
         drawRing2DByRadii(pixelRadius, primaryInnerRadius, cappedAlpha(color, 255), circleSegments)
-    end, viewerPos)
+    end
+
+    cam.End3D2D()
 end
 
 local function drawRingSprite(worldPos, radius, thickness, color, settings, viewerPos, matchCircleQuality)
@@ -1136,27 +1176,32 @@ local function drawRingSprite(worldPos, radius, thickness, color, settings, view
     local ringSegments = matchCircleQuality and circleSpriteSegments(settings) or ringRenderSegments(settings)
     local cachedRingRtSize = matchCircleQuality and circleSpriteRtSize(settings) or ringRtSize(settings)
 
-    drawBillboard(worldPos, function()
-        if settings and not settings.realtime and cachedRingRtSize then
-            local mainEntry = ensureCachedShape("ring", cachedRingRtSize, mainInnerRadius / math.max(pixelRadius, 1e-6), ringSegments)
-            local accentEntry = accentOuterRadius > 0
-                and ensureCachedShape("ring", cachedRingRtSize, accentInnerRadius / math.max(accentOuterRadius, 1e-6), ringSegments)
-                or nil
+    if not beginBillboard(worldPos, viewerPos) then return end
 
-            if mainEntry and (accentOuterRadius <= 0 or accentEntry) then
-                drawCachedShapeRect2D(pixelRadius, mainEntry, cappedAlpha(color, 255))
-                if accentEntry then
-                    drawCachedShapeRect2D(accentOuterRadius, accentEntry, cappedAlpha(color, 150))
-                end
-                return
+    local drewCached = false
+    if settings and not settings.realtime and cachedRingRtSize then
+        local mainEntry = ensureCachedShape("ring", cachedRingRtSize, mainInnerRadius / math.max(pixelRadius, 1e-6), ringSegments)
+        local accentEntry = accentOuterRadius > 0
+            and ensureCachedShape("ring", cachedRingRtSize, accentInnerRadius / math.max(accentOuterRadius, 1e-6), ringSegments)
+            or nil
+
+        if mainEntry and (accentOuterRadius <= 0 or accentEntry) then
+            drawCachedShapeRect2D(pixelRadius, mainEntry, cappedAlpha(color, 255))
+            if accentEntry then
+                drawCachedShapeRect2D(accentOuterRadius, accentEntry, cappedAlpha(color, 150))
             end
+            drewCached = true
         end
+    end
 
+    if not drewCached then
         drawRing2DByRadii(pixelRadius, mainInnerRadius, cappedAlpha(color, 255), ringSegments)
         if accentOuterRadius > 0 then
             drawRing2DByRadii(accentOuterRadius, accentInnerRadius, cappedAlpha(color, 150), ringSegments)
         end
-    end, viewerPos)
+    end
+
+    cam.End3D2D()
 end
 
 local function normalizeDegrees(angle)
@@ -1195,6 +1240,18 @@ local function isFortyFiveTick(angle)
     return isAngleMultiple(angle, 45)
 end
 
+local function rotationTickDistanceLess(a, b)
+    if math.abs(a.dist - b.dist) <= 1e-4 then
+        return a.angle < b.angle
+    end
+
+    return a.dist < b.dist
+end
+
+local function rotationTickAngleLess(a, b)
+    return a.angle < b.angle
+end
+
 local function visibleRotationTicks(divisions, step, cursorAngle, settings)
     local cachedRotationTicks = shapeMetricCache.rotationTicks
     if not cachedRotationTicks then
@@ -1211,32 +1268,39 @@ local function visibleRotationTicks(divisions, step, cursorAngle, settings)
         return cachedRotationTicks.ticks
     end
 
-    local ticks = {}
+    local ticks = cachedRotationTicks.allTicks or {}
+    cachedRotationTicks.allTicks = ticks
+    local tickCount = 0
     for index = 0, math.max(divisions - 1, 0) do
+        tickCount = tickCount + 1
         local angle = index * step
-        ticks[#ticks + 1] = {
-            angle = angle,
-            dist = math.abs(math.AngleDifference(angle, cursorAngle)),
-            major = isMajorTick(angle)
-        }
-    end
-
-    table.sort(ticks, function(a, b)
-        if math.abs(a.dist - b.dist) <= 1e-4 then
-            return a.angle < b.angle
+        local tick = ticks[tickCount]
+        if not tick then
+            tick = {}
+            ticks[tickCount] = tick
         end
 
-        return a.dist < b.dist
-    end)
-
-    local selected = {}
-    for i = 1, math.min(tickLimit, #ticks) do
-        selected[#selected + 1] = ticks[i]
+        tick.angle = angle
+        tick.dist = math.abs(math.AngleDifference(angle, cursorAngle))
+        tick.major = isMajorTick(angle)
+    end
+    for i = tickCount + 1, #ticks do
+        ticks[i] = nil
     end
 
-    table.sort(selected, function(a, b)
-        return a.angle < b.angle
-    end)
+    table.sort(ticks, rotationTickDistanceLess)
+
+    local selected = cachedRotationTicks.selectedTicks or {}
+    cachedRotationTicks.selectedTicks = selected
+    local selectedCount = math.min(tickLimit, #ticks)
+    for i = 1, selectedCount do
+        selected[i] = ticks[i]
+    end
+    for i = selectedCount + 1, #selected do
+        selected[i] = nil
+    end
+
+    table.sort(selected, rotationTickAngleLess)
 
     cachedRotationTicks.cursorAngle = cursorAngle
     cachedRotationTicks.divisions = divisions
@@ -1414,6 +1478,16 @@ local function faceLineLocalPoints(face, grid, axisKey, value)
 end
 
 local function faceLineWorldPoints(ent, face, grid, axisKey, value)
+    if face and face.worldBSP and isfunction(face.lineWorldPoints) then
+        local a, b = face.lineWorldPoints(face, grid, axisKey, value)
+        if isvector(a) and isvector(b) and isvector(face.normal) then
+            local push = face.normal * GRID_CONFIG.bspSurfacePush
+            return a + push, b + push
+        end
+
+        return a, b
+    end
+
     local a, b = faceLineLocalPoints(face, grid, axisKey, value)
     if not a or not b then return end
     if not IsValid(ent) then return end
@@ -2123,8 +2197,8 @@ if cvars and cvars.AddChangeCallback then
     cvars.RemoveChangeCallback(RENDER_CONFIG.ringQualityCvar, SHAPE_CONFIG.rebuildCallback)
     end
 
-    cvars.AddChangeCallback(RENDER_CONFIG.ringQualityCvar, function()
-        queueShapeCacheWarmup()
+    cvars.AddChangeCallback(RENDER_CONFIG.ringQualityCvar, function(_, _, newValue)
+        queueShapeCacheWarmup(nil, newValue)
     end, SHAPE_CONFIG.rebuildCallback)
 end
 
@@ -2429,8 +2503,15 @@ local function isDrawingPickPress(state)
         or press.kind == "select_target_pick"
 end
 
+local function hasDrawableFace(candidate)
+    if not candidate or not candidate.face then return false end
+    if IsValid(candidate.ent) then return true end
+
+    return M.IsWorldTarget and M.IsWorldTarget(candidate.ent) and candidate.face.worldBSP == true
+end
+
 local function shouldRenderHoverGrid(state, hoverCandidate)
-    if not hoverCandidate or not hoverCandidate.face or not IsValid(hoverCandidate.ent) then return false end
+    if not hasDrawableFace(hoverCandidate) then return false end
 
     local settings = state and state.hover and state.hover.settings
     if isDrawingPickPress(state) then return false end
@@ -2441,7 +2522,7 @@ local function shouldRenderHoverGrid(state, hoverCandidate)
 end
 
 local function shouldRenderHoverFace(state, hoverCandidate)
-    if not hoverCandidate or not hoverCandidate.face or not IsValid(hoverCandidate.ent) then return false end
+    if not hasDrawableFace(hoverCandidate) then return false end
     if isDrawingPickPress(state) then return false end
 
     return true
@@ -2493,6 +2574,18 @@ function hoverRender.drawFaceOutline(state, candidate)
     if not shouldRenderHoverFace(state, candidate) then return end
 
     local face = candidate.face
+    if face.worldBSP and istable(face.worldCorners) then
+        local push = isvector(face.normal) and face.normal * GRID_CONFIG.bspSurfacePush or ZERO_VEC
+        for i = 1, #face.worldCorners do
+            local a = face.worldCorners[i]
+            local b = face.worldCorners[i % #face.worldCorners + 1]
+            if isvector(a) and isvector(b) then
+                drawLine(a + push, b + push, cachedColor(255, 255, 255, 70), true)
+            end
+        end
+        return
+    end
+
     local ent = candidate.ent
     local corners = face.corners
     local entPos = ent:GetPos()
@@ -2587,6 +2680,12 @@ local function reusableEntry(entries, index)
     end
 
     return entry
+end
+
+local function shouldDrawGizmoHandle(activeHandle, kind, key)
+    if not activeHandle then return true end
+
+    return activeHandle.kind == kind and activeHandle.key == key
 end
 
 function TOOL:DrawHUD()
@@ -2772,32 +2871,26 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
             local yHandle = M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisRight, g.size))
             local zHandle = M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisUp, g.size))
 
-            local function shouldDrawHandle(kind, key)
-                if not activeHandle then return true end
-
-                return activeHandle.kind == kind and activeHandle.key == key
-            end
-
-            if shouldDrawHandle("move", "x") then
+            if shouldDrawGizmoHandle(activeHandle, "move", "x") then
                 drawLine(g.origin, M.SubtractVectorsPrecise(xHandle, M.ScaleVectorPrecise(basisForward, axisHandleRadius)), colors.x, true)
                 drawCircleSprite(xHandle, axisHandleRadius, colors.x, spriteSettings, viewerPos)
             end
-            if shouldDrawHandle("move", "y") then
+            if shouldDrawGizmoHandle(activeHandle, "move", "y") then
                 drawLine(g.origin, M.SubtractVectorsPrecise(yHandle, M.ScaleVectorPrecise(basisRight, axisHandleRadius)), colors.y, true)
                 drawCircleSprite(yHandle, axisHandleRadius, colors.y, spriteSettings, viewerPos)
             end
-            if shouldDrawHandle("move", "z") then
+            if shouldDrawGizmoHandle(activeHandle, "move", "z") then
                 drawLine(g.origin, M.SubtractVectorsPrecise(zHandle, M.ScaleVectorPrecise(basisUp, axisHandleRadius)), colors.z, true)
                 drawCircleSprite(zHandle, axisHandleRadius, colors.z, spriteSettings, viewerPos)
             end
 
-            if shouldDrawHandle("plane", "xy") then
+            if shouldDrawGizmoHandle(activeHandle, "plane", "xy") then
                 drawPlaneSquare(M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisForward, g.planeOffset)), M.ScaleVectorPrecise(basisRight, g.planeOffset)), basisForward, basisRight, g.size * 0.11, colors.xy)
             end
-            if shouldDrawHandle("plane", "xz") then
+            if shouldDrawGizmoHandle(activeHandle, "plane", "xz") then
                 drawPlaneSquare(M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisForward, g.planeOffset)), M.ScaleVectorPrecise(basisUp, g.planeOffset)), basisForward, basisUp, g.size * 0.11, colors.xz, nil, true, true)
             end
-            if shouldDrawHandle("plane", "yz") then
+            if shouldDrawGizmoHandle(activeHandle, "plane", "yz") then
                 drawPlaneSquare(M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisRight, g.planeOffset)), M.ScaleVectorPrecise(basisUp, g.planeOffset)), basisRight, basisUp, g.size * 0.11, colors.yz)
             end
 
@@ -2821,18 +2914,21 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
 
             local ringRenderSettings = showRotation and spriteSettings or nil
             if showRotation then
-                local rotationRings = {
-                    { key = "roll", axis = basisForward, a = basisRight, b = basisUp, c = colors.x },
-                    { key = "pitch", axis = basisRight, a = basisForward, b = basisUp, c = colors.y },
-                    { key = "yaw", axis = basisUp, a = basisForward, b = basisRight, c = colors.z }
-                }
+                local rotationRings = reusableRotationRings
+                local rollRing = rotationRings[1]
+                rollRing.axis, rollRing.a, rollRing.b, rollRing.c = basisForward, basisRight, basisUp, colors.x
+                local pitchRing = rotationRings[2]
+                pitchRing.axis, pitchRing.a, pitchRing.b, pitchRing.c = basisRight, basisForward, basisUp, colors.y
+                local yawRing = rotationRings[3]
+                yawRing.axis, yawRing.a, yawRing.b, yawRing.c = basisUp, basisForward, basisRight, colors.z
                 local rotationSnapEnabled = not (input.IsKeyDown(KEY_LSHIFT) or input.IsKeyDown(KEY_RSHIFT))
                 local activeRotationKey = rotationSnapEnabled and g.hover and g.hover.kind == "rot" and g.hover.key or nil
                 local rotationDivisions = client.rotationSnapDivisions(tool)
                 local rotationStep = client.rotationSnapStep(tool) or (360 / math.max(rotationDivisions, 1))
 
-                for _, item in ipairs(rotationRings) do
-                    if shouldDrawHandle("rot", item.key) then
+                for i = 1, #rotationRings do
+                    local item = rotationRings[i]
+                    if shouldDrawGizmoHandle(activeHandle, "rot", item.key) then
                         drawRotationRingBand(g.origin, item.a, item.b, g.ringRadius, g.ringPadding, item.c, nil, ringRenderSettings)
 
                         if press and press.kind == "gizmo"
@@ -2881,7 +2977,7 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
                 end
             end
 
-            if g.hover and shouldDrawHandle(g.hover.kind, g.hover.key) then
+            if g.hover and shouldDrawGizmoHandle(activeHandle, g.hover.kind, g.hover.key) then
                 if g.hover.kind == "move" then
                     local axisDir = g.hover.key == "x" and basisForward
                         or g.hover.key == "y" and basisRight

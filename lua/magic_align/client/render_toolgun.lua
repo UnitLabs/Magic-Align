@@ -6,7 +6,6 @@ local isvector = M.IsVectorLike
 local client = M.Client or {}
 local FormulaManager = M.FormulaManager or include("magic_align/client/formula_manager.lua")
 local colors = client.colors or {}
-local menuColors = client.menuColors or {}
 local activeTool = client.activeTool
 local isWorldTarget = M.IsWorldTarget
 local spaceLabels = client.spaceLabels or {}
@@ -15,19 +14,30 @@ local MICRO_UNIT = "\194\181"
 local DEGREE_UNIT = "\194\176"
 local VALUE_FONT_PREFIX = "MagicAlignToolgunValue"
 local VALUE_FONT_SIZES = { 64, 58, 52, 46, 40, 34, 30, 26, 22, 18, 16 }
+local COMPASS_RADIUS = 21
+local TAU = math.pi * 2
 local fontsReady = false
+local compassNeedles = {}
+
+local COMPASS_NEEDLE = {
+    stiffness = 76,
+    damping = 7.5,
+    maxFrameTime = 0.05,
+    snapAngle = math.rad(0.08),
+    snapVelocity = math.rad(0.8)
+}
 
 local palette = {
-    bg = menuColors.panelSoft or Color(243, 243, 243),
-    shell = menuColors.panel or Color(232, 232, 232),
-    card = menuColors.inputFocus or Color(255, 255, 255),
-    cardSoft = menuColors.input or Color(247, 247, 247),
-    border = menuColors.border or Color(138, 138, 138),
-    text = menuColors.text or Color(18, 18, 18),
-    textMuted = menuColors.textMuted or Color(118, 118, 118),
+    bg = Color(5, 6, 8),
+    shell = Color(12, 14, 18),
+    card = Color(23, 26, 32),
+    cardSoft = Color(16, 18, 23),
+    border = Color(72, 78, 90),
+    text = Color(238, 242, 248),
+    textMuted = Color(158, 168, 184),
+    accentTextDark = Color(10, 12, 16),
     idle = colors.preview or Color(80, 240, 255),
-    sheen = Color(255, 255, 255, 55),
-    shadow = Color(0, 0, 0, 18)
+    shadow = Color(0, 0, 0, 78)
 }
 
 local function solid(color, fallback)
@@ -66,11 +76,11 @@ local panelAccent = {
 local footerTabAccent = {
     prop1 = panelAccent.prop1,
     prop2 = panelAccent.prop2,
-    points = solid(colors.preview, Color(80, 240, 255)),
-    world = solid(menuColors.tabActiveLine, Color(94, 94, 94))
+    points = solid(colors.axis, Color(92, 220, 148)),
+    world = Color(210, 216, 226)
 }
-local pointCountColor = Color(46, 148, 84)
-local missingPropColor = Color(150, 150, 150)
+local pointCountColor = Color(92, 220, 148)
+local missingPropColor = Color(166, 174, 188)
 
 local sliderColors = {
     px = handleAccent.x,
@@ -117,8 +127,86 @@ local gizmoFormulaKeys = {
     }
 }
 
+local cachedColors = {}
+local compassPoly = {
+    { x = 0, y = 0 },
+    { x = 0, y = 0 },
+    { x = 0, y = 0 }
+}
+local valueFontTexts = {}
+
+local function cachedColor(r, g, b, a)
+    r = math.Clamp(math.floor(tonumber(r) or 0), 0, 255)
+    g = math.Clamp(math.floor(tonumber(g) or 0), 0, 255)
+    b = math.Clamp(math.floor(tonumber(b) or 0), 0, 255)
+    a = math.Clamp(math.floor(tonumber(a) or 255), 0, 255)
+
+    local key = (((r * 256) + g) * 256 + b) * 256 + a
+    local cached = cachedColors[key]
+    if cached then
+        return cached
+    end
+
+    cached = Color(r, g, b, a)
+    cachedColors[key] = cached
+    return cached
+end
+
 local function colorAlpha(color, alpha)
-    return Color(color.r, color.g, color.b, alpha)
+    return cachedColor(color.r, color.g, color.b, alpha)
+end
+
+local function normalizedAngle(angle)
+    return (angle + math.pi) % TAU - math.pi
+end
+
+local function frameDelta()
+    local dt
+
+    if isfunction(RealFrameTime) then
+        dt = RealFrameTime()
+    elseif isfunction(FrameTime) then
+        dt = FrameTime()
+    end
+
+    dt = tonumber(dt) or (1 / 60)
+    return math.Clamp(dt, 0, COMPASS_NEEDLE.maxFrameTime)
+end
+
+local function smoothedCompassAngle(key, targetAngle, signature)
+    targetAngle = normalizedAngle(targetAngle)
+
+    local needle = compassNeedles[key]
+    if not needle or needle.signature ~= signature then
+        needle = {
+            angle = targetAngle,
+            velocity = 0,
+            signature = signature
+        }
+        compassNeedles[key] = needle
+        return targetAngle
+    end
+
+    local dt = frameDelta()
+    local delta = normalizedAngle(targetAngle - needle.angle)
+
+    needle.velocity = (needle.velocity + delta * COMPASS_NEEDLE.stiffness * dt) * math.exp(-COMPASS_NEEDLE.damping * dt)
+    needle.angle = normalizedAngle(needle.angle + needle.velocity * dt)
+
+    if math.abs(delta) <= COMPASS_NEEDLE.snapAngle and math.abs(needle.velocity) <= COMPASS_NEEDLE.snapVelocity then
+        needle.angle = targetAngle
+        needle.velocity = 0
+    end
+
+    return needle.angle
+end
+
+local function compassSignature(ent)
+    if isWorldTarget and isWorldTarget(ent) then
+        return "world"
+    end
+
+    return IsValid(ent) and tostring(ent:EntIndex()) or "none"
 end
 
 local function commitUploadProgress()
@@ -134,10 +222,10 @@ end
 
 local function accentTextColor(color)
     if luminance(color) >= 170 then
-        return palette.text
+        return palette.accentTextDark
     end
 
-    return Color(252, 252, 252)
+    return cachedColor(252, 252, 252)
 end
 
 local function clampDisplayValue(value)
@@ -194,8 +282,8 @@ local function ensureFonts()
 
     surface.CreateFont("MagicAlignToolgunChip", {
         font = "Roboto",
-        size = 18,
-        weight = 700,
+        size = 22,
+        weight = 600,
         antialias = true,
         extended = true
     })
@@ -321,11 +409,6 @@ local function drawBackdrop(width, height, accent)
     surface.DrawOutlinedRect(8, 8, width - 16, height - 16, 1)
     surface.DrawOutlinedRect(16, 16, width - 32, height - 32, 1)
 
-    for index = 0, 4 do
-        local x = 26 + index * 34
-        surface.SetDrawColor(colorAlpha(palette.sheen, 22))
-        surface.DrawLine(x, 22, x + 46, height - 22)
-    end
 end
 
 local function drawValueCards(width, height, items)
@@ -337,13 +420,14 @@ local function drawValueCards(width, height, items)
     local cardWidth = width - margin * 2
     local count = math.max(#items, 1)
     local cardHeight = math.floor((availableHeight - gap * (count - 1)) / count)
-    local valueFont = pickValueFont((function()
-        local texts = {}
-        for i = 1, #items do
-            texts[i] = items[i].value
-        end
-        return texts
-    end)(), cardWidth - 30, math.max(cardHeight * 0.52, VALUE_FONT_SIZES[#VALUE_FONT_SIZES]))
+    for i = 1, #items do
+        valueFontTexts[i] = items[i].value
+    end
+    for i = #items + 1, #valueFontTexts do
+        valueFontTexts[i] = nil
+    end
+
+    local valueFont = pickValueFont(valueFontTexts, cardWidth - 30, math.max(cardHeight * 0.52, VALUE_FONT_SIZES[#VALUE_FONT_SIZES]))
 
     for index = 1, #items do
         local item = items[index]
@@ -382,21 +466,29 @@ local function drawCompass(cx, cy, radius, angle, accent)
 
     local dirX = math.sin(angle)
     local dirY = -math.cos(angle)
-    local tipX = cx + dirX * (radius - 1)
-    local tipY = cy + dirY * (radius - 1)
-    local backX = cx - dirX * 3
-    local backY = cy - dirY * 3
-    local sideX = -dirY * 4
-    local sideY = dirX * 4
+    local length = radius - 1
+    local halfWidth = math.max(radius * 0.28, 4)
+    local tipX = cx + dirX * length
+    local tipY = cy + dirY * length
+    local tailX = cx - dirX * length
+    local tailY = cy - dirY * length
+    local rightX = cx - dirY * halfWidth
+    local rightY = cy + dirX * halfWidth
+    local leftX = cx + dirY * halfWidth
+    local leftY = cy - dirX * halfWidth
 
     surface.SetDrawColor(accent)
-    surface.DrawPoly({
-        { x = tipX, y = tipY },
-        { x = backX + sideX, y = backY + sideY },
-        { x = backX - sideX, y = backY - sideY }
-    })
+    compassPoly[1].x, compassPoly[1].y = tipX, tipY
+    compassPoly[2].x, compassPoly[2].y = rightX, rightY
+    compassPoly[3].x, compassPoly[3].y = leftX, leftY
+    surface.DrawPoly(compassPoly)
 
     draw.NoTexture()
+    surface.SetDrawColor(colorAlpha(accent, 220))
+    surface.DrawLine(leftX, leftY, tailX, tailY)
+    surface.DrawLine(tailX, tailY, rightX, rightY)
+    surface.DrawLine(rightX, rightY, leftX, leftY)
+
     surface.SetDrawColor(palette.card)
     surface.DrawRect(cx - 1, cy - 1, 2, 2)
 end
@@ -435,8 +527,8 @@ local function drawFooter(width, height, tool, state, data)
     local tabWidth = math.floor((w - gap * (#spaces - 1)) / #spaces)
     local remainder = w - tabWidth * #spaces - gap * (#spaces - 1)
     local tabX = x
-    local stripColor = menuColors.tabStrip or palette.shell
-    local borderColor = menuColors.border or palette.border
+    local stripColor = palette.shell
+    local borderColor = palette.border
 
     draw.RoundedBoxEx(6, x, y, w, h, stripColor, true, true, false, false)
     surface.SetDrawColor(colorAlpha(borderColor, 180))
@@ -446,7 +538,7 @@ local function drawFooter(width, height, tool, state, data)
         local space = spaces[i]
         local tabW = tabWidth + (i == #spaces and remainder or 0)
         local active = space == activeSpace
-        local bg = active and (menuColors.tabActive or palette.card) or (menuColors.tabIdle or palette.shell)
+        local bg = active and palette.card or palette.shell
         local textColor = active and palette.text or palette.textMuted
 
         draw.RoundedBoxEx(6, tabX, y, tabW, h, bg, true, true, false, false)
@@ -454,7 +546,7 @@ local function drawFooter(width, height, tool, state, data)
         surface.DrawOutlinedRect(tabX, y, tabW, h - 1, 1)
 
         if active then
-            surface.SetDrawColor(footerTabAccent[space] or menuColors.tabActiveLine or palette.text)
+            surface.SetDrawColor(footerTabAccent[space] or palette.text)
             surface.DrawRect(tabX + 1, y + h - 3, math.max(tabW - 2, 0), 3)
         end
 
@@ -487,7 +579,7 @@ end
 local function blendColor(fromColor, toColor, t)
     t = math.Clamp(tonumber(t) or 0, 0, 1)
 
-    return Color(
+    return cachedColor(
         math.Round(Lerp(t, fromColor.r, toColor.r)),
         math.Round(Lerp(t, fromColor.g, toColor.g)),
         math.Round(Lerp(t, fromColor.b, toColor.b)),
@@ -502,10 +594,10 @@ local function linkedCountColor(count, maxCount)
         ratio = math.Clamp((tonumber(count) or 0) / maxCount, 0, 1)
     end
 
-    local alpha = math.Round(Lerp(ratio, 255 * 0.10, 255 * 0.62))
-    local dark = Color(22, 22, 22, alpha)
-    local warn = Color(156, 142, 88, alpha)
-    local hot = Color(166, 92, 86, alpha)
+    local alpha = math.Round(Lerp(ratio, 170, 230))
+    local dark = cachedColor(182, 190, 204, alpha)
+    local warn = cachedColor(240, 202, 105, alpha)
+    local hot = cachedColor(255, 140, 126, alpha)
 
     if ratio <= 0.5 then
         return blendColor(dark, warn, ratio / 0.5)
@@ -527,7 +619,7 @@ local function drawLinkedCountInline(x, y, h, label, count, maxCount)
     draw.SimpleText(text, "MagicAlignToolgunTitleSoft", textX, lineY, color, TEXT_ALIGN_LEFT, TEXT_ALIGN_CENTER)
 end
 
-local function drawCompassPanel(x, y, w, h, label, ent, accent, pointCount)
+local function drawCompassPanel(x, y, w, h, needleKey, label, ent, accent, pointCount)
     draw.RoundedBox(12, x, y, w, h, palette.card)
     draw.RoundedBox(12, x, y, 8, h, colorAlpha(accent, 220))
     surface.SetDrawColor(colorAlpha(palette.border, 105))
@@ -546,7 +638,9 @@ local function drawCompassPanel(x, y, w, h, label, ent, accent, pointCount)
 
     local angle = isWorldTarget and isWorldTarget(ent) and 0 or compassAngle(ent)
     if angle then
-        drawCompass(compassX, y + h * 0.5, 14, angle, accent)
+        drawCompass(compassX, y + h * 0.5, COMPASS_RADIUS, smoothedCompassAngle(needleKey, angle, compassSignature(ent)), accent)
+    else
+        compassNeedles[needleKey] = nil
     end
 end
 
@@ -562,6 +656,7 @@ local function drawIdleCompasses(width, height, state)
         startY,
         w,
         panelHeight,
+        "prop1",
         spaceLabels.prop1 or "Prop 1",
         state and state.prop1 or nil,
         panelAccent.prop1 or palette.idle,
@@ -580,6 +675,7 @@ local function drawIdleCompasses(width, height, state)
         startY + panelHeight + gap,
         w,
         panelHeight,
+        "prop2",
         spaceLabels.prop2 or "Prop 2",
         state and state.prop2 or nil,
         panelAccent.prop2 or palette.idle,

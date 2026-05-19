@@ -137,14 +137,14 @@ TOOL_UI.information.readyWorldPoint = {
 
 local RENDER_QUALITY = {
     presets = {
-        { label = "Low", ringRtSize = 512, ringSegments = 64, tickCount = 9, hidePointTriangles = true },
-        { label = "Medium", ringRtSize = 1024, ringSegments = 128, tickCount = 17 },
-        { label = "High", ringRtSize = 2048, ringSegments = 256, tickCount = 33 },
-        { label = "Ultra", ringRtSize = 4096, ringSegments = 360, tickCount = 65 },
-        { label = "Low", realtime = true, ringSegments = 12, tickCount = 9, hidePointTriangles = true },
-        { label = "Medium", realtime = true, ringSegments = 24, tickCount = 17 },
-        { label = "High", realtime = true, ringSegments = 36, tickCount = 33 },
-        { label = "Ultra", realtime = true, ringSegments = 64, tickCount = 65 }
+        { label = "Low", ringRtSize = 512, circleRtSize = 64, ringSegments = 64, circleSegments = 64, tickCount = 9, hidePointTriangles = true },
+        { label = "Medium", ringRtSize = 1024, circleRtSize = 128, ringSegments = 128, circleSegments = 128, tickCount = 17 },
+        { label = "High", ringRtSize = 2048, circleRtSize = 512, ringSegments = 256, circleSegments = 256, tickCount = 33 },
+        { label = "Ultra", ringRtSize = 4096, circleRtSize = 1024, ringSegments = 360, circleSegments = 360, tickCount = 65 },
+        { label = "Low", realtime = true, ringSegments = 12, circleSegments = 6, tickCount = 9, hidePointTriangles = true },
+        { label = "Medium", realtime = true, ringSegments = 24, circleSegments = 12, tickCount = 17 },
+        { label = "High", realtime = true, ringSegments = 36, circleSegments = 18, tickCount = 33 },
+        { label = "Ultra", realtime = true, ringSegments = 64, circleSegments = 32, tickCount = 65 }
     },
     defaultIndex = 2
 }
@@ -189,6 +189,8 @@ TOOL.ClientConVar = {
     preview_occluded_b = "70",
     preview_occluded_a = "160",
     ring_quality = tostring(RENDER_QUALITY.defaultIndex),
+    world_bsp_snap = "1",
+    world_bsp_budget_ms = "1",
     rotation_snap = "12",
     translation_snap = "0",
     world_target = "1",
@@ -520,6 +522,7 @@ if SERVER then
     AddCSLuaFile("magic_align/client/formula_manager.lua")
     AddCSLuaFile("magic_align/client/geometry.lua")
     AddCSLuaFile("magic_align/client/dmagic_align_numslider.lua")
+    AddCSLuaFile("magic_align/client/world_bsp.lua")
     AddCSLuaFile("magic_align/client/menu.lua")
     AddCSLuaFile("magic_align/client/menuentryhack.lua")
     AddCSLuaFile("magic_align/client/render.lua")
@@ -531,6 +534,7 @@ end
 local colors = {
     source = Color(255, 190, 80),
     target = Color(80, 220, 255),
+    axis = Color(92, 220, 148),
     preview = Color(80, 240, 255),
     pending = Color(120, 255, 120),
     corner = Color(255, 120, 255),
@@ -1547,6 +1551,8 @@ local function cfg(tool, out)
     out.traceSnapLength = clientNumber(tool, "trace_snap_length", 5)
     out.translationSnap = translationSnapStep(tool)
     out.worldTarget = clientNumber(tool, "world_target", 1) == 1
+    out.worldBspSnap = clientNumber(tool, "world_bsp_snap", 1) == 1
+    out.worldBspBudgetMs = math.Clamp(clientNumber(tool, "world_bsp_budget_ms", 1), 0.1, 8)
     out.alt = input.IsKeyDown(KEY_LALT) or input.IsKeyDown(KEY_RALT)
     out.shift = input.IsKeyDown(KEY_LSHIFT) or input.IsKeyDown(KEY_RSHIFT)
 
@@ -2269,6 +2275,21 @@ local function faceCandidate(ent, tr, settings, box)
             or settings.shift and "free_face"
             or "grid"
     }
+end
+
+local function worldCandidateFromTrace(tr, settings)
+    local worldBSP = client.WorldBSP
+    if settings
+        and settings.worldBspSnap
+        and worldBSP
+        and isfunction(worldBSP.candidateFromTrace) then
+        local candidate = worldBSP.candidateFromTrace(tr, settings)
+        if candidate then
+            return candidate
+        end
+    end
+
+    return geometry.traceCandidate(M.WORLD_TARGET, tr)
 end
 
 local function axisVectorForKey(basis, key)
@@ -3270,6 +3291,11 @@ local function hoverState(tool, state)
     local settings = cfg(tool, state._magicAlignHoverSettings or {})
     state._magicAlignHoverSettings = settings
 
+    local worldBSP = client.WorldBSP
+    if settings.worldTarget and settings.worldBspSnap and worldBSP and isfunction(worldBSP.update) then
+        worldBSP.update(settings)
+    end
+
     local hover = state._magicAlignHover or {}
     state._magicAlignHover = hover
     clearHover(hover)
@@ -3293,7 +3319,7 @@ local function hoverState(tool, state)
             hover.point = hoverPoint(ent, points)
 
             if geometry.isWorldTarget(ent) then
-                hover.candidate = geometry.traceCandidate(ent, tr)
+                hover.candidate = worldCandidateFromTrace(tr, settings)
             else
                 hover.box = boundsFor(state, ent)
                 hover.candidate = faceCandidate(ent, tr, settings, hover.box)
@@ -3315,7 +3341,7 @@ local function hoverState(tool, state)
         hover.overlayBox = boundsFor(state, tr.Entity)
         hover.overlay = faceCandidate(tr.Entity, tr, settings, hover.overlayBox)
     elseif not hover.candidate and not hover.overlay and settings.worldTarget and geometry.traceHitsWorld(tr) and not geometry.hasTargetEntity(state.prop2) and #state.source > 0 then
-        hover.overlay = geometry.traceCandidate(M.WORLD_TARGET, tr)
+        hover.overlay = worldCandidateFromTrace(tr, settings)
     end
 
     return hover
@@ -3575,6 +3601,10 @@ end
 
 local function drawPressCandidate(kind, ent, hover)
     if not geometry.hasTargetEntity(ent) or not hover or not hover.trace then return end
+    if geometry.isWorldTarget(ent) then
+        return worldCandidateFromTrace(hover.trace, hover.settings)
+    end
+
     return geometry.traceCandidate(ent, hover.trace)
 end
 
@@ -3966,6 +3996,7 @@ client.activeTool = activeTool
 client.setValue = setValue
 client.gizmo = gizmo
 client.snapGizmoPosition = snapGizmoPosition
+client.snapFaceCoordinates = snapFaceCoordinates
 client.rotationSnapDivisors = ROTATION_CONFIG.snapDivisors
 client.defaultRotationSnapIndex = ROTATION_CONFIG.defaultSnapIndex
 client.rotationSnapDivisions = rotationSnapDivisions
@@ -4217,6 +4248,7 @@ function TOOL:Think()
 end
 
 include("magic_align/client/geometry.lua")
+include("magic_align/client/world_bsp.lua")
 include("magic_align/client/world_points.lua")
 include("magic_align/client/render.lua")
 include("magic_align/client/menu.lua")
