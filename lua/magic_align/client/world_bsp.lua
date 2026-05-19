@@ -36,6 +36,8 @@ local CONFIG = {
     boundaryGridTolerance = 0.05,
     boundarySnapPromoteTolerance = 0.45,
     boundaryRepairTolerance = 1.25,
+    gridBoundaryTolerance = 1.25,
+    cornerSnapTolerance = 2,
     hintAfterSeconds = 5,
     defaultBudgetMs = 1,
     minBudgetMs = 0.1,
@@ -945,7 +947,7 @@ local function gridLineInfo(grid, axisKey, value)
     local lineValue = gridPointValue(grid, axisKey, index)
     if math.abs(lineValue - value) > CONFIG.boundaryGridTolerance then return end
 
-    return index, div > 0 and (index / div) * 100 or 0
+    return index, div > 0 and (index / div) * 100 or 0, lineValue
 end
 
 local function nearestGridLineInfo(face, axisKey, value)
@@ -953,9 +955,8 @@ local function nearestGridLineInfo(face, axisKey, value)
     local best
 
     for _, entry in ipairs(grids) do
-        local index, percent = gridLineInfo(entry.grid, axisKey, value)
+        local index, percent, lineValue = gridLineInfo(entry.grid, axisKey, value)
         if index then
-            local lineValue = gridPointValue(entry.grid, axisKey, index)
             local dist = math.abs(lineValue - value)
             if not best or dist < best.dist then
                 best = {
@@ -963,6 +964,7 @@ local function nearestGridLineInfo(face, axisKey, value)
                     gridId = entry.id,
                     index = index,
                     percent = percent,
+                    value = lineValue,
                     dist = dist
                 }
             end
@@ -989,10 +991,13 @@ local function keepNearestSnapCandidate(best, candidate, rawU, rawV)
     return best
 end
 
-local function applyAxisInfo(candidate, axisKey, info)
+local function applyAxisInfo(candidate, axisKey, info, snapCoordinate)
     if not info then return end
 
     if axisKey == "u" then
+        if snapCoordinate and info.value ~= nil then
+            candidate.u = info.value
+        end
         candidate.gridU = info.grid
         candidate.gridUId = info.gridId
         candidate.indexU = info.index
@@ -1000,6 +1005,9 @@ local function applyAxisInfo(candidate, axisKey, info)
         return
     end
 
+    if snapCoordinate and info.value ~= nil then
+        candidate.v = info.value
+    end
     candidate.gridV = info.grid
     candidate.gridVId = info.gridId
     candidate.indexV = info.index
@@ -1044,14 +1052,14 @@ local function applyEdgeAxisInfo(candidate, axisKey, face)
     candidate.percentV = nil
 end
 
-local function applyBoundaryAxisInfo(candidate, axisKey, face, value, allowEdgeLine)
+local function applyBoundaryAxisInfo(candidate, axisKey, face, value, allowEdgeLine, snapCoordinate)
     local minValue = axisKey == "u" and face.uMin or face.vMin
     local maxValue = axisKey == "u" and face.uMax or face.vMax
 
     if math.abs(value - minValue) <= CONFIG.boundarySnapPromoteTolerance then
         local info = nearestGridLineInfo(face, axisKey, minValue)
         if info then
-            applyAxisInfo(candidate, axisKey, info)
+            applyAxisInfo(candidate, axisKey, info, snapCoordinate)
         elseif allowEdgeLine then
             applyEdgeAxisInfo(candidate, axisKey, face)
         end
@@ -1061,7 +1069,7 @@ local function applyBoundaryAxisInfo(candidate, axisKey, face, value, allowEdgeL
     if math.abs(value - maxValue) <= CONFIG.boundarySnapPromoteTolerance then
         local info = nearestGridLineInfo(face, axisKey, maxValue)
         if info then
-            applyAxisInfo(candidate, axisKey, info)
+            applyAxisInfo(candidate, axisKey, info, snapCoordinate)
         elseif allowEdgeLine then
             applyEdgeAxisInfo(candidate, axisKey, face)
         end
@@ -1070,7 +1078,7 @@ local function applyBoundaryAxisInfo(candidate, axisKey, face, value, allowEdgeL
 
     local info = nearestGridLineInfo(face, axisKey, value)
     if info then
-        applyAxisInfo(candidate, axisKey, info)
+        applyAxisInfo(candidate, axisKey, info, snapCoordinate)
     elseif allowEdgeLine then
         applyEdgeAxisInfo(candidate, axisKey, face)
     end
@@ -1116,6 +1124,163 @@ local function gridLineCandidate(face, axisKey, snapped, rawU, rawV)
     }
 end
 
+local function keepBestBoundaryIntersection(best, candidate)
+    if not candidate then return best end
+    if not best or candidate.boundaryDist < best.boundaryDist then
+        return candidate
+    end
+    if math.abs(candidate.boundaryDist - best.boundaryDist) <= M.COMPUTE_EPSILON and candidate.dist < best.dist then
+        return candidate
+    end
+
+    return best
+end
+
+local function gridBoundaryIntersectionCandidate(face, axisKey, rawU, rawV, snapped, testU, testV)
+    local polygon = face and face.polygon
+    if not istable(polygon) or #polygon < 2 or not snapped then return end
+
+    local grid = axisKey == "u" and snapped.gridU or snapped.gridV
+    local value = axisKey == "u" and snapped.u or snapped.v
+    if not grid or value == nil then return end
+
+    testU = tonumber(testU) or rawU
+    testV = tonumber(testV) or rawV
+
+    local best
+    local previous = polygon[#polygon]
+    for i = 1, #polygon do
+        local current = polygon[i]
+        local a = axisKey == "u" and previous.u or previous.v
+        local b = axisKey == "u" and current.u or current.v
+        local oa = axisKey == "u" and previous.v or previous.u
+        local ob = axisKey == "u" and current.v or current.u
+        local otherGrid = axisKey == "u" and snapped.gridV or snapped.gridU
+        local otherValue = axisKey == "u" and snapped.v or snapped.u
+        local useOtherGrid = false
+        local other
+
+        if math.abs(a - value) <= CONFIG.boundaryGridTolerance
+            and math.abs(b - value) <= CONFIG.boundaryGridTolerance then
+            local target = axisKey == "u" and testV or testU
+            if otherGrid and otherValue ~= nil then
+                target = otherValue
+            end
+            other = math.Clamp(target, math.min(oa, ob), math.max(oa, ob))
+            useOtherGrid = otherGrid and otherValue ~= nil
+                and math.abs(other - otherValue) <= CONFIG.boundaryGridTolerance
+        elseif math.abs(a - b) > M.COMPUTE_EPSILON
+            and value >= math.min(a, b) - CONFIG.boundaryGridTolerance
+            and value <= math.max(a, b) + CONFIG.boundaryGridTolerance then
+            local t = math.Clamp((value - a) / (b - a), 0, 1)
+            other = oa + (ob - oa) * t
+        end
+
+        if other ~= nil then
+            local candidate = {
+                u = axisKey == "u" and value or other,
+                v = axisKey == "u" and other or value,
+                gridU = nil,
+                gridV = nil,
+                gridUId = nil,
+                gridVId = nil,
+                indexU = nil,
+                indexV = nil,
+                percentU = nil,
+                percentV = nil
+            }
+
+            if axisKey == "u" then
+                candidate.gridU = snapped.gridU
+                candidate.gridUId = snapped.gridUId
+                candidate.indexU = snapped.indexU
+                candidate.percentU = snapped.percentU
+                if useOtherGrid then
+                    candidate.gridV = snapped.gridV
+                    candidate.gridVId = snapped.gridVId
+                    candidate.indexV = snapped.indexV
+                    candidate.percentV = snapped.percentV
+                end
+            else
+                candidate.gridV = snapped.gridV
+                candidate.gridVId = snapped.gridVId
+                candidate.indexV = snapped.indexV
+                candidate.percentV = snapped.percentV
+                if useOtherGrid then
+                    candidate.gridU = snapped.gridU
+                    candidate.gridUId = snapped.gridUId
+                    candidate.indexU = snapped.indexU
+                    candidate.percentU = snapped.percentU
+                end
+            end
+
+            candidate.boundaryKind = "grid_boundary"
+            candidate.boundaryDist = snapCandidateDistance(candidate, testU, testV)
+            candidate.dist = snapCandidateDistance(candidate, rawU, rawV)
+            best = keepBestBoundaryIntersection(best, candidate)
+        end
+
+        previous = current
+    end
+
+    return best
+end
+
+local function nearestGridBoundaryCandidate(face, rawU, rawV, snapped, testU, testV)
+    local best
+    best = keepBestBoundaryIntersection(
+        best,
+        gridBoundaryIntersectionCandidate(face, "u", rawU, rawV, snapped, testU, testV)
+    )
+    best = keepBestBoundaryIntersection(
+        best,
+        gridBoundaryIntersectionCandidate(face, "v", rawU, rawV, snapped, testU, testV)
+    )
+
+    return best
+end
+
+local function cornerSnapCandidate(face, rawU, rawV, testU, testV)
+    local polygon = face and face.polygon
+    if not istable(polygon) or #polygon < 2 then return end
+
+    testU = tonumber(testU) or rawU
+    testV = tonumber(testV) or rawV
+
+    local best
+    for i = 1, #polygon do
+        local vertex = polygon[i]
+        local du = testU - vertex.u
+        local dv = testV - vertex.v
+        local distSqr = du * du + dv * dv
+        if not best or distSqr < best.dist then
+            best = {
+                u = vertex.u,
+                v = vertex.v,
+                dist = distSqr
+            }
+        end
+    end
+
+    if not best then return end
+
+    return {
+        u = best.u,
+        v = best.v,
+        gridU = nil,
+        gridV = nil,
+        gridUId = nil,
+        gridVId = nil,
+        indexU = nil,
+        indexV = nil,
+        percentU = nil,
+        percentV = nil,
+        boundaryKind = "corner",
+        boundaryDist = best.dist,
+        dist = snapCandidateDistance(best, rawU, rawV)
+    }
+end
+
 local function boundarySnapCandidate(face, rawU, rawV, snapped, testU, testV)
     local polygon = face and face.polygon
     if not istable(polygon) or #polygon < 2 then return end
@@ -1143,6 +1308,11 @@ local function boundarySnapCandidate(face, rawU, rawV, snapped, testU, testV)
 
     if not best then return end
 
+    local corner = cornerSnapCandidate(face, rawU, rawV, testU, testV)
+    if corner and corner.boundaryDist <= CONFIG.cornerSnapTolerance * CONFIG.cornerSnapTolerance then
+        return corner
+    end
+
     local du = math.abs(best.b.u - best.a.u)
     local dv = math.abs(best.b.v - best.a.v)
     local candidate = {
@@ -1169,14 +1339,14 @@ local function boundarySnapCandidate(face, rawU, rawV, snapped, testU, testV)
                 candidate.indexV = snapped.indexV
                 candidate.percentV = snapped.percentV
             else
-                applyBoundaryAxisInfo(candidate, "v", face, candidate.v, false)
+                applyBoundaryAxisInfo(candidate, "v", face, candidate.v, false, true)
             end
         else
             candidate.v = best.v
-            applyBoundaryAxisInfo(candidate, "v", face, candidate.v, false)
+            applyBoundaryAxisInfo(candidate, "v", face, candidate.v, false, true)
         end
 
-        applyBoundaryAxisInfo(candidate, "u", face, candidate.u, true)
+        applyBoundaryAxisInfo(candidate, "u", face, candidate.u, true, true)
     elseif dv <= CONFIG.boundaryGridTolerance then
         if snapped and snapped.u ~= nil then
             local clampedU = math.Clamp(snapped.u, math.min(best.a.u, best.b.u), math.max(best.a.u, best.b.u))
@@ -1187,20 +1357,18 @@ local function boundarySnapCandidate(face, rawU, rawV, snapped, testU, testV)
                 candidate.indexU = snapped.indexU
                 candidate.percentU = snapped.percentU
             else
-                applyBoundaryAxisInfo(candidate, "u", face, candidate.u, false)
+                applyBoundaryAxisInfo(candidate, "u", face, candidate.u, false, true)
             end
         else
             candidate.u = best.u
-            applyBoundaryAxisInfo(candidate, "u", face, candidate.u, false)
+            applyBoundaryAxisInfo(candidate, "u", face, candidate.u, false, true)
         end
 
         candidate.v = (best.a.v + best.b.v) * 0.5
-        applyBoundaryAxisInfo(candidate, "v", face, candidate.v, true)
-    else
-        applyBoundaryAxisInfo(candidate, "u", face, candidate.u, false)
-        applyBoundaryAxisInfo(candidate, "v", face, candidate.v, false)
+        applyBoundaryAxisInfo(candidate, "v", face, candidate.v, true, true)
     end
 
+    candidate.boundaryKind = "boundary"
     candidate.boundaryDist = best.dist
     candidate.dist = snapCandidateDistance(candidate, rawU, rawV)
     return candidate
@@ -1215,6 +1383,8 @@ end
 local function nearestPolygonSnapPoint(face, rawU, rawV, snapped)
     local best
 
+    best = keepNearestSnapCandidate(best, cornerSnapCandidate(face, rawU, rawV), rawU, rawV)
+    best = keepNearestSnapCandidate(best, nearestGridBoundaryCandidate(face, rawU, rawV, snapped, snapped and snapped.u, snapped and snapped.v), rawU, rawV)
     best = keepNearestSnapCandidate(best, idealBoundarySnapCandidate(face, rawU, rawV, snapped), rawU, rawV)
     best = keepNearestSnapCandidate(best, boundarySnapCandidate(face, rawU, rawV, snapped), rawU, rawV)
     best = keepNearestSnapCandidate(best, gridLineCandidate(face, "u", snapped, rawU, rawV), rawU, rawV)
@@ -1252,6 +1422,34 @@ local function nearestPolygonSnapPoint(face, rawU, rawV, snapped)
     return best
 end
 
+local function snapModeForBoundary(candidate, repair)
+    local kind = candidate and candidate.boundaryKind
+    if kind == "grid_boundary" then
+        return repair and "grid_boundary_repair" or "grid_boundary"
+    end
+    if kind == "corner" then
+        return repair and "corner_repair" or "corner"
+    end
+
+    return repair and "boundary_repair" or "boundary"
+end
+
+local function promoteToleranceForBoundary(candidate)
+    local kind = candidate and candidate.boundaryKind
+    if kind == "grid_boundary" then return CONFIG.gridBoundaryTolerance end
+    if kind == "corner" then return CONFIG.cornerSnapTolerance end
+
+    return CONFIG.boundarySnapPromoteTolerance
+end
+
+local function repairToleranceForBoundary(candidate)
+    local kind = candidate and candidate.boundaryKind
+    if kind == "grid_boundary" then return CONFIG.gridBoundaryTolerance end
+    if kind == "corner" then return CONFIG.cornerSnapTolerance end
+
+    return CONFIG.boundaryRepairTolerance
+end
+
 local function buildFace(surfaceData, normal, rawU, rawV, settings)
     local face = {
         worldBSP = true,
@@ -1283,32 +1481,42 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
 
     if not (settings and settings.shift) then
         boundary = boundarySnapCandidate(face, rawU, rawV, snapped)
+        local gridBoundary = nearestGridBoundaryCandidate(face, rawU, rawV, snapped, rawU, rawV)
         local currentDist = snapCandidateDistance({ u = u, v = v }, rawU, rawV)
-        local boundaryDist = boundary and (boundary.boundaryDist or boundary.dist) or math.huge
-        if boundary
-            and boundaryDist <= CONFIG.boundarySnapPromoteTolerance * CONFIG.boundarySnapPromoteTolerance
-            and boundary.dist <= currentDist then
-            u = boundary.u
-            v = boundary.v
-            snapped.gridU = boundary.gridU
-            snapped.gridV = boundary.gridV
-            snapped.gridUId = boundary.gridUId
-            snapped.gridVId = boundary.gridVId
-            snapped.indexU = boundary.indexU
-            snapped.indexV = boundary.indexV
-            snapped.percentU = boundary.percentU
-            snapped.percentV = boundary.percentV
-            snapMode = "boundary"
+        local promoteBoundary = keepBestBoundaryIntersection(nil, gridBoundary)
+        promoteBoundary = keepBestBoundaryIntersection(promoteBoundary, boundary)
+        if boundary and boundary.boundaryKind == "corner" then
+            promoteBoundary = boundary
+        end
+        local promoteBoundaryDist = promoteBoundary and (promoteBoundary.boundaryDist or promoteBoundary.dist) or math.huge
+        local promoteTolerance = promoteToleranceForBoundary(promoteBoundary)
+        if promoteBoundary
+            and promoteBoundaryDist <= promoteTolerance * promoteTolerance
+            and (promoteBoundary.boundaryKind ~= "boundary" or promoteBoundary.dist <= currentDist) then
+            u = promoteBoundary.u
+            v = promoteBoundary.v
+            snapped.gridU = promoteBoundary.gridU
+            snapped.gridV = promoteBoundary.gridV
+            snapped.gridUId = promoteBoundary.gridUId
+            snapped.gridVId = promoteBoundary.gridVId
+            snapped.indexU = promoteBoundary.indexU
+            snapped.indexV = promoteBoundary.indexV
+            snapped.percentU = promoteBoundary.percentU
+            snapped.percentV = promoteBoundary.percentV
+            snapMode = snapModeForBoundary(promoteBoundary, false)
         end
     end
 
     if not (settings and settings.shift) and not pointInPolygon2D(face.polygon, u, v, CONFIG.polygonTolerance) then
-        local repairBoundary = idealBoundarySnapCandidate(face, rawU, rawV, snapped)
+        local repairBoundary = boundary and boundary.boundaryKind == "corner" and boundary
+            or nearestGridBoundaryCandidate(face, rawU, rawV, snapped, snapped and snapped.u, snapped and snapped.v)
+            or idealBoundarySnapCandidate(face, rawU, rawV, snapped)
             or boundary
             or boundarySnapCandidate(face, rawU, rawV, snapped)
         local repairBoundaryDist = repairBoundary and (repairBoundary.boundaryDist or repairBoundary.dist) or math.huge
+        local repairTolerance = repairToleranceForBoundary(repairBoundary)
         local nearest = repairBoundary
-            and repairBoundaryDist <= CONFIG.boundaryRepairTolerance * CONFIG.boundaryRepairTolerance
+            and repairBoundaryDist <= repairTolerance * repairTolerance
             and repairBoundary
             or nearestPolygonSnapPoint(face, rawU, rawV, snapped)
         if nearest then
@@ -1322,7 +1530,9 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
             snapped.indexV = nearest.indexV
             snapped.percentU = nearest.percentU
             snapped.percentV = nearest.percentV
-            snapMode = nearest == repairBoundary and "boundary_repair" or "repair"
+            snapMode = nearest == repairBoundary
+                and snapModeForBoundary(repairBoundary, true)
+                or (nearest.boundaryKind == "corner" and "corner_repair" or "repair")
         else
             u = math.Clamp(rawU, face.uMin, face.uMax)
             v = math.Clamp(rawV, face.vMin, face.vMax)
