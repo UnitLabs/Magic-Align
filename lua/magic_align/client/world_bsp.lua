@@ -14,7 +14,7 @@ local normalizedVec = M.NormalizeVectorPrecise
 local dot = M.DotVectorsPrecise
 local cross = M.CrossVectorsPrecise
 
-local CACHE_VERSION = 2
+local CACHE_VERSION = 5
 
 local CONFIG = {
     cellSize = 512,
@@ -28,8 +28,14 @@ local CONFIG = {
     polygonTolerance = 0.001,
     rayPickTolerance = 2.5,
     rayPlaneDotMin = 0.0001,
+    rayPreferScore = 0.4,
+    rayNormalWeight = 1.5,
     queryCellRadius = 1,
     vertexMergeToleranceSqr = 1e-8,
+    hullTolerance = 0.001,
+    boundaryGridTolerance = 0.05,
+    boundarySnapPromoteTolerance = 0.45,
+    boundaryRepairTolerance = 1.25,
     hintAfterSeconds = 5,
     defaultBudgetMs = 1,
     minBudgetMs = 0.1,
@@ -141,28 +147,6 @@ local function computeNormal(vertices)
     end
 end
 
-local function atan2(y, x)
-    if math.atan2 then
-        return math.atan2(y, x)
-    end
-
-    if x > 0 then return math.atan(y / x) end
-    if x < 0 and y >= 0 then return math.atan(y / x) + math.pi end
-    if x < 0 then return math.atan(y / x) - math.pi end
-    if y > 0 then return math.pi * 0.5 end
-    if y < 0 then return -math.pi * 0.5 end
-    return 0
-end
-
-local function centerOfVertices(vertices)
-    local center = VectorP(0, 0, 0)
-    for i = 1, #vertices do
-        center = center + vertices[i]
-    end
-
-    return center / #vertices
-end
-
 local function projectedAxisFromVertices(vertices, normal)
     local base = vertices[1]
     for i = 2, #vertices do
@@ -175,6 +159,30 @@ local function projectedAxisFromVertices(vertices, normal)
         or M.ProjectVectorPrecise(VectorP(1, 0, 0), normal, M.PICKING_VECTOR_EPSILON_SQR)
 end
 
+local function hullCross2D(a, b, c)
+    return (b.u - a.u) * (c.v - a.v) - (b.v - a.v) * (c.u - a.u)
+end
+
+local function hullEntryLess(a, b)
+    if math.abs(a.u - b.u) <= CONFIG.polygonTolerance then
+        return a.v < b.v
+    end
+
+    return a.u < b.u
+end
+
+local function polygonArea2D(entries)
+    local area = 0
+    local previous = entries[#entries]
+    for i = 1, #entries do
+        local current = entries[i]
+        area = area + (previous.u * current.v - current.u * previous.v)
+        previous = current
+    end
+
+    return area * 0.5
+end
+
 local function orderSurfaceVertices(vertices, normal)
     local uAxis = projectedAxisFromVertices(vertices, normal)
     if not uAxis then return end
@@ -182,30 +190,66 @@ local function orderSurfaceVertices(vertices, normal)
     local vAxis = normalizedVec(cross(normal, uAxis), M.PICKING_VECTOR_EPSILON_SQR)
     if not vAxis then return end
 
-    local center = centerOfVertices(vertices)
     local entries = {}
     for i = 1, #vertices do
-        local delta = vertices[i] - center
-        local u = dot(delta, uAxis)
-        local v = dot(delta, vAxis)
+        local vertex = vertices[i]
         entries[i] = {
-            vertex = vertices[i],
-            angle = atan2(v, u),
-            distSqr = u * u + v * v
+            vertex = vertex,
+            u = dot(vertex, uAxis),
+            v = dot(vertex, vAxis)
         }
     end
 
-    table.sort(entries, function(a, b)
-        if math.abs(a.angle - b.angle) <= M.COMPUTE_EPSILON then
-            return a.distSqr < b.distSqr
+    table.sort(entries, hullEntryLess)
+
+    local hull = {}
+    local hullCount = 0
+    local function pushHull(entry)
+        while hullCount >= 2
+            and hullCross2D(hull[hullCount - 1], hull[hullCount], entry) <= CONFIG.hullTolerance do
+            hull[hullCount] = nil
+            hullCount = hullCount - 1
         end
 
-        return a.angle < b.angle
-    end)
+        hullCount = hullCount + 1
+        hull[hullCount] = entry
+    end
+
+    for i = 1, #entries do
+        pushHull(entries[i])
+    end
+
+    local lowerCount = hullCount
+    for i = #entries - 1, 1, -1 do
+        while hullCount > lowerCount
+            and hullCross2D(hull[hullCount - 1], hull[hullCount], entries[i]) <= CONFIG.hullTolerance do
+            hull[hullCount] = nil
+            hullCount = hullCount - 1
+        end
+
+        hullCount = hullCount + 1
+        hull[hullCount] = entries[i]
+    end
+
+    if hullCount > 1 then
+        hull[hullCount] = nil
+        hullCount = hullCount - 1
+    end
+
+    if hullCount < 3 then return end
+
+    if polygonArea2D(hull) < 0 then
+        local left, right = 1, hullCount
+        while left < right do
+            hull[left], hull[right] = hull[right], hull[left]
+            left = left + 1
+            right = right - 1
+        end
+    end
 
     local ordered = {}
-    for i = 1, #entries do
-        ordered[i] = entries[i].vertex
+    for i = 1, hullCount do
+        ordered[i] = hull[i].vertex
     end
 
     return ordered
@@ -301,21 +345,21 @@ local function pointInPolygon2D(polygon, u, v, eps)
     return inside
 end
 
-local function pointSegmentDistanceSqr2D(px, py, a, b)
+local function closestPointOnSegment2D(px, py, a, b)
     local abx, aby = b.u - a.u, b.v - a.v
     local lenSqr = abx * abx + aby * aby
     if lenSqr <= M.COMPUTE_EPSILON then
         local dx, dy = px - a.u, py - a.v
-        return dx * dx + dy * dy
+        return a.u, a.v, 0, dx * dx + dy * dy
     end
 
     local t = ((px - a.u) * abx + (py - a.v) * aby) / lenSqr
     t = math.Clamp(t, 0, 1)
 
-    local cx = a.u + abx * t
-    local cy = a.v + aby * t
-    local dx, dy = px - cx, py - cy
-    return dx * dx + dy * dy
+    local u = a.u + abx * t
+    local v = a.v + aby * t
+    local dx, dy = px - u, py - v
+    return u, v, t, dx * dx + dy * dy
 end
 
 local function polygonEdgeDistance(polygon, u, v)
@@ -325,7 +369,7 @@ local function polygonEdgeDistance(polygon, u, v)
     local previous = polygon[#polygon]
     for i = 1, #polygon do
         local current = polygon[i]
-        local distSqr = pointSegmentDistanceSqr2D(u, v, previous, current)
+        local _, _, _, distSqr = closestPointOnSegment2D(u, v, previous, current)
         if not best or distSqr < best then
             best = distSqr
         end
@@ -425,7 +469,21 @@ local function buildSurfaceData(surfaceInfo, index)
         return nil, "order"
     end
 
-    normal = computeNormal(vertices) or normal
+    local orderedNormal = computeNormal(vertices)
+    if orderedNormal then
+        if dot(orderedNormal, normal) < 0 then
+            local left, right = 1, #vertices
+            while left < right do
+                vertices[left], vertices[right] = vertices[right], vertices[left]
+                left = left + 1
+                right = right - 1
+            end
+
+            normal = -orderedNormal
+        else
+            normal = orderedNormal
+        end
+    end
 
     local uAxis = longestEdgeAxis(vertices, normal)
     if not uAxis then
@@ -817,11 +875,13 @@ local function findSurfaceForTrace(tr)
                             and v >= surfaceData.vMin - CONFIG.boundsTolerance
                             and v <= surfaceData.vMax + CONFIG.boundsTolerance
                             and pointInPolygon2D(surfaceData.polygon, u, v, CONFIG.polygonPickTolerance) then
-                            local score = traceDistance + (1 - math.min(math.abs(denom), 1)) * 0.25
+                            local normalDot = dot(surfaceData.normal, hitNormal)
+                            local normalPenalty = (1 - math.min(math.abs(normalDot), 1)) * CONFIG.rayNormalWeight
+                            local score = traceDistance + (1 - math.min(math.abs(denom), 1)) * 0.25 + normalPenalty
                             if not bestRayScore or score < bestRayScore then
                                 bestRay = {
                                     surface = surfaceData,
-                                    normalSign = denom > 0 and -1 or 1,
+                                    normalSign = normalDot < 0 and -1 or 1,
                                     u = u,
                                     v = v,
                                     projectedHit = rayHit,
@@ -834,6 +894,10 @@ local function findSurfaceForTrace(tr)
                 end
             end
         end
+    end
+
+    if bestRay and bestRayScore and bestRayScore <= CONFIG.rayPreferScore then
+        return bestRay
     end
 
     return bestStrict or bestRay or bestEdge
@@ -849,9 +913,7 @@ local function gridPointValue(grid, axisKey, index)
     return minValue + step * index
 end
 
-local function nearestPolygonGridPoint(face, rawU, rawV)
-    local best
-    local bestDist
+local function gridEntriesForFace(face)
     local grids = {}
     local seen = {}
 
@@ -864,26 +926,323 @@ local function nearestPolygonGridPoint(face, rawU, rawV)
     addGrid(face.gridA, "A")
     addGrid(face.gridB, "B")
 
+    return grids
+end
+
+local function gridLineInfo(grid, axisKey, value)
+    if not grid then return end
+
+    local div = axisKey == "u" and grid.divU or grid.divV
+    div = math.max(math.Round(tonumber(div) or 0), 0)
+    if div <= 0 then return end
+
+    local minValue = axisKey == "u" and grid.uMin or grid.vMin
+    local maxValue = axisKey == "u" and grid.uMax or grid.vMax
+    local step = axisKey == "u" and grid.stepU or grid.stepV
+    if step == nil or math.abs(step) <= M.COMPUTE_EPSILON then return end
+
+    local index = math.Clamp(math.Round((value - minValue) / step), 0, div)
+    local lineValue = gridPointValue(grid, axisKey, index)
+    if math.abs(lineValue - value) > CONFIG.boundaryGridTolerance then return end
+
+    return index, div > 0 and (index / div) * 100 or 0
+end
+
+local function nearestGridLineInfo(face, axisKey, value)
+    local grids = gridEntriesForFace(face)
+    local best
+
     for _, entry in ipairs(grids) do
-        local grid = entry.grid
-        for uIndex = 0, math.max(grid.divU or 0, 0) do
-            local u = gridPointValue(grid, "u", uIndex)
-            for vIndex = 0, math.max(grid.divV or 0, 0) do
-                local v = gridPointValue(grid, "v", vIndex)
-                if pointInPolygon2D(face.polygon, u, v, CONFIG.polygonTolerance) then
-                    local dist = (u - rawU) ^ 2 + (v - rawV) ^ 2
-                    if not bestDist or dist < bestDist then
-                        bestDist = dist
-                        best = {
+        local index, percent = gridLineInfo(entry.grid, axisKey, value)
+        if index then
+            local lineValue = gridPointValue(entry.grid, axisKey, index)
+            local dist = math.abs(lineValue - value)
+            if not best or dist < best.dist then
+                best = {
+                    grid = entry.grid,
+                    gridId = entry.id,
+                    index = index,
+                    percent = percent,
+                    dist = dist
+                }
+            end
+        end
+    end
+
+    return best
+end
+
+local function snapCandidateDistance(candidate, rawU, rawV)
+    if not candidate or candidate.u == nil or candidate.v == nil then return math.huge end
+
+    return (candidate.u - rawU) ^ 2 + (candidate.v - rawV) ^ 2
+end
+
+local function keepNearestSnapCandidate(best, candidate, rawU, rawV)
+    if not candidate then return best end
+
+    candidate.dist = snapCandidateDistance(candidate, rawU, rawV)
+    if not best or candidate.dist < best.dist then
+        return candidate
+    end
+
+    return best
+end
+
+local function applyAxisInfo(candidate, axisKey, info)
+    if not info then return end
+
+    if axisKey == "u" then
+        candidate.gridU = info.grid
+        candidate.gridUId = info.gridId
+        candidate.indexU = info.index
+        candidate.percentU = info.percent
+        return
+    end
+
+    candidate.gridV = info.grid
+    candidate.gridVId = info.gridId
+    candidate.indexV = info.index
+    candidate.percentV = info.percent
+end
+
+local function fallbackBoundaryGrid(face)
+    if face.gridA then return face.gridA end
+    if face.gridB then return face.gridB end
+
+    if not face.boundaryGrid then
+        face.boundaryGrid = {
+            uMin = face.uMin,
+            uMax = face.uMax,
+            vMin = face.vMin,
+            vMax = face.vMax,
+            divU = 1,
+            divV = 1,
+            stepU = face.uMax - face.uMin,
+            stepV = face.vMax - face.vMin
+        }
+    end
+
+    return face.boundaryGrid
+end
+
+local function applyEdgeAxisInfo(candidate, axisKey, face)
+    local grid = fallbackBoundaryGrid(face)
+    if not grid then return end
+
+    if axisKey == "u" then
+        candidate.gridU = grid
+        candidate.gridUId = "E"
+        candidate.indexU = nil
+        candidate.percentU = nil
+        return
+    end
+
+    candidate.gridV = grid
+    candidate.gridVId = "E"
+    candidate.indexV = nil
+    candidate.percentV = nil
+end
+
+local function applyBoundaryAxisInfo(candidate, axisKey, face, value, allowEdgeLine)
+    local minValue = axisKey == "u" and face.uMin or face.vMin
+    local maxValue = axisKey == "u" and face.uMax or face.vMax
+
+    if math.abs(value - minValue) <= CONFIG.boundarySnapPromoteTolerance then
+        local info = nearestGridLineInfo(face, axisKey, minValue)
+        if info then
+            applyAxisInfo(candidate, axisKey, info)
+        elseif allowEdgeLine then
+            applyEdgeAxisInfo(candidate, axisKey, face)
+        end
+        return
+    end
+
+    if math.abs(value - maxValue) <= CONFIG.boundarySnapPromoteTolerance then
+        local info = nearestGridLineInfo(face, axisKey, maxValue)
+        if info then
+            applyAxisInfo(candidate, axisKey, info)
+        elseif allowEdgeLine then
+            applyEdgeAxisInfo(candidate, axisKey, face)
+        end
+        return
+    end
+
+    local info = nearestGridLineInfo(face, axisKey, value)
+    if info then
+        applyAxisInfo(candidate, axisKey, info)
+    elseif allowEdgeLine then
+        applyEdgeAxisInfo(candidate, axisKey, face)
+    end
+end
+
+local function gridLineCandidate(face, axisKey, snapped, rawU, rawV)
+    if axisKey == "u" then
+        if not snapped.gridU or snapped.u == nil then return end
+
+        local minV, maxV = clippedLineRange(face, "u", snapped.u)
+        if not minV or not maxV then return end
+
+        return {
+            u = snapped.u,
+            v = math.Clamp(rawV, minV, maxV),
+            gridU = snapped.gridU,
+            gridV = nil,
+            gridUId = snapped.gridUId,
+            gridVId = nil,
+            indexU = snapped.indexU,
+            indexV = nil,
+            percentU = snapped.percentU,
+            percentV = nil
+        }
+    end
+
+    if not snapped.gridV or snapped.v == nil then return end
+
+    local minU, maxU = clippedLineRange(face, "v", snapped.v)
+    if not minU or not maxU then return end
+
+    return {
+        u = math.Clamp(rawU, minU, maxU),
+        v = snapped.v,
+        gridU = nil,
+        gridV = snapped.gridV,
+        gridUId = nil,
+        gridVId = snapped.gridVId,
+        indexU = nil,
+        indexV = snapped.indexV,
+        percentU = nil,
+        percentV = snapped.percentV
+    }
+end
+
+local function boundarySnapCandidate(face, rawU, rawV, snapped, testU, testV)
+    local polygon = face and face.polygon
+    if not istable(polygon) or #polygon < 2 then return end
+
+    testU = tonumber(testU) or rawU
+    testV = tonumber(testV) or rawV
+
+    local best
+    local previous = polygon[#polygon]
+    for i = 1, #polygon do
+        local current = polygon[i]
+        local u, v, _, distSqr = closestPointOnSegment2D(testU, testV, previous, current)
+        if not best or distSqr < best.dist then
+            best = {
+                u = u,
+                v = v,
+                dist = distSqr,
+                a = previous,
+                b = current
+            }
+        end
+
+        previous = current
+    end
+
+    if not best then return end
+
+    local du = math.abs(best.b.u - best.a.u)
+    local dv = math.abs(best.b.v - best.a.v)
+    local candidate = {
+        u = best.u,
+        v = best.v,
+        gridU = nil,
+        gridV = nil,
+        gridUId = nil,
+        gridVId = nil,
+        indexU = nil,
+        indexV = nil,
+        percentU = nil,
+        percentV = nil
+    }
+
+    if du <= CONFIG.boundaryGridTolerance then
+        candidate.u = (best.a.u + best.b.u) * 0.5
+        if snapped and snapped.v ~= nil then
+            local clampedV = math.Clamp(snapped.v, math.min(best.a.v, best.b.v), math.max(best.a.v, best.b.v))
+            candidate.v = clampedV
+            if math.abs(clampedV - snapped.v) <= CONFIG.boundaryGridTolerance then
+                candidate.gridV = snapped.gridV
+                candidate.gridVId = snapped.gridVId
+                candidate.indexV = snapped.indexV
+                candidate.percentV = snapped.percentV
+            else
+                applyBoundaryAxisInfo(candidate, "v", face, candidate.v, false)
+            end
+        else
+            candidate.v = best.v
+            applyBoundaryAxisInfo(candidate, "v", face, candidate.v, false)
+        end
+
+        applyBoundaryAxisInfo(candidate, "u", face, candidate.u, true)
+    elseif dv <= CONFIG.boundaryGridTolerance then
+        if snapped and snapped.u ~= nil then
+            local clampedU = math.Clamp(snapped.u, math.min(best.a.u, best.b.u), math.max(best.a.u, best.b.u))
+            candidate.u = clampedU
+            if math.abs(clampedU - snapped.u) <= CONFIG.boundaryGridTolerance then
+                candidate.gridU = snapped.gridU
+                candidate.gridUId = snapped.gridUId
+                candidate.indexU = snapped.indexU
+                candidate.percentU = snapped.percentU
+            else
+                applyBoundaryAxisInfo(candidate, "u", face, candidate.u, false)
+            end
+        else
+            candidate.u = best.u
+            applyBoundaryAxisInfo(candidate, "u", face, candidate.u, false)
+        end
+
+        candidate.v = (best.a.v + best.b.v) * 0.5
+        applyBoundaryAxisInfo(candidate, "v", face, candidate.v, true)
+    else
+        applyBoundaryAxisInfo(candidate, "u", face, candidate.u, false)
+        applyBoundaryAxisInfo(candidate, "v", face, candidate.v, false)
+    end
+
+    candidate.boundaryDist = best.dist
+    candidate.dist = snapCandidateDistance(candidate, rawU, rawV)
+    return candidate
+end
+
+local function idealBoundarySnapCandidate(face, rawU, rawV, snapped)
+    if not snapped or snapped.u == nil or snapped.v == nil then return end
+
+    return boundarySnapCandidate(face, rawU, rawV, snapped, snapped.u, snapped.v)
+end
+
+local function nearestPolygonSnapPoint(face, rawU, rawV, snapped)
+    local best
+
+    best = keepNearestSnapCandidate(best, idealBoundarySnapCandidate(face, rawU, rawV, snapped), rawU, rawV)
+    best = keepNearestSnapCandidate(best, boundarySnapCandidate(face, rawU, rawV, snapped), rawU, rawV)
+    best = keepNearestSnapCandidate(best, gridLineCandidate(face, "u", snapped, rawU, rawV), rawU, rawV)
+    best = keepNearestSnapCandidate(best, gridLineCandidate(face, "v", snapped, rawU, rawV), rawU, rawV)
+
+    local grids = gridEntriesForFace(face)
+
+    for _, uEntry in ipairs(grids) do
+        local uGrid = uEntry.grid
+        for _, vEntry in ipairs(grids) do
+            local vGrid = vEntry.grid
+            for uIndex = 0, math.max(uGrid.divU or 0, 0) do
+                local u = gridPointValue(uGrid, "u", uIndex)
+                for vIndex = 0, math.max(vGrid.divV or 0, 0) do
+                    local v = gridPointValue(vGrid, "v", vIndex)
+                    if pointInPolygon2D(face.polygon, u, v, CONFIG.polygonTolerance) then
+                        best = keepNearestSnapCandidate(best, {
                             u = u,
                             v = v,
-                            grid = grid,
-                            gridId = entry.id,
+                            gridU = uGrid,
+                            gridV = vGrid,
+                            gridUId = uEntry.id,
+                            gridVId = vEntry.id,
                             indexU = uIndex,
                             indexV = vIndex,
-                            percentU = (grid.divU or 0) > 0 and (uIndex / grid.divU) * 100 or 0,
-                            percentV = (grid.divV or 0) > 0 and (vIndex / grid.divV) * 100 or 0
-                        }
+                            percentU = (uGrid.divU or 0) > 0 and (uIndex / uGrid.divU) * 100 or 0,
+                            percentV = (vGrid.divV or 0) > 0 and (vIndex / vGrid.divV) * 100 or 0
+                        }, rawU, rawV)
                     end
                 end
             end
@@ -919,20 +1278,51 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
 
     local u = snapped.u
     local v = snapped.v
+    local snapMode = "grid"
+    local boundary
+
+    if not (settings and settings.shift) then
+        boundary = boundarySnapCandidate(face, rawU, rawV, snapped)
+        local currentDist = snapCandidateDistance({ u = u, v = v }, rawU, rawV)
+        local boundaryDist = boundary and (boundary.boundaryDist or boundary.dist) or math.huge
+        if boundary
+            and boundaryDist <= CONFIG.boundarySnapPromoteTolerance * CONFIG.boundarySnapPromoteTolerance
+            and boundary.dist <= currentDist then
+            u = boundary.u
+            v = boundary.v
+            snapped.gridU = boundary.gridU
+            snapped.gridV = boundary.gridV
+            snapped.gridUId = boundary.gridUId
+            snapped.gridVId = boundary.gridVId
+            snapped.indexU = boundary.indexU
+            snapped.indexV = boundary.indexV
+            snapped.percentU = boundary.percentU
+            snapped.percentV = boundary.percentV
+            snapMode = "boundary"
+        end
+    end
 
     if not (settings and settings.shift) and not pointInPolygon2D(face.polygon, u, v, CONFIG.polygonTolerance) then
-        local nearest = nearestPolygonGridPoint(face, rawU, rawV)
+        local repairBoundary = idealBoundarySnapCandidate(face, rawU, rawV, snapped)
+            or boundary
+            or boundarySnapCandidate(face, rawU, rawV, snapped)
+        local repairBoundaryDist = repairBoundary and (repairBoundary.boundaryDist or repairBoundary.dist) or math.huge
+        local nearest = repairBoundary
+            and repairBoundaryDist <= CONFIG.boundaryRepairTolerance * CONFIG.boundaryRepairTolerance
+            and repairBoundary
+            or nearestPolygonSnapPoint(face, rawU, rawV, snapped)
         if nearest then
             u = nearest.u
             v = nearest.v
-            snapped.gridU = nearest.grid
-            snapped.gridV = nearest.grid
-            snapped.gridUId = nearest.gridId
-            snapped.gridVId = nearest.gridId
+            snapped.gridU = nearest.gridU
+            snapped.gridV = nearest.gridV
+            snapped.gridUId = nearest.gridUId
+            snapped.gridVId = nearest.gridVId
             snapped.indexU = nearest.indexU
             snapped.indexV = nearest.indexV
             snapped.percentU = nearest.percentU
             snapped.percentV = nearest.percentV
+            snapMode = nearest == repairBoundary and "boundary_repair" or "repair"
         else
             u = math.Clamp(rawU, face.uMin, face.uMax)
             v = math.Clamp(rawV, face.vMin, face.vMax)
@@ -944,6 +1334,7 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
             snapped.indexV = nil
             snapped.percentU = nil
             snapped.percentV = nil
+            snapMode = "clamp"
         end
     end
 
@@ -954,6 +1345,7 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
     face.snapGridVId = snapped.gridVId
     face.snapIndexU, face.snapIndexV = snapped.indexU, snapped.indexV
     face.snapPercentU, face.snapPercentV = snapped.percentU, snapped.percentV
+    face.snapMode = snapMode
 
     return face, worldFromUv(surfaceData, u, v)
 end
@@ -968,6 +1360,22 @@ function worldBSP.candidateFromTrace(tr, settings)
     local normal = match.normalSign < 0 and -surfaceData.normal or surfaceData.normal
     local face, worldPos = buildFace(surfaceData, normal, match.u, match.v, settings)
     if not face or not isvector(worldPos) then return end
+
+    worldBSP.lastDebug = {
+        match = match.match,
+        surfaceId = surfaceData.id,
+        rawU = match.u,
+        rawV = match.v,
+        snapU = face.uSnap,
+        snapV = face.vSnap,
+        snapGridUId = face.snapGridUId,
+        snapGridVId = face.snapGridVId,
+        snapIndexU = face.snapIndexU,
+        snapIndexV = face.snapIndexV,
+        snapMode = face.snapMode,
+        normal = surfaceData.normal,
+        worldPos = worldPos
+    }
 
     return {
         ent = M.WORLD_TARGET,
@@ -1005,13 +1413,26 @@ function worldBSP.debugTrace(tr)
         return
     end
 
-    print(("Magic Align: World BSP debug: match=%s surface=%d candidates=%d u=%.3f v=%.3f hit=%s normal=%s."):format(
+    local last = worldBSP.lastDebug
+    local snapDetails = last and last.surfaceId == (match.surface and match.surface.id) and (" snap=(%.3f, %.3f %s %s%d/%s%d)"):format(
+        tonumber(last.snapU) or 0,
+        tonumber(last.snapV) or 0,
+        tostring(last.snapMode or "?"),
+        tostring(last.snapGridUId or "-"),
+        tonumber(last.snapIndexU) or -1,
+        tostring(last.snapGridVId or "-"),
+        tonumber(last.snapIndexV) or -1
+    ) or ""
+
+    print(("Magic Align: World BSP debug: match=%s surface=%d candidates=%d raw=(%.3f, %.3f)%s hit=%s hitNormal=%s surfaceNormal=%s."):format(
         tostring(match.match or "unknown"),
         tonumber(match.surface and match.surface.id) or -1,
         #surfaces,
         tonumber(match.u) or 0,
         tonumber(match.v) or 0,
+        snapDetails,
         formatVec(tr.HitPos),
+        formatVec(tr.HitNormal),
         formatVec(match.surface and match.surface.normal)
     ))
 end
