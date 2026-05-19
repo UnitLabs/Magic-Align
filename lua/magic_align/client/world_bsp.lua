@@ -1383,7 +1383,6 @@ end
 local function nearestPolygonSnapPoint(face, rawU, rawV, snapped)
     local best
 
-    best = keepNearestSnapCandidate(best, cornerSnapCandidate(face, rawU, rawV), rawU, rawV)
     best = keepNearestSnapCandidate(best, nearestGridBoundaryCandidate(face, rawU, rawV, snapped, snapped and snapped.u, snapped and snapped.v), rawU, rawV)
     best = keepNearestSnapCandidate(best, idealBoundarySnapCandidate(face, rawU, rawV, snapped), rawU, rawV)
     best = keepNearestSnapCandidate(best, boundarySnapCandidate(face, rawU, rawV, snapped), rawU, rawV)
@@ -1450,6 +1449,42 @@ local function repairToleranceForBoundary(candidate)
     return CONFIG.boundaryRepairTolerance
 end
 
+local function boundaryCandidateDistance(candidate)
+    return candidate and (candidate.boundaryDist or candidate.dist) or math.huge
+end
+
+local function boundaryCandidateRank(candidate)
+    local kind = candidate and candidate.boundaryKind
+    if kind == "corner" or kind == "grid_boundary" then return 2 end
+    if kind == "boundary" then return 1 end
+
+    return 0
+end
+
+local function keepPreferredBoundaryCandidate(best, candidate, repair)
+    if not candidate then return best end
+
+    local tolerance = repair and repairToleranceForBoundary(candidate) or promoteToleranceForBoundary(candidate)
+    local distance = boundaryCandidateDistance(candidate)
+    if distance > tolerance * tolerance then return best end
+
+    if not best then return candidate end
+
+    local candidateRank = boundaryCandidateRank(candidate)
+    local bestRank = boundaryCandidateRank(best)
+    if candidateRank > bestRank then return candidate end
+    if candidateRank < bestRank then return best end
+
+    local bestDistance = boundaryCandidateDistance(best)
+    if distance < bestDistance then return candidate end
+    if math.abs(distance - bestDistance) <= M.COMPUTE_EPSILON
+        and (candidate.dist or math.huge) < (best.dist or math.huge) then
+        return candidate
+    end
+
+    return best
+end
+
 local function buildFace(surfaceData, normal, rawU, rawV, settings)
     local face = {
         worldBSP = true,
@@ -1483,15 +1518,9 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
         boundary = boundarySnapCandidate(face, rawU, rawV, snapped)
         local gridBoundary = nearestGridBoundaryCandidate(face, rawU, rawV, snapped, rawU, rawV)
         local currentDist = snapCandidateDistance({ u = u, v = v }, rawU, rawV)
-        local promoteBoundary = keepBestBoundaryIntersection(nil, gridBoundary)
-        promoteBoundary = keepBestBoundaryIntersection(promoteBoundary, boundary)
-        if boundary and boundary.boundaryKind == "corner" then
-            promoteBoundary = boundary
-        end
-        local promoteBoundaryDist = promoteBoundary and (promoteBoundary.boundaryDist or promoteBoundary.dist) or math.huge
-        local promoteTolerance = promoteToleranceForBoundary(promoteBoundary)
+        local promoteBoundary = keepPreferredBoundaryCandidate(nil, gridBoundary, false)
+        promoteBoundary = keepPreferredBoundaryCandidate(promoteBoundary, boundary, false)
         if promoteBoundary
-            and promoteBoundaryDist <= promoteTolerance * promoteTolerance
             and (promoteBoundary.boundaryKind ~= "boundary" or promoteBoundary.dist <= currentDist) then
             u = promoteBoundary.u
             v = promoteBoundary.v
@@ -1508,17 +1537,15 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
     end
 
     if not (settings and settings.shift) and not pointInPolygon2D(face.polygon, u, v, CONFIG.polygonTolerance) then
-        local repairBoundary = boundary and boundary.boundaryKind == "corner" and boundary
-            or nearestGridBoundaryCandidate(face, rawU, rawV, snapped, snapped and snapped.u, snapped and snapped.v)
-            or idealBoundarySnapCandidate(face, rawU, rawV, snapped)
-            or boundary
-            or boundarySnapCandidate(face, rawU, rawV, snapped)
-        local repairBoundaryDist = repairBoundary and (repairBoundary.boundaryDist or repairBoundary.dist) or math.huge
-        local repairTolerance = repairToleranceForBoundary(repairBoundary)
-        local nearest = repairBoundary
-            and repairBoundaryDist <= repairTolerance * repairTolerance
-            and repairBoundary
-            or nearestPolygonSnapPoint(face, rawU, rawV, snapped)
+        local repairBoundary = keepPreferredBoundaryCandidate(
+            nil,
+            nearestGridBoundaryCandidate(face, rawU, rawV, snapped, snapped and snapped.u, snapped and snapped.v),
+            true
+        )
+        repairBoundary = keepPreferredBoundaryCandidate(repairBoundary, idealBoundarySnapCandidate(face, rawU, rawV, snapped), true)
+        repairBoundary = keepPreferredBoundaryCandidate(repairBoundary, boundary, true)
+        repairBoundary = keepPreferredBoundaryCandidate(repairBoundary, boundarySnapCandidate(face, rawU, rawV, snapped), true)
+        local nearest = repairBoundary or nearestPolygonSnapPoint(face, rawU, rawV, snapped)
         if nearest then
             u = nearest.u
             v = nearest.v
