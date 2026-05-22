@@ -190,7 +190,11 @@ TOOL.ClientConVar = {
     preview_occluded_a = "160",
     ring_quality = tostring(RENDER_QUALITY.defaultIndex),
     world_bsp_snap = "1",
-    world_bsp_budget_ms = "1",
+    world_bsp_grid_mode = "global",
+    world_bsp_grid_size = "16",
+    world_bsp_budget_ms = "2.5",
+    world_bsp_ignore_brush_blockers = "1",
+    world_bsp_show_blockers = "0",
     rotation_snap = "12",
     translation_snap = "0",
     world_target = "1",
@@ -1552,7 +1556,16 @@ local function cfg(tool, out)
     out.translationSnap = translationSnapStep(tool)
     out.worldTarget = clientNumber(tool, "world_target", 1) == 1
     out.worldBspSnap = clientNumber(tool, "world_bsp_snap", 1) == 1
-    out.worldBspBudgetMs = math.Clamp(clientNumber(tool, "world_bsp_budget_ms", 1), 0.1, 8)
+    out.worldBspGridMode = string.lower(tostring(tool and tool.GetClientInfo and tool:GetClientInfo("world_bsp_grid_mode") or "global"))
+    if out.worldBspGridMode ~= "global" and out.worldBspGridMode ~= "global_units" then
+        out.worldBspGridMode = "per_surface"
+    else
+        out.worldBspGridMode = "global"
+    end
+    out.worldBspGridSize = math.Clamp(clientNumber(tool, "world_bsp_grid_size", 16), 0.125, 512)
+    out.worldBspBudgetMs = math.Clamp(clientNumber(tool, "world_bsp_budget_ms", 2.5), 0.1, 8)
+    out.worldBspIgnoreBrushBlockers = clientNumber(tool, "world_bsp_ignore_brush_blockers", 1) == 1
+    out.worldBspShowBlockers = clientNumber(tool, "world_bsp_show_blockers", 0) == 1
     out.alt = input.IsKeyDown(KEY_LALT) or input.IsKeyDown(KEY_RALT)
     out.shift = input.IsKeyDown(KEY_LSHIFT) or input.IsKeyDown(KEY_RSHIFT)
 
@@ -2277,19 +2290,352 @@ local function faceCandidate(ent, tr, settings, box)
     }
 end
 
-local function worldCandidateFromTrace(tr, settings)
+function client.worldBspTraceEntityIndex(ent)
+    if IsValid(ent) and isfunction(ent.EntIndex) then
+        return ent:EntIndex()
+    end
+end
+
+function client.worldBspCandidateCacheStatusToken()
     local worldBSP = client.WorldBSP
-    if settings
+    if not (worldBSP and isfunction(worldBSP.isReady) and worldBSP.isReady()) then return end
+
+    local cache = worldBSP and worldBSP.cache
+
+    return istable(cache) and cache.readyAt or true
+end
+
+function client.worldBspCandidateCacheSameTraceVec(entry, prefix, value)
+    if isvector(value) then
+        return entry[prefix .. "X"] == value.x
+            and entry[prefix .. "Y"] == value.y
+            and entry[prefix .. "Z"] == value.z
+    end
+
+    return entry[prefix .. "X"] == nil
+        and entry[prefix .. "Y"] == nil
+        and entry[prefix .. "Z"] == nil
+end
+
+function client.storeWorldBspCandidateCacheTraceVec(entry, prefix, value)
+    if isvector(value) then
+        entry[prefix .. "X"] = value.x
+        entry[prefix .. "Y"] = value.y
+        entry[prefix .. "Z"] = value.z
+    else
+        entry[prefix .. "X"] = nil
+        entry[prefix .. "Y"] = nil
+        entry[prefix .. "Z"] = nil
+    end
+end
+
+function client.worldBspCandidateCacheMatches(entry, tr, settings)
+    if not entry or not tr then return false end
+
+    return entry.worldBspCacheStatusToken == client.worldBspCandidateCacheStatusToken()
+        and entry.worldBspSnap == (settings and settings.worldBspSnap)
+        and entry.worldTarget == (settings and settings.worldTarget)
+        and entry.worldBspGridMode == (settings and settings.worldBspGridMode)
+        and entry.worldBspGridSize == (settings and settings.worldBspGridSize)
+        and entry.worldBspIgnoreBrushBlockers == (settings and settings.worldBspIgnoreBrushBlockers)
+        and entry.gridA == (settings and settings.gridA)
+        and entry.gridAMin == (settings and settings.gridAMin)
+        and entry.gridB == (settings and settings.gridB)
+        and entry.gridBMin == (settings and settings.gridBMin)
+        and entry.gridBEnabled == (settings and settings.gridBEnabled)
+        and entry.minLength == (settings and settings.minLength)
+        and entry.shift == (settings and settings.shift)
+        and entry.alt == (settings and settings.alt)
+        and entry.entity == tr.Entity
+        and entry.entityIndex == client.worldBspTraceEntityIndex(tr.Entity)
+        and entry.hitWorld == tr.HitWorld
+        and entry.hitSky == tr.HitSky
+        and entry.surfaceProps == tr.SurfaceProps
+        and entry.hitTexture == tr.HitTexture
+        and entry.matType == tr.MatType
+        and entry.contents == tr.Contents
+        and client.worldBspCandidateCacheSameTraceVec(entry, "hitPos", tr.HitPos)
+        and client.worldBspCandidateCacheSameTraceVec(entry, "hitNormal", tr.HitNormal)
+        and client.worldBspCandidateCacheSameTraceVec(entry, "startPos", tr.StartPos)
+        and client.worldBspCandidateCacheSameTraceVec(entry, "normal", tr.Normal)
+end
+
+function client.storeWorldBspCandidateCacheEntry(cache, tr, settings, candidate)
+    if not istable(cache) or not tr then return end
+
+    local index = (tonumber(cache.count) or 0) + 1
+    cache.count = index
+
+    local entry = cache[index]
+    if not istable(entry) then
+        entry = {}
+        cache[index] = entry
+    end
+
+    entry.settings = settings
+    entry.worldBspCacheStatusToken = client.worldBspCandidateCacheStatusToken()
+    entry.worldBspSnap = settings and settings.worldBspSnap
+    entry.worldTarget = settings and settings.worldTarget
+    entry.worldBspGridMode = settings and settings.worldBspGridMode
+    entry.worldBspGridSize = settings and settings.worldBspGridSize
+    entry.worldBspIgnoreBrushBlockers = settings and settings.worldBspIgnoreBrushBlockers
+    entry.gridA = settings and settings.gridA
+    entry.gridAMin = settings and settings.gridAMin
+    entry.gridB = settings and settings.gridB
+    entry.gridBMin = settings and settings.gridBMin
+    entry.gridBEnabled = settings and settings.gridBEnabled
+    entry.minLength = settings and settings.minLength
+    entry.shift = settings and settings.shift
+    entry.alt = settings and settings.alt
+    entry.entity = tr.Entity
+    entry.entityIndex = client.worldBspTraceEntityIndex(tr.Entity)
+    entry.hitWorld = tr.HitWorld
+    entry.hitSky = tr.HitSky
+    entry.surfaceProps = tr.SurfaceProps
+    entry.hitTexture = tr.HitTexture
+    entry.matType = tr.MatType
+    entry.contents = tr.Contents
+    client.storeWorldBspCandidateCacheTraceVec(entry, "hitPos", tr.HitPos)
+    client.storeWorldBspCandidateCacheTraceVec(entry, "hitNormal", tr.HitNormal)
+    client.storeWorldBspCandidateCacheTraceVec(entry, "startPos", tr.StartPos)
+    client.storeWorldBspCandidateCacheTraceVec(entry, "normal", tr.Normal)
+    entry.hasResult = true
+    entry.result = candidate
+end
+
+function client.lookupWorldBspCandidateCache(cache, tr, settings)
+    if not istable(cache) then return false end
+
+    local count = tonumber(cache.count) or 0
+    for i = 1, count do
+        local entry = cache[i]
+        if entry and entry.hasResult and client.worldBspCandidateCacheMatches(entry, tr, settings) then
+            return true, entry.result
+        end
+    end
+
+    return false
+end
+
+function client.clearWorldBspCandidateCache(cache)
+    if istable(cache) then
+        cache.count = 0
+    end
+end
+
+local function worldCandidateFromTrace(tr, settings, resultCache, stableCache)
+    local worldBSP = client.WorldBSP
+    local canUseWorldBsp = settings
         and settings.worldBspSnap
         and worldBSP
-        and isfunction(worldBSP.candidateFromTrace) then
-        local candidate = worldBSP.candidateFromTrace(tr, settings)
+        and isfunction(worldBSP.candidateFromTrace)
+    local stableCacheReady = canUseWorldBsp
+        and client.worldBspCandidateCacheStatusToken() ~= nil
+
+    if stableCacheReady then
+        local stableCached, stableCandidate = client.lookupWorldBspCandidateCache(stableCache, tr, settings)
+        if stableCached then
+            client.storeWorldBspCandidateCacheEntry(resultCache, tr, settings, stableCandidate)
+            return stableCandidate
+        end
+    else
+        client.clearWorldBspCandidateCache(stableCache)
+    end
+
+    local cached, cachedCandidate = client.lookupWorldBspCandidateCache(resultCache, tr, settings)
+    if cached then
+        return cachedCandidate
+    end
+
+    local candidate
+    if canUseWorldBsp then
+        candidate = worldBSP.candidateFromTrace(tr, settings)
         if candidate then
+            client.storeWorldBspCandidateCacheEntry(resultCache, tr, settings, candidate)
+            if stableCacheReady then
+                client.clearWorldBspCandidateCache(stableCache)
+                client.storeWorldBspCandidateCacheEntry(stableCache, tr, settings, candidate)
+            end
             return candidate
         end
     end
 
-    return geometry.traceCandidate(M.WORLD_TARGET, tr)
+    client.clearWorldBspCandidateCache(stableCache)
+    candidate = geometry.traceCandidate(M.WORLD_TARGET, tr)
+    client.storeWorldBspCandidateCacheEntry(resultCache, tr, settings, candidate)
+    return candidate
+end
+
+client.worldBspBlockerTraceDistance = 32768
+client.worldBspBlockerTraceLimit = 8
+
+function client.worldBspBlockerClass(ent)
+    if not IsValid(ent) or not isfunction(ent.GetClass) then return "" end
+    return string.lower(tostring(ent:GetClass() or ""))
+end
+
+function client.isWorldBspTraceBlocker(ent)
+    if not IsValid(ent) then return false end
+    if M.IsWorldTarget and M.IsWorldTarget(ent) then return false end
+    if isfunction(ent.IsPlayer) and ent:IsPlayer() then return false end
+    if isfunction(ent.IsNPC) and ent:IsNPC() then return false end
+    if isfunction(ent.IsWeapon) and ent:IsWeapon() then return false end
+    if M.IsProp and M.IsProp(ent) then return false end
+
+    local class = client.worldBspBlockerClass(ent)
+    if class == "" then return false end
+
+    return string.StartWith(class, "trigger_")
+        or string.StartWith(class, "func_")
+        or isfunction(ent.GetBrushSurfaces)
+end
+
+function client.clearWorldBspTraceScratchList(list)
+    if not istable(list) then return end
+
+    list._count = 0
+end
+
+function client.finishWorldBspTraceScratchList(list)
+    if not istable(list) then return end
+
+    local count = tonumber(list._count) or #list
+    for i = count + 1, #list do
+        list[i] = nil
+    end
+    list._count = nil
+end
+
+function client.addWorldBspTraceBlocker(blockers, tr, copyHit)
+    if not istable(blockers) or not tr or not client.isWorldBspTraceBlocker(tr.Entity) then return end
+
+    local ent = tr.Entity
+    local count = tonumber(blockers._count) or #blockers
+    for i = 1, count do
+        if blockers[i].ent == ent then return end
+    end
+
+    count = count + 1
+    blockers._count = count
+
+    local blocker = blockers[count]
+    if not istable(blocker) then
+        blocker = {}
+        blockers[count] = blocker
+    end
+
+    blocker.ent = ent
+    blocker.class = client.worldBspBlockerClass(ent)
+    blocker.index = isfunction(ent.EntIndex) and ent:EntIndex() or nil
+    if copyHit then
+        blocker.hitPos = isvector(tr.HitPos) and setVec(blocker.hitPos, tr.HitPos) or nil
+        blocker.hitNormal = isvector(tr.HitNormal) and setVec(blocker.hitNormal, tr.HitNormal) or nil
+    else
+        blocker.hitPos = nil
+        blocker.hitNormal = nil
+    end
+end
+
+function client.worldBspBlockerTraceStartAndDirection(tr)
+    local start = tr and isvector(tr.StartPos) and copyVec(tr.StartPos) or nil
+    local ply = LocalPlayer()
+    if not start and IsValid(ply) then
+        start = copyVec(ply:GetShootPos())
+    end
+    if not isvector(start) then return end
+
+    local dir = tr and isvector(tr.Normal) and normalizedVec(tr.Normal) or nil
+    if not dir and tr and isvector(tr.HitPos) then
+        dir = normalizedVec(tr.HitPos - start)
+    end
+    if not dir and IsValid(ply) then
+        dir = normalizedVec(ply:GetAimVector())
+    end
+    if not dir then return end
+
+    return start, dir
+end
+
+function client.addWorldBspBaseBlockerTraceFilter(filter)
+    local ply = LocalPlayer()
+    local weapon = IsValid(ply) and ply:GetActiveWeapon() or nil
+
+    if IsValid(ply) then
+        filter[#filter + 1] = ply
+    end
+    if IsValid(weapon) then
+        filter[#filter + 1] = weapon
+    end
+end
+
+function client.worldBspTraceThroughBlockers(tr, settings, scratch)
+    if not tr or tr.HitSky == true or not client.isWorldBspTraceBlocker(tr.Entity) then
+        return tr, nil
+    end
+    if not (settings and (settings.worldBspIgnoreBrushBlockers or settings.worldBspShowBlockers)) then
+        return tr, nil
+    end
+
+    scratch = istable(scratch) and scratch or nil
+    local blockers = scratch and scratch.blockers or {}
+    if scratch then
+        scratch.blockers = blockers
+        client.clearWorldBspTraceScratchList(blockers)
+    end
+
+    local copyHits = settings.worldBspShowBlockers == true
+    client.addWorldBspTraceBlocker(blockers, tr, copyHits)
+
+    if not settings.worldBspIgnoreBrushBlockers then
+        client.finishWorldBspTraceScratchList(blockers)
+        return tr, blockers
+    end
+
+    local start, dir = client.worldBspBlockerTraceStartAndDirection(tr)
+    if not start or not dir then
+        client.finishWorldBspTraceScratchList(blockers)
+        return tr, blockers
+    end
+
+    local filter = scratch and scratch.filter or {}
+    if scratch then
+        scratch.filter = filter
+        for i = 1, #filter do
+            filter[i] = nil
+        end
+    end
+    client.addWorldBspBaseBlockerTraceFilter(filter)
+    if IsValid(tr.Entity) then
+        filter[#filter + 1] = tr.Entity
+    end
+
+    for _ = 1, client.worldBspBlockerTraceLimit do
+        local filtered = util.TraceLine({
+            start = toVector(start),
+            endpos = toVector(start + dir * client.worldBspBlockerTraceDistance),
+            filter = filter
+        })
+        if not filtered or filtered.Hit == false or filtered.HitSky == true then
+            client.finishWorldBspTraceScratchList(blockers)
+            return tr, blockers
+        end
+
+        if geometry.traceHitsWorld(filtered) then
+            client.finishWorldBspTraceScratchList(blockers)
+            return filtered, blockers
+        end
+
+        if not client.isWorldBspTraceBlocker(filtered.Entity) then
+            client.finishWorldBspTraceScratchList(blockers)
+            return tr, blockers
+        end
+
+        client.addWorldBspTraceBlocker(blockers, filtered, copyHits)
+        filter[#filter + 1] = filtered.Entity
+    end
+
+    client.finishWorldBspTraceScratchList(blockers)
+    return tr, blockers
 end
 
 local function axisVectorForKey(basis, key)
@@ -2840,57 +3186,147 @@ function gizmoShared.sizeForProp(ent)
     )
 end
 
-function gizmoShared.metricsForSize(size)
-    size = tonumber(size) or GIZMO_CONFIG.defaultSize
-
-    return {
-        planeOffset = size * GIZMO_CONFIG.planeOffsetScale,
-        ringRadius = size * GIZMO_CONFIG.ringRadiusScale,
-        ringPadding = GIZMO_CONFIG.ringPadding,
-        pickRadius = math.max(GIZMO_CONFIG.pickRadiusMin, size * size * GIZMO_CONFIG.pickRadiusScale)
-    }
-end
-
-function gizmoShared.linearHandles(origin, basis, size)
-    local basisForward, basisRight, basisUp = M.AngleAxesPrecise(basis)
-    local metrics = gizmoShared.metricsForSize(size)
-    local function originOffset(axis, distance)
-        return M.AddVectorsPrecise(origin, M.ScaleVectorPrecise(axis, distance))
+function gizmoShared.setVecComponents(out, x, y, z)
+    if not isvector(out) then
+        return VectorP(x, y, z)
     end
 
-    return {
-        { kind = "move", key = "x", color = colors.x, a = origin, b = originOffset(basisForward, size) },
-        { kind = "move", key = "y", color = colors.y, a = origin, b = originOffset(basisRight, size) },
-        { kind = "move", key = "z", color = colors.z, a = origin, b = originOffset(basisUp, size) },
-        { kind = "plane", key = "xy", color = colors.xy, center = M.AddVectorsPrecise(originOffset(basisForward, metrics.planeOffset), M.ScaleVectorPrecise(basisRight, metrics.planeOffset)) },
-        { kind = "plane", key = "xz", color = colors.xz, center = M.AddVectorsPrecise(originOffset(basisForward, metrics.planeOffset), M.ScaleVectorPrecise(basisUp, metrics.planeOffset)) },
-        { kind = "plane", key = "yz", color = colors.yz, center = M.AddVectorsPrecise(originOffset(basisRight, metrics.planeOffset), M.ScaleVectorPrecise(basisUp, metrics.planeOffset)) }
-    }, basisForward, basisRight, basisUp, metrics
+    out.x, out.y, out.z = x, y, z
+    return out
+end
+
+function gizmoShared.setOffsetVec(out, origin, axis, distance)
+    if not isvector(origin) or not isvector(axis) then return end
+
+    distance = tonumber(distance) or 0
+    return gizmoShared.setVecComponents(
+        out,
+        origin.x + axis.x * distance,
+        origin.y + axis.y * distance,
+        origin.z + axis.z * distance
+    )
+end
+
+function gizmoShared.setOffsetVec2(out, origin, axisA, distanceA, axisB, distanceB)
+    if not isvector(origin) or not isvector(axisA) or not isvector(axisB) then return end
+
+    distanceA = tonumber(distanceA) or 0
+    distanceB = tonumber(distanceB) or 0
+    return gizmoShared.setVecComponents(
+        out,
+        origin.x + axisA.x * distanceA + axisB.x * distanceB,
+        origin.y + axisA.y * distanceA + axisB.y * distanceB,
+        origin.z + axisA.z * distanceA + axisB.z * distanceB
+    )
+end
+
+function gizmoShared.handle(handles, index, kind, key, color)
+    local item = handles[index]
+    if not istable(item) then
+        item = {}
+        handles[index] = item
+    end
+
+    item.kind = kind
+    item.key = key
+    item.color = color
+    item.a = nil
+    item.b = nil
+    item.center = nil
+    item.axis = nil
+    item.cursorAngle = nil
+    return item
+end
+
+function gizmoShared.copyHandle(item, out)
+    if not istable(item) then return end
+
+    out = out or {}
+    out.kind = item.kind
+    out.key = item.key
+    out.color = item.color
+    out.a = isvector(item.a) and copyVec(item.a) or item.a
+    out.b = isvector(item.b) and copyVec(item.b) or item.b
+    out.center = isvector(item.center) and copyVec(item.center) or item.center
+    out.axis = isvector(item.axis) and copyVec(item.axis) or item.axis
+    out.cursorAngle = item.cursorAngle
+
+    return out
+end
+
+function gizmoShared.metricsForSize(size, out)
+    size = tonumber(size) or GIZMO_CONFIG.defaultSize
+
+    out = istable(out) and out or {}
+    out.planeOffset = size * GIZMO_CONFIG.planeOffsetScale
+    out.ringRadius = size * GIZMO_CONFIG.ringRadiusScale
+    out.ringPadding = GIZMO_CONFIG.ringPadding
+    out.pickRadius = math.max(GIZMO_CONFIG.pickRadiusMin, size * size * GIZMO_CONFIG.pickRadiusScale)
+    return out
+end
+
+function gizmoShared.linearHandles(origin, basis, size, reuse)
+    local basisForward, basisRight, basisUp = M.AngleAxesPrecise(basis)
+    local handles = istable(reuse) and reuse.handles or {}
+    local metrics = gizmoShared.metricsForSize(size, istable(reuse) and reuse.metrics or nil)
+    if istable(reuse) then
+        reuse.handles = handles
+        reuse.metrics = metrics
+    end
+
+    local handle = gizmoShared.handle(handles, 1, "move", "x", colors.x)
+    handle.a = origin
+    handle.b = gizmoShared.setOffsetVec(handle.b, origin, basisForward, size)
+
+    handle = gizmoShared.handle(handles, 2, "move", "y", colors.y)
+    handle.a = origin
+    handle.b = gizmoShared.setOffsetVec(handle.b, origin, basisRight, size)
+
+    handle = gizmoShared.handle(handles, 3, "move", "z", colors.z)
+    handle.a = origin
+    handle.b = gizmoShared.setOffsetVec(handle.b, origin, basisUp, size)
+
+    handle = gizmoShared.handle(handles, 4, "plane", "xy", colors.xy)
+    handle.center = gizmoShared.setOffsetVec2(handle.center, origin, basisForward, metrics.planeOffset, basisRight, metrics.planeOffset)
+
+    handle = gizmoShared.handle(handles, 5, "plane", "xz", colors.xz)
+    handle.center = gizmoShared.setOffsetVec2(handle.center, origin, basisForward, metrics.planeOffset, basisUp, metrics.planeOffset)
+
+    handle = gizmoShared.handle(handles, 6, "plane", "yz", colors.yz)
+    handle.center = gizmoShared.setOffsetVec2(handle.center, origin, basisRight, metrics.planeOffset, basisUp, metrics.planeOffset)
+
+    for i = 7, #handles do
+        handles[i] = nil
+    end
+
+    return handles, basisForward, basisRight, basisUp, metrics
 end
 
 function gizmoShared.pickHoveredHandle(handles, pickRadius, ringRadius, ringPadding, origin, basis, eye, dir)
     local x, y = ScrW() * 0.5, ScrH() * 0.5
     local best, bestDist
-
-    local function take(item, dist)
-        if dist and dist < pickRadius and (not bestDist or dist < bestDist) then
-            best = item
-            bestDist = dist
-        end
-    end
+    pickRadius = tonumber(pickRadius) or 0
 
     for i = 1, #handles do
         local item = handles[i]
 
-        if item.kind == "move" then
+        if item.kind == "move" and isvector(item.b) then
             local screen = item.b:ToScreen()
             if screen.visible then
-                take(item, (x - screen.x) ^ 2 + (y - screen.y) ^ 2)
+                local dist = (x - screen.x) ^ 2 + (y - screen.y) ^ 2
+                if dist < pickRadius and (not bestDist or dist < bestDist) then
+                    best = item
+                    bestDist = dist
+                end
             end
-        elseif item.kind == "plane" then
+        elseif item.kind == "plane" and isvector(item.center) then
             local screen = item.center:ToScreen()
             if screen.visible then
-                take(item, (x - screen.x) ^ 2 + (y - screen.y) ^ 2)
+                local dist = (x - screen.x) ^ 2 + (y - screen.y) ^ 2
+                if dist < pickRadius and (not bestDist or dist < bestDist) then
+                    best = item
+                    bestDist = dist
+                end
             end
         elseif item.kind == "rot" and isvector(eye) and isvector(dir) then
             local _, localPos = M.LinePlaneIntersection(dir, eye, item.axis, origin, basis)
@@ -2899,7 +3335,10 @@ function gizmoShared.pickHoveredHandle(handles, pickRadius, ringRadius, ringPadd
                 item.cursorAngle = math.deg(ringAngle(item.key, localPos))
                 local dist = math.abs(math.sqrt(u * u + v * v) - ringRadius)
                 if dist <= ringPadding then
-                    take(item, dist)
+                    if dist < pickRadius and (not bestDist or dist < bestDist) then
+                        best = item
+                        bestDist = dist
+                    end
                 end
             end
         end
@@ -2997,10 +3436,15 @@ local function gizmo(tool, state)
         referenceBasis = press.referenceBasis
     end
 
-    local handles, basisForward, basisRight, basisUp, metrics = gizmoShared.linearHandles(origin, basis, size)
-    handles[#handles + 1] = { kind = "rot", key = "roll", axis = basisForward, color = colors.x }
-    handles[#handles + 1] = { kind = "rot", key = "pitch", axis = basisRight, color = colors.y }
-    handles[#handles + 1] = { kind = "rot", key = "yaw", axis = basisUp, color = colors.z }
+    local scratch = state._magicAlignGizmoScratch or {}
+    state._magicAlignGizmoScratch = scratch
+    local handles, basisForward, basisRight, basisUp, metrics = gizmoShared.linearHandles(origin, basis, size, scratch)
+    local handle = gizmoShared.handle(handles, 7, "rot", "roll", colors.x)
+    handle.axis = basisForward
+    handle = gizmoShared.handle(handles, 8, "rot", "pitch", colors.y)
+    handle.axis = basisRight
+    handle = gizmoShared.handle(handles, 9, "rot", "yaw", colors.z)
+    handle.axis = basisUp
 
     local best = gizmoShared.pickHoveredHandle(
         handles,
@@ -3027,6 +3471,7 @@ local function gizmo(tool, state)
 end
 
 local function clearHover(hover)
+    hover.rawTrace = nil
     hover.trace = nil
     hover.settings = nil
     hover.gizmo = nil
@@ -3040,6 +3485,9 @@ local function clearHover(hover)
     hover.pickTarget = nil
     hover.overlayBox = nil
     hover.overlay = nil
+    hover.worldBspBlockers = nil
+    hover.worldBspCandidateCache = nil
+    hover.worldBspStableCandidateCache = nil
 end
 
 local function markPointSnapshot(cache, prefix, points)
@@ -3066,10 +3514,17 @@ local function markPointSnapshot(cache, prefix, points)
                 changed = true
                 cache[base .. "nx"], cache[base .. "ny"], cache[base .. "nz"] = nil, nil, nil
             end
+
+            local world = point.world == true or nil
+            if cache[base .. "world"] ~= world then
+                changed = true
+                cache[base .. "world"] = world
+            end
         elseif cache[base .. "x"] ~= nil then
             changed = true
             cache[base .. "x"], cache[base .. "y"], cache[base .. "z"] = nil, nil, nil
             cache[base .. "nx"], cache[base .. "ny"], cache[base .. "nz"] = nil, nil, nil
+            cache[base .. "world"] = nil
         end
     end
 
@@ -3137,8 +3592,85 @@ local function previewInputsChanged(state, cache, offsetRevision, sourceAnchorRe
     return changed
 end
 
+local function markVecSnapshot(cache, prefix, value)
+    if isvector(value) then
+        local changed = cache[prefix .. "x"] ~= value.x or cache[prefix .. "y"] ~= value.y or cache[prefix .. "z"] ~= value.z
+        cache[prefix .. "x"], cache[prefix .. "y"], cache[prefix .. "z"] = value.x, value.y, value.z
+        return changed
+    end
+
+    if cache[prefix .. "x"] ~= nil or cache[prefix .. "y"] ~= nil or cache[prefix .. "z"] ~= nil then
+        cache[prefix .. "x"], cache[prefix .. "y"], cache[prefix .. "z"] = nil, nil, nil
+        return true
+    end
+
+    return false
+end
+
+local function markPendingCandidateSnapshot(cache, prefix, candidate)
+    local changed = false
+    local isWorld = geometry.isWorldTarget(candidate.ent) or nil
+    local face = candidate.face
+    local hasFace = istable(face)
+    local surface = hasFace and face.surface or nil
+    local snapMode = hasFace and face.snapMode or nil
+    local uSnap = hasFace and face.uSnap or nil
+    local vSnap = hasFace and face.vSnap or nil
+    local gridUId = hasFace and face.snapGridUId or nil
+    local gridVId = hasFace and face.snapGridVId or nil
+    local indexU = hasFace and face.snapIndexU or nil
+    local indexV = hasFace and face.snapIndexV or nil
+
+    if cache[prefix .. "Ent"] ~= candidate.ent then cache[prefix .. "Ent"] = candidate.ent; changed = true end
+    if cache[prefix .. "Mode"] ~= candidate.mode then cache[prefix .. "Mode"] = candidate.mode; changed = true end
+    if cache[prefix .. "World"] ~= isWorld then cache[prefix .. "World"] = isWorld; changed = true end
+    if markVecSnapshot(cache, prefix .. "LocalPos", candidate.localPos) then changed = true end
+    if markVecSnapshot(cache, prefix .. "LocalNormal", candidate.localNormal) then changed = true end
+    if markVecSnapshot(cache, prefix .. "WorldPos", candidate.worldPos) then changed = true end
+    if markVecSnapshot(cache, prefix .. "Normal", candidate.normal) then changed = true end
+
+    if cache[prefix .. "Surface"] ~= surface then cache[prefix .. "Surface"] = surface; changed = true end
+    if cache[prefix .. "SnapMode"] ~= snapMode then cache[prefix .. "SnapMode"] = snapMode; changed = true end
+    if cache[prefix .. "USnap"] ~= uSnap then cache[prefix .. "USnap"] = uSnap; changed = true end
+    if cache[prefix .. "VSnap"] ~= vSnap then cache[prefix .. "VSnap"] = vSnap; changed = true end
+    if cache[prefix .. "GridUId"] ~= gridUId then cache[prefix .. "GridUId"] = gridUId; changed = true end
+    if cache[prefix .. "GridVId"] ~= gridVId then cache[prefix .. "GridVId"] = gridVId; changed = true end
+    if cache[prefix .. "IndexU"] ~= indexU then cache[prefix .. "IndexU"] = indexU; changed = true end
+    if cache[prefix .. "IndexV"] ~= indexV then cache[prefix .. "IndexV"] = indexV; changed = true end
+
+    return changed
+end
+
+local function pendingPreviewInputsChanged(state, cache, candidate, offsetRevision, sourceAnchorRevision, targetAnchorRevision, sourceAnchorId, sourcePriority, targetAnchorId, targetPriority)
+    local changed = false
+
+    if markPoseSnapshot(cache, "prop1", state.prop1) then changed = true end
+    if markPoseSnapshot(cache, "prop2", state.prop2) then changed = true end
+    if markPointSnapshot(cache, "source", state.source) then changed = true end
+    if markPointSnapshot(cache, "target", state.target) then changed = true end
+    if markPendingCandidateSnapshot(cache, "pendingCandidate", candidate) then changed = true end
+
+    if cache.offsetRevision ~= offsetRevision then cache.offsetRevision = offsetRevision; changed = true end
+    if cache.sourceAnchorRevision ~= sourceAnchorRevision then cache.sourceAnchorRevision = sourceAnchorRevision; changed = true end
+    if cache.targetAnchorRevision ~= targetAnchorRevision then cache.targetAnchorRevision = targetAnchorRevision; changed = true end
+    if cache.sourceAnchorId ~= sourceAnchorId then cache.sourceAnchorId = sourceAnchorId; changed = true end
+    if cache.targetAnchorId ~= targetAnchorId then cache.targetAnchorId = targetAnchorId; changed = true end
+    if cache.sourcePriority ~= sourcePriority then cache.sourcePriority = sourcePriority; changed = true end
+    if cache.targetPriority ~= targetPriority then cache.targetPriority = targetPriority; changed = true end
+
+    return changed
+end
+
+local function markPreviewChangedFrame(state)
+    state._magicAlignPreviewChangedFrame = currentFrameNumber()
+end
+
 local function solvePreview(tool, state)
     if not IsValid(state.prop1) then
+        if state.preview ~= nil then
+            markPreviewChangedFrame(state)
+        end
+
         state.preview = nil
         state.pending = nil
         state._magicAlignPreviewCache = nil
@@ -3171,6 +3703,10 @@ local function solvePreview(tool, state)
     )
 
     if not solve then
+        if state.preview ~= nil then
+            markPreviewChangedFrame(state)
+        end
+
         state.preview = nil
         state.pending = nil
         return
@@ -3214,6 +3750,7 @@ local function solvePreview(tool, state)
     preview.baseAng = rawAng
     preview.linked = linkedPreview
     state.preview = preview
+    markPreviewChangedFrame(state)
     previewInputsChanged(state, cache, offsetRevision, sourceAnchorRevision, targetAnchorRevision, sourceAnchorId, sourcePriority, targetAnchorId, targetPriority)
 end
 
@@ -3287,20 +3824,37 @@ local function ensureGhost(state)
 end
 
 local function hoverState(tool, state)
-    local tr = LocalPlayer():GetEyeTrace()
+    local rawTrace = LocalPlayer():GetEyeTrace()
     local settings = cfg(tool, state._magicAlignHoverSettings or {})
     state._magicAlignHoverSettings = settings
+    local candidateCache = state._magicAlignWorldBspCandidateCache or {}
+    state._magicAlignWorldBspCandidateCache = candidateCache
+    candidateCache.count = 0
+    local stableCandidateCache = state._magicAlignWorldBspStableCandidateCache or {}
+    state._magicAlignWorldBspStableCandidateCache = stableCandidateCache
 
     local worldBSP = client.WorldBSP
     if settings.worldTarget and settings.worldBspSnap and worldBSP and isfunction(worldBSP.update) then
         worldBSP.update(settings)
     end
 
+    local tr = rawTrace
+    local worldBspBlockers
+    if settings.worldTarget and settings.worldBspSnap then
+        local traceScratch = state._magicAlignWorldBspTraceScratch or {}
+        state._magicAlignWorldBspTraceScratch = traceScratch
+        tr, worldBspBlockers = client.worldBspTraceThroughBlockers(rawTrace, settings, traceScratch)
+    end
+
     local hover = state._magicAlignHover or {}
     state._magicAlignHover = hover
     clearHover(hover)
+    hover.rawTrace = rawTrace
     hover.trace = tr
     hover.settings = settings
+    hover.worldBspBlockers = worldBspBlockers
+    hover.worldBspCandidateCache = candidateCache
+    hover.worldBspStableCandidateCache = stableCandidateCache
     local side, ent, points = editable(state, tr.Entity, tr)
 
     if IsValid(state.prop1) then requestBounds(state, state.prop1) end
@@ -3319,11 +3873,25 @@ local function hoverState(tool, state)
             hover.point = hoverPoint(ent, points)
 
             if geometry.isWorldTarget(ent) then
-                hover.candidate = worldCandidateFromTrace(tr, settings)
+                hover.candidate = worldCandidateFromTrace(tr, settings, candidateCache, stableCandidateCache)
             else
                 hover.box = boundsFor(state, ent)
                 hover.candidate = faceCandidate(ent, tr, settings, hover.box)
             end
+        end
+    end
+
+    if not hover.candidate
+        and settings.worldBspIgnoreBrushBlockers
+        and istable(worldBspBlockers)
+        and #worldBspBlockers > 0
+        and geometry.isWorldTarget(state.prop2) then
+        local candidate = worldCandidateFromTrace(rawTrace, settings, candidateCache, stableCandidateCache)
+        if candidate then
+            hover.side = "target"
+            hover.points = state.target
+            hover.ent = state.prop2
+            hover.candidate = candidate
         end
     end
 
@@ -3341,7 +3909,27 @@ local function hoverState(tool, state)
         hover.overlayBox = boundsFor(state, tr.Entity)
         hover.overlay = faceCandidate(tr.Entity, tr, settings, hover.overlayBox)
     elseif not hover.candidate and not hover.overlay and settings.worldTarget and geometry.traceHitsWorld(tr) and not geometry.hasTargetEntity(state.prop2) and #state.source > 0 then
-        hover.overlay = worldCandidateFromTrace(tr, settings)
+        hover.overlay = worldCandidateFromTrace(tr, settings, candidateCache, stableCandidateCache)
+    elseif not hover.candidate
+        and not hover.overlay
+        and settings.worldTarget
+        and settings.worldBspIgnoreBrushBlockers
+        and istable(worldBspBlockers)
+        and #worldBspBlockers > 0
+        and not geometry.hasTargetEntity(state.prop2)
+        and #state.source > 0 then
+        hover.overlay = worldCandidateFromTrace(rawTrace, settings, candidateCache, stableCandidateCache)
+        if hover.overlay then
+            hover.pickTarget = M.WORLD_TARGET
+        end
+    end
+
+    local prepareWorldBspRender = client.prepareWorldBspRenderCandidate
+    if isfunction(prepareWorldBspRender) then
+        prepareWorldBspRender(hover.candidate)
+        if hover.overlay ~= hover.candidate then
+            prepareWorldBspRender(hover.overlay)
+        end
     end
 
     return hover
@@ -3369,11 +3957,64 @@ local function pointFromCandidateInto(candidate, out)
     return out
 end
 
-local function pendingPreview(tool, state)
+local function invalidatePendingPreview(state)
     state.pending = nil
 
-    if not state.hover or state.hover.side ~= "target" or state.hover.point or not state.hover.candidate or #state.target >= M.MAX_POINTS then
+    local cache = state._magicAlignPendingPreviewCache
+    if cache then
+        cache.valid = false
+        cache.hasPending = false
+    end
+end
+
+local function pendingPreview(tool, state)
+    if not IsValid(state.prop1)
+        or not state.hover
+        or state.hover.side ~= "target"
+        or state.hover.point
+        or not state.hover.candidate
+        or #state.target >= M.MAX_POINTS then
+        invalidatePendingPreview(state)
         return
+    end
+
+    local candidate = state.hover.candidate
+    if not istable(candidate) or not isvector(candidate.localPos) then
+        invalidatePendingPreview(state)
+        return
+    end
+
+    local sourceAnchorOptions, sourceAnchorRevision = cachedAnchorOptions(tool, state, "from")
+    local targetAnchorOptions, targetAnchorRevision = cachedAnchorOptions(tool, state, "to")
+    local offsetTable, offsetRevision = cachedOffsets(tool, state)
+    local sourceAnchorId, sourcePriority = selectedAnchorState(tool, state, "from")
+    local targetAnchorId, targetPriority = selectedAnchorState(tool, state, "to")
+    local cache = state._magicAlignPendingPreviewCache or {}
+    state._magicAlignPendingPreviewCache = cache
+    local inputsChanged = pendingPreviewInputsChanged(
+        state,
+        cache,
+        candidate,
+        offsetRevision,
+        sourceAnchorRevision,
+        targetAnchorRevision,
+        sourceAnchorId,
+        sourcePriority,
+        targetAnchorId,
+        targetPriority
+    )
+
+    if cache.valid and not inputsChanged then
+        if cache.hasPending == false then
+            state.pending = nil
+            return
+        end
+
+        local pending = state._magicAlignPendingPreview
+        if pending then
+            state.pending = pending
+            return
+        end
     end
 
     local points = state._magicAlignPendingPoints or {}
@@ -3385,17 +4026,17 @@ local function pendingPreview(tool, state)
     end
 
     local pendingPoint = pointFromCandidateInto(state.hover.candidate, points[targetCount + 1])
-    if not pendingPoint then return end
+    if not pendingPoint then
+        cache.valid = true
+        cache.hasPending = false
+        state.pending = nil
+        return
+    end
+
     points[targetCount + 1] = pendingPoint
     for i = targetCount + 2, #points do
         points[i] = nil
     end
-
-    local sourceAnchorOptions = cachedAnchorOptions(tool, state, "from")
-    local targetAnchorOptions = cachedAnchorOptions(tool, state, "to")
-    local offsetTable = cachedOffsets(tool, state)
-    local sourceAnchorId, sourcePriority = selectedAnchorState(tool, state, "from")
-    local targetAnchorId, targetPriority = selectedAnchorState(tool, state, "to")
 
     local solve = M.Solve(
         state.prop1,
@@ -3420,6 +4061,12 @@ local function pendingPreview(tool, state)
         pending.spaceBasis = spaceBasis
         pending.referenceBasis = referenceBasis
         state.pending = pending
+        cache.valid = true
+        cache.hasPending = true
+    else
+        state.pending = nil
+        cache.valid = true
+        cache.hasPending = false
     end
 end
 
@@ -3602,7 +4249,12 @@ end
 local function drawPressCandidate(kind, ent, hover)
     if not geometry.hasTargetEntity(ent) or not hover or not hover.trace then return end
     if geometry.isWorldTarget(ent) then
-        return worldCandidateFromTrace(hover.trace, hover.settings)
+        return worldCandidateFromTrace(
+            hover.trace,
+            hover.settings,
+            hover.worldBspCandidateCache,
+            hover.worldBspStableCandidateCache
+        )
     end
 
     return geometry.traceCandidate(ent, hover.trace)
@@ -3633,8 +4285,7 @@ local function beginPickPress(kind, side, ent, hover)
         clickCandidate = nil
     end
 
-    local drawCandidate = drawPressCandidate(kind, ent, hover)
-    local candidate = clickCandidate or drawCandidate
+    local candidate = clickCandidate or drawPressCandidate(kind, ent, hover)
     if not candidate then return end
 
     local firstSample = buildTraceSample(ent, hover.trace.HitPos, hover.trace.HitNormal, hover.trace)
@@ -3662,7 +4313,8 @@ local function beginGizmoDrag(tool, state, handle)
     local dir = ply:GetAimVector()
     local origin = handle.origin
     local basis = handle.basis
-    local item = handle.hover
+    local item = gizmoShared.copyHandle(handle.hover)
+    if not item then return end
     local normal = ((item.kind == "move" or item.kind == "plane")
         and gizmoShared.linearDragNormal(origin, basis, item, eye)
         or item.axis)

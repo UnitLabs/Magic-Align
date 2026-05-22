@@ -46,6 +46,8 @@ local rotationSnapDivisors = client.rotationSnapDivisors or { 2, 3, 4, 5, 6, 8, 
 local defaultRotationSnapIndex = client.defaultRotationSnapIndex or 13
 local ringQualityPresets = client.ringQualityPresets
 local defaultRingQualityIndex = client.defaultRingQualityIndex or 2
+local worldGridUnitPresets = { 0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 }
+local referencePositionSliderTargetIntervals = 16
 local setStringConVar
 local getStringConVar
 local menuFooterText = "Thank you for using Magic Align.\nI hope it helps your builds click into place a little faster, cleaner, and calmer."
@@ -154,7 +156,11 @@ local persistedMenuConVars = {
     "magic_align_grid_label_reduce_fraction",
     "magic_align_grid_alpha",
     "magic_align_world_bsp_snap",
+    "magic_align_world_bsp_grid_mode",
+    "magic_align_world_bsp_grid_size",
     "magic_align_world_bsp_budget_ms",
+    "magic_align_world_bsp_ignore_brush_blockers",
+    "magic_align_world_bsp_show_blockers",
     "magic_align_display_rounding",
     "magic_align_preview_occluded",
     "magic_align_preview_occluded_r",
@@ -231,6 +237,26 @@ local function currentTranslationSnapStep()
     return clampTranslationSnapStep(getStringConVar("magic_align_translation_snap", 0))
 end
 
+local function referencePositionSliderSnapStep(slider)
+    local gridStep = tonumber(currentTranslationSnapStep()) or 0
+    if gridStep <= 0 then
+        return nil
+    end
+
+    local range = 32
+    if IsValid(slider) and isfunction(slider.GetRange) then
+        range = math.abs(tonumber(slider:GetRange()) or range)
+    end
+
+    local targetStep = range / referencePositionSliderTargetIntervals
+    if targetStep <= 0 then
+        return gridStep
+    end
+
+    local divisor = math.max(math.Round(gridStep / targetStep), 1)
+    return gridStep / divisor
+end
+
 local function setTranslationSnapStep(step)
     setStringConVar("magic_align_translation_snap", M.FormatConVarNumber(clampTranslationSnapStep(step)))
 end
@@ -241,6 +267,65 @@ end
 
 local function setTraceSnapLength(length)
     setStringConVar("magic_align_trace_snap_length", M.FormatConVarNumber(clampTraceSnapLength(length)))
+end
+
+local function clampWorldGridSize(size)
+    return math.Clamp(tonumber(size) or 16, worldGridUnitPresets[1], worldGridUnitPresets[#worldGridUnitPresets])
+end
+
+local function currentWorldGridSize()
+    return clampWorldGridSize(getStringConVar("magic_align_world_bsp_grid_size", 16))
+end
+
+local function setWorldGridSize(size)
+    setStringConVar("magic_align_world_bsp_grid_size", M.FormatConVarNumber(clampWorldGridSize(size)))
+end
+
+local function currentWorldGridMode()
+    local mode = string.lower(tostring(getStringConVar("magic_align_world_bsp_grid_mode", "global") or ""))
+    if mode == "global" or mode == "global_units" then
+        return "global"
+    end
+
+    return "per_surface"
+end
+
+local function setWorldGridMode(mode)
+    mode = (mode == "global" or mode == "global_units") and "global" or "per_surface"
+    setStringConVar("magic_align_world_bsp_grid_mode", mode)
+end
+
+local function worldGridPresetFraction(value)
+    value = clampWorldGridSize(value)
+    local minExponent = -3
+    local maxExponent = 9
+
+    return math.Clamp((math.log(value) / math.log(2) - minExponent) / (maxExponent - minExponent), 0, 1)
+end
+
+local function worldGridPresetForFraction(fraction)
+    fraction = math.Clamp(tonumber(fraction) or 0, 0, 1)
+    local index = math.Clamp(math.Round(fraction * (#worldGridUnitPresets - 1)) + 1, 1, #worldGridUnitPresets)
+
+    return worldGridUnitPresets[index]
+end
+
+local function nearestWorldGridPreset(value)
+    value = clampWorldGridSize(value)
+    local logValue = math.log(value) / math.log(2)
+    local best = worldGridUnitPresets[1]
+    local bestDist = math.huge
+
+    for i = 1, #worldGridUnitPresets do
+        local preset = worldGridUnitPresets[i]
+        local dist = math.abs(math.log(preset) / math.log(2) - logValue)
+        if dist < bestDist then
+            best = preset
+            bestDist = dist
+        end
+    end
+
+    return best
 end
 
 local function currentRingQualityIndex()
@@ -1163,6 +1248,96 @@ local function addStyledCheckBox(panel, label, convar)
     return checkBox
 end
 
+local function createStyledModeCombo(parent, choices, currentValue, onChange)
+    local combo = vgui.Create("DComboBox", parent)
+    combo:SetTall(26)
+    if combo.SetSortItems then
+        combo:SetSortItems(false)
+    end
+    if combo.SetTextColor then
+        combo:SetTextColor(menuColors.text)
+    end
+
+    for i = 1, #(choices or {}) do
+        local choice = choices[i]
+        combo:AddChoice(choice.label, choice.value, choice.value == currentValue)
+    end
+
+    combo.Paint = function(self, w, h)
+        local bg = self:IsHovered() and menuColors.inputFocus or menuColors.input
+        draw.RoundedBox(4, 0, 0, w, h, bg)
+        surface.SetDrawColor(menuColors.inputBorder)
+        surface.DrawOutlinedRect(0, 0, w, h, 1)
+    end
+
+    combo.OnSelect = function(self, index, _, data)
+        if self.MagicAlignSyncing then return end
+
+        if data == nil and choices and choices[index] then
+            data = choices[index].value
+        end
+
+        if onChange then
+            onChange(data)
+        end
+    end
+
+    return combo
+end
+
+local function syncComboToValue(combo, choices, value)
+    if not IsValid(combo) then return end
+    if IsValid(combo.Menu) and combo.Menu:IsVisible() then return end
+
+    for i = 1, #(choices or {}) do
+        local choice = choices[i]
+        if choice.value == value then
+            if combo:GetSelectedID() ~= i then
+                combo.MagicAlignSyncing = true
+                combo:ChooseOptionID(i)
+                combo.MagicAlignSyncing = false
+            end
+            return
+        end
+    end
+end
+
+local function installWorldGridPresetScale(slider)
+    if not IsValid(slider) then return end
+
+    local baseNormalizeValue = slider.NormalizeValue
+
+    slider.GetSliderFractionForValue = function(_, value)
+        return worldGridPresetFraction(value)
+    end
+
+    slider.NormalizeValue = function(self, value, source)
+        if source == "slider" then
+            return nearestWorldGridPreset(value)
+        end
+
+        return baseNormalizeValue(self, value, source)
+    end
+
+    slider.TranslateSliderValues = function(self, x, y)
+        local value = worldGridPresetForFraction(x)
+        local applied = self:ApplyValue(value, "slider")
+        return self:GetSliderFractionForValue(applied), y
+    end
+
+    if IsValid(slider.Slider) then
+        slider.Slider.TranslateValues = function(_, x, y)
+            if slider:IsFormulaLocked() then
+                local range = math.max(slider:GetRange(), 1e-9)
+                return math.Clamp((slider:GetValue() - slider:GetMin()) / range, 0, 1), y
+            end
+
+            return slider:TranslateSliderValues(x, y)
+        end
+        slider.Slider:SetSlideX(slider:GetSliderFractionForValue(slider:GetValue()))
+    end
+end
+
 local function createInlineCheckBoxRow(parent, items, options)
     options = options or {}
 
@@ -1819,7 +1994,7 @@ function TOOL.BuildCPanel(panel)
                     return step
                 end
 
-                return currentTranslationSnapStep()
+                return referencePositionSliderSnapStep(slider)
             end)
             slider:SetInputDecimals("label", 3)
             slider:SetInputSnap("label", 0.001)
@@ -2111,12 +2286,77 @@ function TOOL.BuildCPanel(panel)
     addStyledSlider(gridCategoryContent, "Grid B Min", "magic_align_grid_b_min", 2, 24, 0, { labelWide = 72, textWide = 56, tall = 30 })
     addStyledSlider(gridCategoryContent, "Min Len", "magic_align_min_length", 0, 12, 0, { labelWide = 72, textWide = 56, tall = 30 })
     addStyledSlider(gridCategoryContent, "Grid Alpha", "magic_align_grid_alpha", 0, 255, 0, { labelWide = 72, textWide = 56, tall = 30 })
-    addStyledCheckBox(gridCategoryContent, "World BSP Surface Snap", "magic_align_world_bsp_snap")
     gridCategoryContent:AddItem(createInlineCheckBoxRow(gridCategoryContent, {
         { label = "Grid Labels as Percent", convar = "magic_align_grid_label_percent" },
         { label = "Reduce Fractions", convar = "magic_align_grid_label_reduce_fraction" }
     }))
     createPersistedCategory(panel, "grid_settings", "Grid A/B", gridCategoryContent)
+
+    local worldGridCategoryContent = createStackPanel(panel, {
+        spacing = 6
+    })
+    addStyledCheckBox(worldGridCategoryContent, "World BSP Snap / Grid", "magic_align_world_bsp_snap")
+    addStyledCheckBox(worldGridCategoryContent, "Ignore Brush Blockers", "magic_align_world_bsp_ignore_brush_blockers")
+    addStyledCheckBox(worldGridCategoryContent, "Show Brush Blockers", "magic_align_world_bsp_show_blockers")
+
+    local worldGridChoices = {
+        { label = "Per Surface", value = "per_surface" },
+        { label = "Global Units", value = "global" }
+    }
+    local worldGridModeCombo = createStyledModeCombo(
+        worldGridCategoryContent,
+        worldGridChoices,
+        currentWorldGridMode(),
+        setWorldGridMode
+    )
+    worldGridCategoryContent:AddItem(worldGridModeCombo, 4)
+
+    local worldGridSizeSlider = vgui.Create(magicSliderClass, worldGridCategoryContent)
+    worldGridSizeSlider:SetText("Global Units")
+    worldGridSizeSlider:SetMinMax(worldGridUnitPresets[1], worldGridUnitPresets[#worldGridUnitPresets])
+    worldGridSizeSlider:SetDecimals(3)
+    worldGridSizeSlider:SetConVar("magic_align_world_bsp_grid_size")
+    installWorldGridPresetScale(worldGridSizeSlider)
+    worldGridSizeSlider:SetInputDecimals("slider", 3)
+    worldGridSizeSlider:SetInputSnap("slider", nil)
+    worldGridSizeSlider:SetInputDecimals("label", 3)
+    worldGridSizeSlider:SetInputSnap("label", nil)
+    worldGridSizeSlider:SetInputDecimals("text", nil)
+    worldGridSizeSlider:SetInputSnap("text", nil)
+    worldGridSizeSlider.ShouldClampValue = function(_, source)
+        return source == "slider" or source == "label" or source == "api" or source == "text"
+    end
+    stylePanelSlider(worldGridSizeSlider, {
+        labelWide = 88,
+        textWide = 56,
+        tall = 30,
+        textColor = menuColors.text,
+        outlineLabel = true
+    })
+    setWorldGridSize(currentWorldGridSize())
+    worldGridSizeSlider:SyncFromConVar(true)
+    if IsValid(worldGridSizeSlider.Slider) then
+        worldGridSizeSlider.Slider:SetSlideX(worldGridSizeSlider:GetSliderFractionForValue(worldGridSizeSlider:GetValue()))
+    end
+    worldGridCategoryContent:AddItem(worldGridSizeSlider, 0)
+
+    worldGridCategoryContent.Think = function()
+        syncComboToValue(worldGridModeCombo, worldGridChoices, currentWorldGridMode())
+        if not worldGridSizeSlider:IsEditing() then
+            local value = currentWorldGridSize()
+            if math.abs((tonumber(getStringConVar("magic_align_world_bsp_grid_size", value)) or value) - value) > 1e-4 then
+                setWorldGridSize(value)
+            end
+            if math.abs((tonumber(worldGridSizeSlider:GetValue()) or value) - value) > 1e-4 then
+                worldGridSizeSlider:SyncFromConVar(true)
+                if IsValid(worldGridSizeSlider.Slider) then
+                    worldGridSizeSlider.Slider:SetSlideX(worldGridSizeSlider:GetSliderFractionForValue(worldGridSizeSlider:GetValue()))
+                end
+            end
+        end
+    end
+
+    createPersistedCategory(panel, "world_grid", "World Grid", worldGridCategoryContent)
 
     local constraintsCategoryContent = createStackPanel(panel, {
         spacing = 4

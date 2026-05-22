@@ -201,7 +201,9 @@ local function buildGizmo(state)
     local size = gizmoSize(state)
     local handles, metrics
     if isfunction(gizmoShared.linearHandles) then
-        handles, _, _, _, metrics = gizmoShared.linearHandles(origin, basis, size)
+        local scratch = state._magicAlignWorldPointGizmoScratch or {}
+        state._magicAlignWorldPointGizmoScratch = scratch
+        handles, _, _, _, metrics = gizmoShared.linearHandles(origin, basis, size, scratch)
     end
 
     local best
@@ -272,7 +274,8 @@ local function beginWorldPointGizmoDrag(state, handle)
     local dir = ply:GetAimVector()
     local origin = copyVec(handle.origin)
     local basis = copyAng(handle.basis or worldBasis())
-    local item = handle.hover
+    local item = isfunction(gizmoShared.copyHandle) and gizmoShared.copyHandle(handle.hover) or handle.hover
+    if not istable(item) then return false end
     if item.kind ~= "move" and item.kind ~= "plane" then
         return false
     end

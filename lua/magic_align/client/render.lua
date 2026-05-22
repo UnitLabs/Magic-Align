@@ -55,7 +55,19 @@ local GRID_CONFIG = {
     snapLineAlpha = 255,
     snapLabelAlpha = 235,
     snapLabelInset = 1.6,
-    bspSurfacePush = 0.12
+    bspSurfacePush = 0.12,
+    bspGlobalAlpha = 85,
+    bspGlobalNeighborAlpha = 43
+}
+client.worldGridRender = client.worldGridRender or {}
+client.worldGridRender.rtConfig = client.worldGridRender.rtConfig or {
+    cacheName = "magic_align_world_grid",
+    baseRtSize = 256,
+    referenceStep = 32,
+    minRtSize = 16,
+    maxRtSize = 4096,
+    rebuildHook = "magic_align_world_grid_rebuild",
+    maxRebuildsPerFrame = 1
 }
 local TRANSLATION_CONFIG = {
     axisTickCount = 21,
@@ -109,6 +121,10 @@ local stripePatternReady = false
 local shapeCache = {}
 local shapeCacheRebuildQueue = {}
 local shapeCacheRebuildScheduled = false
+client.worldGridRender.rtCache = client.worldGridRender.rtCache or {}
+client.worldGridRender.rtRebuildQueue = client.worldGridRender.rtRebuildQueue or {}
+client.worldGridRender.rtRebuildScheduled = client.worldGridRender.rtRebuildScheduled or false
+client.worldGridRender.bspRenderCache = client.worldGridRender.bspRenderCache or setmetatable({}, { __mode = "k" })
 local shapeMetricCache = {}
 local shapeWhiteMaterial
 local reusableCirclePolyCache = {}
@@ -257,6 +273,19 @@ local function setVec(out, value)
     end
 
     out.x, out.y, out.z = value.x, value.y, value.z
+    return out
+end
+
+function client.worldGridRender.setRenderVector(out, x, y, z)
+    x = tonumber(x) or 0
+    y = tonumber(y) or 0
+    z = tonumber(z) or 0
+
+    if not isvector(out) then
+        return Vector and Vector(x, y, z) or VectorP(x, y, z)
+    end
+
+    out.x, out.y, out.z = x, y, z
     return out
 end
 
@@ -750,6 +779,612 @@ local function drawCachedShapePlane(origin, axisA, axisB, outerRadius, entry, co
         entry.material,
         doubleSided
     )
+end
+
+function client.worldGridRender.worldGridRtSize(step)
+    local rtConfig = client.worldGridRender.rtConfig
+    step = math.max(tonumber(step) or rtConfig.referenceStep, 0.001)
+    local referenceStep = rtConfig.referenceStep
+    local scale = step / referenceStep
+
+    if step >= referenceStep then
+        return math.Clamp(
+            math.floor(rtConfig.baseRtSize * scale + 0.5),
+            rtConfig.baseRtSize,
+            rtConfig.maxRtSize
+        )
+    end
+
+    local scaled = math.floor(rtConfig.baseRtSize * scale + 0.5)
+    return math.Clamp(scaled, rtConfig.minRtSize, rtConfig.baseRtSize)
+end
+
+function client.worldGridRender.drawWorldGridRtLines(size, lineMode, thin)
+    local centerThickness = thin and 1 or 2
+    local center = math.floor(size * 0.5 - centerThickness * 0.5)
+    local drawU = lineMode ~= "v"
+    local drawV = lineMode ~= "u"
+
+    if drawU then
+        surface.SetDrawColor(255, 255, 255, 255)
+        surface.DrawRect(0, 0, 1, size)
+        surface.DrawRect(size - 1, 0, 1, size)
+        surface.SetDrawColor(128, 128, 128, 255)
+        surface.DrawRect(center, 0, centerThickness, size)
+    end
+
+    if drawV then
+        surface.SetDrawColor(255, 255, 255, 255)
+        surface.DrawRect(0, 0, size, 1)
+        surface.DrawRect(0, size - 1, size, 1)
+        surface.SetDrawColor(128, 128, 128, 255)
+        surface.DrawRect(0, center, size, centerThickness)
+    end
+end
+
+function client.worldGridRender.rebuildWorldGridRtEntry(entry)
+    if not entry or not entry.texture then return end
+
+    render.PushRenderTarget(entry.texture)
+    render.Clear(0, 0, 0, 0, true, true)
+    cam.Start2D()
+        draw.NoTexture()
+        setStripePatternCopyBlend(true)
+        client.worldGridRender.drawWorldGridRtLines(entry.rtSize, entry.lineMode, entry.thin)
+        setStripePatternCopyBlend(false)
+    cam.End2D()
+    render.PopRenderTarget()
+
+    entry.ready = true
+end
+
+function client.worldGridRender.scheduleWorldGridRtRebuild()
+    local rtConfig = client.worldGridRender.rtConfig
+    if client.worldGridRender.rtRebuildScheduled then return end
+
+    client.worldGridRender.rtRebuildScheduled = true
+    hook.Add("PostRender", rtConfig.rebuildHook, function()
+        client.worldGridRender.rtRebuildScheduled = false
+
+        local rebuilt = 0
+        for entry in pairs(client.worldGridRender.rtRebuildQueue) do
+            client.worldGridRender.rtRebuildQueue[entry] = nil
+            client.worldGridRender.rebuildWorldGridRtEntry(entry)
+
+            rebuilt = rebuilt + 1
+            if rebuilt >= rtConfig.maxRebuildsPerFrame then
+                break
+            end
+        end
+
+        if next(client.worldGridRender.rtRebuildQueue) then
+            client.worldGridRender.scheduleWorldGridRtRebuild()
+        else
+            hook.Remove("PostRender", rtConfig.rebuildHook)
+        end
+    end)
+end
+
+function client.worldGridRender.queueWorldGridRtEntryRebuild(entry)
+    if not entry or entry.ready then return end
+
+    client.worldGridRender.rtRebuildQueue[entry] = true
+    client.worldGridRender.scheduleWorldGridRtRebuild()
+end
+
+function client.worldGridRender.ensureWorldGridMaterial(step, lineMode)
+    local rtConfig = client.worldGridRender.rtConfig
+    local rtSize = client.worldGridRender.worldGridRtSize(step)
+    lineMode = lineMode or "full"
+    local thin = (tonumber(step) or 0) < rtConfig.referenceStep
+    local cacheKey = ("%d_%s_%s"):format(rtSize, lineMode, thin and "thin" or "normal")
+    local entry = client.worldGridRender.rtCache[cacheKey]
+
+    if not entry then
+        local texture = GetRenderTargetEx(
+            rtConfig.cacheName .. "_" .. cacheKey .. "_rt",
+            rtSize,
+            rtSize,
+            RT_SIZE_NO_CHANGE,
+            MATERIAL_RT_DEPTH_NONE,
+            0,
+            0,
+            IMAGE_FORMAT_RGBA8888
+        )
+        local material = CreateMaterial(rtConfig.cacheName .. "_" .. cacheKey .. "_mat", "UnlitGeneric", {
+            ["$basetexture"] = texture:GetName(),
+            ["$translucent"] = "1",
+            ["$vertexalpha"] = "1",
+            ["$vertexcolor"] = "1",
+            ["$decal"] = "1",
+            ["$nocull"] = "0",
+            ["$model"] = "1"
+        })
+
+        entry = {
+            texture = texture,
+            material = material,
+            rtSize = rtSize,
+            lineMode = lineMode,
+            thin = thin,
+            ready = false
+        }
+
+        client.worldGridRender.rtCache[cacheKey] = entry
+    end
+
+    entry.material:SetTexture("$basetexture", entry.texture)
+    entry.material:SetInt("$decal", 1)
+    entry.material:SetInt("$nocull", 0)
+
+    if not entry.ready then
+        client.worldGridRender.queueWorldGridRtEntryRebuild(entry)
+    end
+
+    return entry.material, entry
+end
+
+function client.worldGridRender.axisComponent(value, axisKey)
+    if not isvector(value) then return 0 end
+    if axisKey == "x" then return value.x end
+    if axisKey == "y" then return value.y end
+    return value.z
+end
+
+function client.worldGridRender.ensureWorldBspRenderData(surfaceData)
+    local vertices = surfaceData and surfaceData.vertices
+    if not istable(vertices) or #vertices == 0 then return end
+
+    local entry = client.worldGridRender.bspRenderCache[surfaceData]
+    local count = #vertices
+    if entry and entry.sourceVertices == vertices and entry.vertexCount == count then
+        return entry
+    end
+
+    entry = entry or { vertices = {} }
+    local renderVertices = entry.vertices
+    local validCount = 0
+    for i = 1, count do
+        local vertex = vertices[i]
+        if isvector(vertex) then
+            validCount = validCount + 1
+            renderVertices[validCount] = client.worldGridRender.setRenderVector(renderVertices[validCount], vertex.x, vertex.y, vertex.z)
+        end
+    end
+
+    for i = validCount + 1, #renderVertices do
+        renderVertices[i] = nil
+    end
+
+    entry.sourceVertices = vertices
+    entry.vertexCount = validCount
+    entry.version = (entry.version or 0) + 1
+    entry.worldGridBatches = nil
+    client.worldGridRender.bspRenderCache[surfaceData] = entry
+
+    return entry
+end
+
+function client.worldGridRender.worldGridSurfaceComponent(surfaceData, u, v, axisKey)
+    if not surfaceData then return 0 end
+    if axisKey == "x" then
+        return (surfaceData.origin and surfaceData.origin.x or 0)
+            + (surfaceData.uAxis and surfaceData.uAxis.x or 0) * u
+            + (surfaceData.vAxis and surfaceData.vAxis.x or 0) * v
+    elseif axisKey == "y" then
+        return (surfaceData.origin and surfaceData.origin.y or 0)
+            + (surfaceData.uAxis and surfaceData.uAxis.y or 0) * u
+            + (surfaceData.vAxis and surfaceData.vAxis.y or 0) * v
+    end
+
+    return (surfaceData.origin and surfaceData.origin.z or 0)
+        + (surfaceData.uAxis and surfaceData.uAxis.z or 0) * u
+        + (surfaceData.vAxis and surfaceData.vAxis.z or 0) * v
+end
+
+function client.worldGridRender.addUniqueWorldGridPoint(points, count, surfaceData, u, v)
+    local x = surfaceData.origin.x + surfaceData.uAxis.x * u + surfaceData.vAxis.x * v
+    local y = surfaceData.origin.y + surfaceData.uAxis.y * u + surfaceData.vAxis.y * v
+    local z = surfaceData.origin.z + surfaceData.uAxis.z * u + surfaceData.vAxis.z * v
+
+    for i = 1, count do
+        local other = points[i]
+        local dx = x - other.x
+        local dy = y - other.y
+        local dz = z - other.z
+        if dx * dx + dy * dy + dz * dz <= 1e-6 then
+            return count
+        end
+    end
+
+    count = count + 1
+    points[count] = client.worldGridRender.setRenderVector(points[count], x, y, z)
+    return count
+end
+
+function client.worldGridRender.worldGridLineWorldPoints(face, axisKey, value)
+    local surfaceData = face and face.surface
+    local polygon = face and face.polygon or surfaceData and surfaceData.polygon
+    value = tonumber(value)
+    if not surfaceData or not istable(polygon) or #polygon < 2 or not value then return end
+    if not (isvector(surfaceData.origin) and isvector(surfaceData.uAxis) and isvector(surfaceData.vAxis)) then return end
+
+    local epsilon = 1e-5
+    local renderPerf = shapeMetricCache.renderPerf or {}
+    shapeMetricCache.renderPerf = renderPerf
+    local points = renderPerf.worldGridLinePoints or {}
+    renderPerf.worldGridLinePoints = points
+    local pointCount = 0
+    local previous = polygon[#polygon]
+    local previousValue = client.worldGridRender.worldGridSurfaceComponent(surfaceData, previous.u, previous.v, axisKey)
+
+    for i = 1, #polygon do
+        local current = polygon[i]
+        local currentValue = client.worldGridRender.worldGridSurfaceComponent(surfaceData, current.u, current.v, axisKey)
+
+        local previousOnLine = math.abs(previousValue - value) <= epsilon
+        local currentOnLine = math.abs(currentValue - value) <= epsilon
+
+        if previousOnLine then
+            pointCount = client.worldGridRender.addUniqueWorldGridPoint(points, pointCount, surfaceData, previous.u, previous.v)
+        end
+        if currentOnLine then
+            pointCount = client.worldGridRender.addUniqueWorldGridPoint(points, pointCount, surfaceData, current.u, current.v)
+        end
+
+        local delta = currentValue - previousValue
+        if math.abs(delta) > epsilon then
+            local t = (value - previousValue) / delta
+            if t >= -epsilon and t <= 1 + epsilon then
+                t = math.Clamp(t, 0, 1)
+                pointCount = client.worldGridRender.addUniqueWorldGridPoint(
+                    points,
+                    pointCount,
+                    surfaceData,
+                    previous.u + (current.u - previous.u) * t,
+                    previous.v + (current.v - previous.v) * t
+                )
+            end
+        end
+
+        previous = current
+        previousValue = currentValue
+    end
+
+    if pointCount < 2 then return end
+
+    local bestA, bestB, bestDist
+    for i = 1, pointCount - 1 do
+        local a = points[i]
+        for j = i + 1, pointCount do
+            local b = points[j]
+            local dx = b.x - a.x
+            local dy = b.y - a.y
+            local dz = b.z - a.z
+            local dist = dx * dx + dy * dy + dz * dz
+            if not bestDist or dist > bestDist then
+                bestA, bestB, bestDist = a, b, dist
+            end
+        end
+    end
+
+    return bestA, bestB
+end
+
+function client.worldGridRender.addWorldGridSnapAxis(axes, seen, axisKey)
+    if axisKey ~= "x" and axisKey ~= "y" and axisKey ~= "z" then return end
+    if seen[axisKey] then return end
+
+    seen[axisKey] = true
+    axes[#axes + 1] = axisKey
+end
+
+function client.worldGridRender.ensureWorldGridSnapCrossData(face)
+    if not (face and face.globalGrid) then return end
+    if face._magicAlignWorldGridSnapReady then
+        return face._magicAlignWorldGridSnapLines, face._magicAlignWorldGridSnapLineCount or 0
+    end
+
+    local lines = face._magicAlignWorldGridSnapLines or {}
+    face._magicAlignWorldGridSnapLines = lines
+    face._magicAlignWorldGridSnapLineCount = 0
+    face._magicAlignWorldGridSnapReady = true
+
+    local surfaceData = face.surface
+    if not surfaceData or not isvector(surfaceData.origin) or not isvector(surfaceData.uAxis) or not isvector(surfaceData.vAxis) then
+        return lines, 0
+    end
+
+    local snapU = tonumber(face.uSnap)
+    local snapV = tonumber(face.vSnap)
+    if not snapU or not snapV then return lines, 0 end
+
+    local renderPerf = shapeMetricCache.renderPerf or {}
+    shapeMetricCache.renderPerf = renderPerf
+    local axes = renderPerf.worldGridSnapAxes or {}
+    local seen = renderPerf.worldGridSnapSeen or {}
+    renderPerf.worldGridSnapAxes = axes
+    renderPerf.worldGridSnapSeen = seen
+    axes[1], axes[2], axes[3] = nil, nil, nil
+    seen.x, seen.y, seen.z = nil, nil, nil
+
+    client.worldGridRender.addWorldGridSnapAxis(axes, seen, face.snapGlobalAxisU)
+    client.worldGridRender.addWorldGridSnapAxis(axes, seen, face.snapGlobalAxisV)
+
+    local overlays = face.globalGridOverlays
+    if istable(overlays) then
+        for i = 1, #overlays do
+            local overlay = overlays[i]
+            if overlay then
+                client.worldGridRender.addWorldGridSnapAxis(axes, seen, overlay.axisU)
+                client.worldGridRender.addWorldGridSnapAxis(axes, seen, overlay.axisV)
+                if #axes >= 2 then break end
+            end
+        end
+    end
+
+    local lineCount = 0
+    for i = 1, math.min(#axes, 2) do
+        local axisKey = axes[i]
+        local value = client.worldGridRender.worldGridSurfaceComponent(surfaceData, snapU, snapV, axisKey)
+        local a, b = client.worldGridRender.worldGridLineWorldPoints(face, axisKey, value)
+        if a and b then
+            lineCount = lineCount + 1
+            local line = lines[lineCount] or {}
+            lines[lineCount] = line
+            line.a = client.worldGridRender.setRenderVector(line.a, a.x, a.y, a.z)
+            line.b = client.worldGridRender.setRenderVector(line.b, b.x, b.y, b.z)
+        end
+    end
+
+    for i = lineCount + 1, #lines do
+        lines[i] = nil
+    end
+    face._magicAlignWorldGridSnapLineCount = lineCount
+
+    return lines, lineCount
+end
+
+function client.worldGridRender.drawWorldGridSnapCross(face)
+    local lines, lineCount = client.worldGridRender.ensureWorldGridSnapCrossData(face)
+    if not istable(lines) or (lineCount or 0) <= 0 then return end
+
+    local color = cachedColor(255, 255, 255, GRID_CONFIG.snapLineAlpha)
+    for i = 1, lineCount do
+        local line = lines[i]
+        if line and line.a and line.b then
+            drawLine(line.a, line.b, color, false)
+        end
+    end
+end
+
+function client.worldGridRender.worldGridBatchKey(step, overlay, alpha)
+    return ("%.6f:%s:%s:%s:%d"):format(
+        tonumber(step) or 0,
+        tostring(overlay and overlay.axisU or ""),
+        tostring(overlay and overlay.axisV or ""),
+        tostring(overlay and overlay.lineMode or "full"),
+        math.Clamp(math.floor(tonumber(alpha) or 0), 0, 255)
+    )
+end
+
+function client.worldGridRender.writeWorldGridBatchVertex(vertices, index, position, axisU, axisV, textureStep, color, normal)
+    local vertex = vertices[index]
+    if not vertex then
+        vertex = {}
+        vertices[index] = vertex
+    end
+
+    vertex.pos = position
+    vertex.u = client.worldGridRender.axisComponent(position, axisU) / textureStep
+    vertex.v = client.worldGridRender.axisComponent(position, axisV) / textureStep
+    vertex.color = color
+    vertex.normal = normal
+end
+
+function client.worldGridRender.createWorldGridMesh()
+    if not isfunction(Mesh) then return end
+
+    local ok, meshObject = pcall(Mesh)
+    if ok then
+        return meshObject
+    end
+end
+
+function client.worldGridRender.buildWorldGridMesh(batch)
+    if not batch or batch.meshUnsupported then return end
+
+    local meshObject = batch.mesh
+    if not meshObject then
+        meshObject = client.worldGridRender.createWorldGridMesh()
+        if not meshObject then
+            batch.meshUnsupported = true
+            return
+        end
+        batch.mesh = meshObject
+    end
+
+    if not isfunction(meshObject.BuildFromTriangles) then
+        batch.mesh = nil
+        batch.meshUnsupported = true
+        return
+    end
+
+    local ok = pcall(meshObject.BuildFromTriangles, meshObject, batch.vertices)
+    if ok then
+        batch.meshReady = true
+    else
+        batch.mesh = nil
+        batch.meshReady = false
+        batch.meshUnsupported = true
+    end
+end
+
+function client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlay, alpha)
+    local renderData = client.worldGridRender.ensureWorldBspRenderData(face and face.surface)
+    if not renderData then return end
+
+    local vertices = renderData.vertices
+    local vertexCount = renderData.vertexCount or 0
+    local step = tonumber(face and face.globalGridStep) or 0
+    if not istable(vertices) or vertexCount < 3 or not overlay or not overlay.axisU or not overlay.axisV or step <= 0 then return end
+
+    local material, materialEntry = client.worldGridRender.ensureWorldGridMaterial(step, overlay.lineMode or "full")
+    if not material then return end
+
+    local batches = renderData.worldGridBatches
+    if not batches then
+        batches = {}
+        renderData.worldGridBatches = batches
+    end
+
+    local key = client.worldGridRender.worldGridBatchKey(step, overlay, alpha)
+    local batch = batches[key]
+    if batch and batch.sourceVersion == renderData.version then
+        batch.material = material
+        batch.materialEntry = materialEntry
+        return batch
+    end
+
+    batch = batch or { vertices = {} }
+    batches[key] = batch
+
+    local batchVertices = batch.vertices
+    local color = cachedColor(255, 255, 255, alpha)
+    local textureStep = step * 2
+    local axisU = overlay.axisU
+    local axisV = overlay.axisV
+    local normal = face and face.normal
+    local writeIndex = 0
+
+    for vertexIndex = 2, vertexCount - 1 do
+        writeIndex = writeIndex + 1
+        client.worldGridRender.writeWorldGridBatchVertex(batchVertices, writeIndex, vertices[1], axisU, axisV, textureStep, color, normal)
+        writeIndex = writeIndex + 1
+        client.worldGridRender.writeWorldGridBatchVertex(batchVertices, writeIndex, vertices[vertexIndex], axisU, axisV, textureStep, color, normal)
+        writeIndex = writeIndex + 1
+        client.worldGridRender.writeWorldGridBatchVertex(batchVertices, writeIndex, vertices[vertexIndex + 1], axisU, axisV, textureStep, color, normal)
+    end
+
+    for i = writeIndex + 1, #batchVertices do
+        batchVertices[i] = nil
+    end
+
+    batch.material = material
+    batch.materialEntry = materialEntry
+    batch.sourceVersion = renderData.version
+    batch.vertexCount = writeIndex
+    batch.triangleCount = math.floor(writeIndex / 3)
+    batch.meshReady = false
+    client.worldGridRender.buildWorldGridMesh(batch)
+
+    return batch
+end
+
+function client.worldGridRender.prepareWorldGridSurface(face, alpha)
+    local overlays = face and face.globalGridOverlays
+    if not istable(overlays) then return end
+
+    local batches = face._magicAlignWorldGridBatches or {}
+    face._magicAlignWorldGridBatches = batches
+
+    local batchCount = 0
+    for i = 1, #overlays do
+        local batch = client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlays[i], alpha)
+        if batch then
+            batchCount = batchCount + 1
+            batches[batchCount] = batch
+        end
+    end
+
+    for i = batchCount + 1, #batches do
+        batches[i] = nil
+    end
+
+    face._magicAlignWorldGridBatchCount = batchCount
+    face._magicAlignWorldGridPreparedAlpha = alpha
+    return batches, batchCount
+end
+
+function client.worldGridRender.pushWorldGridBatchVertex(vertex)
+    if not vertex or not vertex.pos then return end
+
+    local color = vertex.color or color_white
+    meshPosition(vertex.pos)
+    mesh.TexCoord(0, vertex.u or 0, vertex.v or 0)
+    mesh.Color(color.r, color.g, color.b, color.a)
+    mesh.AdvanceVertex()
+end
+
+function client.worldGridRender.drawWorldGridSurfaceBatch(batch)
+    if not batch or not batch.material or (batch.vertexCount or 0) <= 0 then return end
+    if batch.materialEntry and batch.materialEntry.ready ~= true then return end
+
+    render.SetMaterial(batch.material)
+    if batch.meshReady and batch.mesh and isfunction(batch.mesh.Draw) then
+        batch.mesh:Draw()
+        return
+    end
+
+    mesh.Begin(MATERIAL_TRIANGLES, batch.triangleCount or math.floor((batch.vertexCount or 0) / 3))
+        for i = 1, batch.vertexCount do
+            client.worldGridRender.pushWorldGridBatchVertex(batch.vertices[i])
+        end
+    mesh.End()
+end
+
+function client.worldGridRender.drawWorldGridSurface(face, alpha)
+    local batches = face and face._magicAlignWorldGridBatches
+    local batchCount = face and face._magicAlignWorldGridBatchCount or 0
+    if face and face._magicAlignWorldGridPreparedAlpha ~= alpha then
+        batches, batchCount = client.worldGridRender.prepareWorldGridSurface(face, alpha)
+    end
+    if not istable(batches) or (batchCount or 0) <= 0 then return end
+
+    for i = 1, batchCount do
+        client.worldGridRender.drawWorldGridSurfaceBatch(batches[i])
+    end
+end
+
+function client.worldGridRender.prepareWorldBspGlobalGrid(face)
+    if not face or face._magicAlignWorldGridGlobalPrepared then return end
+
+    local neighbors = face and face.globalGridNeighbors
+    if istable(neighbors) then
+        for i = 1, #neighbors do
+            client.worldGridRender.prepareWorldGridSurface(neighbors[i], GRID_CONFIG.bspGlobalNeighborAlpha)
+        end
+    end
+
+    client.worldGridRender.prepareWorldGridSurface(face, GRID_CONFIG.bspGlobalAlpha)
+    client.worldGridRender.ensureWorldGridSnapCrossData(face)
+    face._magicAlignWorldGridGlobalPrepared = true
+end
+
+function client.prepareWorldBspRenderCandidate(candidate)
+    local face = candidate and candidate.face
+    if not (face and face.worldBSP) then return end
+    if candidate._magicAlignWorldBspRenderPrepared then return end
+    candidate._magicAlignWorldBspRenderPrepared = true
+
+    client.worldGridRender.ensureWorldBspRenderData(face.surface)
+    if face.globalGrid then
+        client.worldGridRender.prepareWorldBspGlobalGrid(face)
+    end
+end
+
+function client.worldGridRender.drawWorldBspGlobalGrid(face)
+    client.worldGridRender.prepareWorldBspGlobalGrid(face)
+
+    local neighbors = face and face.globalGridNeighbors
+    if istable(neighbors) then
+        for i = 1, #neighbors do
+            client.worldGridRender.drawWorldGridSurface(neighbors[i], GRID_CONFIG.bspGlobalNeighborAlpha)
+        end
+    end
+
+    client.worldGridRender.drawWorldGridSurface(face, GRID_CONFIG.bspGlobalAlpha)
+    client.worldGridRender.drawWorldGridSnapCross(face)
 end
 
 local function queueShapeCacheWarmup(tool, qualityIndex)
@@ -2547,10 +3182,46 @@ local function activePickAccentColor(state)
     return sideAccentColor(press.side)
 end
 
+local function drawWorldBspBlockerMarker(blocker)
+    if not istable(blocker) then return end
+
+    local color = cachedColor(255, 166, 64, 215)
+    local ent = blocker.ent
+    if IsValid(ent)
+        and render.DrawWireframeBox
+        and isfunction(ent.GetPos)
+        and isfunction(ent.GetAngles)
+        and isfunction(ent.OBBMins)
+        and isfunction(ent.OBBMaxs) then
+        render.DrawWireframeBox(ent:GetPos(), ent:GetAngles(), ent:OBBMins(), ent:OBBMaxs(), color, true)
+    end
+
+    local hitPos = blocker.hitPos
+    if isvector(hitPos) then
+        local size = 6
+        drawLine(hitPos - VectorP(size, 0, 0), hitPos + VectorP(size, 0, 0), color, true)
+        drawLine(hitPos - VectorP(0, size, 0), hitPos + VectorP(0, size, 0), color, true)
+        drawLine(hitPos - VectorP(0, 0, size), hitPos + VectorP(0, 0, size), color, true)
+    end
+end
+
+local function drawWorldBspBlockers(tool, state)
+    if not tool or not tool.GetClientNumber or tool:GetClientNumber("world_bsp_show_blockers", 0) ~= 1 then return end
+
+    local blockers = state and state.hover and state.hover.worldBspBlockers
+    if not istable(blockers) or #blockers == 0 then return end
+
+    render.SetColorMaterial()
+    for i = 1, #blockers do
+        drawWorldBspBlockerMarker(blockers[i])
+    end
+end
+
 local hoverRender = {}
 
 function hoverRender.drawGridLabels(state, candidate)
     if not shouldRenderHoverGrid(state, candidate) then return end
+    if candidate.face and candidate.face.worldBSP and candidate.face.globalGrid then return end
 
     local face = candidate.face
     local labelColor = cachedColor(255, 255, 255, GRID_CONFIG.snapLabelAlpha)
@@ -2575,12 +3246,17 @@ function hoverRender.drawFaceOutline(state, candidate)
 
     local face = candidate.face
     if face.worldBSP and istable(face.worldCorners) then
-        local push = isvector(face.normal) and face.normal * GRID_CONFIG.bspSurfacePush or ZERO_VEC
-        for i = 1, #face.worldCorners do
-            local a = face.worldCorners[i]
-            local b = face.worldCorners[i % #face.worldCorners + 1]
+        local renderData = client.worldGridRender.ensureWorldBspRenderData(face.surface)
+        local corners = renderData and renderData.vertices or face.worldCorners
+        local count = renderData and renderData.vertexCount or #corners
+        if count < 2 then return end
+
+        local color = cachedColor(255, 255, 255, 70)
+        for i = 1, count do
+            local a = corners[i]
+            local b = corners[i % count + 1]
             if isvector(a) and isvector(b) then
-                drawLine(a + push, b + push, cachedColor(255, 255, 255, 70), true)
+                drawLine(a, b, color, false)
             end
         end
         return
@@ -2606,6 +3282,11 @@ function hoverRender.drawGrid(state, candidate)
 
     local face = candidate.face
     local ent = candidate.ent
+    if face.worldBSP and face.globalGrid then
+        client.worldGridRender.drawWorldBspGlobalGrid(face)
+        return
+    end
+
     local renderPerf = shapeMetricCache.renderPerf
     local gridSets = renderPerf.reusableGridSets or {}
     local seen = renderPerf.reusableGridSeen or {}
@@ -2686,6 +3367,24 @@ local function shouldDrawGizmoHandle(activeHandle, kind, key)
     if not activeHandle then return true end
 
     return activeHandle.kind == kind and activeHandle.key == key
+end
+
+local function reusableHoverGizmoForRender(state)
+    if not istable(state) then return end
+
+    local hover = state.hover
+    if not istable(hover) or not hover.gizmo then return end
+
+    local press = state.press
+    if press and press.kind == "gizmo" then return end
+
+    if state._magicAlignPreviewChangedFrame ~= nil
+        and isfunction(FrameNumber)
+        and state._magicAlignPreviewChangedFrame == FrameNumber() then
+        return
+    end
+
+    return hover.gizmo
 end
 
 function TOOL:DrawHUD()
@@ -2775,10 +3474,32 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
     local spriteSettings = ringRenderSettingsForTool(tool)
     local viewerPos = setVec(shapeMetricCache.renderPerf.viewerPos, IsValid(LocalPlayer()) and LocalPlayer():GetShootPos() or EyePos())
     shapeMetricCache.renderPerf.viewerPos = viewerPos
-    cam.IgnoreZ(true)
 
-    hoverRender.drawFaceOutline(state, hoverCandidate)
-    hoverRender.drawGrid(state, hoverCandidate)
+    local drawFaceOutlineWithIgnoreZ = hoverCandidate
+        and hoverCandidate.face
+        and hoverCandidate.face.worldBSP
+
+    if not drawFaceOutlineWithIgnoreZ then
+        hoverRender.drawFaceOutline(state, hoverCandidate)
+    end
+
+    local drawGridWithIgnoreZ = true
+    if hoverCandidate
+        and hoverCandidate.face
+        and hoverCandidate.face.worldBSP
+        and hoverCandidate.face.globalGrid then
+        hoverRender.drawGrid(state, hoverCandidate)
+        drawGridWithIgnoreZ = false
+    end
+
+    cam.IgnoreZ(true)
+    if drawFaceOutlineWithIgnoreZ then
+        hoverRender.drawFaceOutline(state, hoverCandidate)
+    end
+    drawWorldBspBlockers(tool, state)
+    if drawGridWithIgnoreZ then
+        hoverRender.drawGrid(state, hoverCandidate)
+    end
 
     drawPointSet(state.prop1, state.source, colors.source, nil, nil, 0, nil, sourceAnchorOptions, spriteSettings, viewerPos)
     drawPointSet(state.prop2, state.target, colors.target, nil, nil, 0.5, nil, targetAnchorOptions, spriteSettings, viewerPos)
@@ -2858,7 +3579,7 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
         drawFrame(liveAnchor, state.preview.ang, 16, 220)
         drawFrame(liveContext, solve.axisAng, 8, 110)
 
-        local g = client.gizmo(tool, state)
+        local g = reusableHoverGizmoForRender(state) or client.gizmo(tool, state)
         if g then
             local showRotation = g.disableRotation ~= true
             local axisHandleRadius = g.size * 0.09

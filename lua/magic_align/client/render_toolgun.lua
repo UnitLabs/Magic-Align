@@ -3,6 +3,8 @@ MAGIC_ALIGN = MAGIC_ALIGN or include("autorun/magic_align.lua")
 local M = MAGIC_ALIGN
 local VectorP = M.VectorP
 local isvector = M.IsVectorLike
+local toVector = M.ToVector
+local LocalToWorldPosPrecise = M.LocalToWorldPosPrecise
 local client = M.Client or {}
 local FormulaManager = M.FormulaManager or include("magic_align/client/formula_manager.lua")
 local colors = client.colors or {}
@@ -201,12 +203,61 @@ local function smoothedCompassAngle(key, targetAngle, signature)
     return needle.angle
 end
 
-local function compassSignature(ent)
-    if isWorldTarget and isWorldTarget(ent) then
-        return "world"
+local function compassSignature(ent, targetWorldPos)
+    local base = isWorldTarget and isWorldTarget(ent) and "world" or (IsValid(ent) and tostring(ent:EntIndex()) or "none")
+    if isvector(targetWorldPos) then
+        return ("%s:%.1f:%.1f:%.1f"):format(base, targetWorldPos.x, targetWorldPos.y, targetWorldPos.z)
     end
 
-    return IsValid(ent) and tostring(ent:EntIndex()) or "none"
+    return base
+end
+
+local function safeVector(value)
+    if not isvector(value) then return end
+    if toVector then
+        return toVector(value)
+    end
+
+    return Vector(value.x, value.y, value.z)
+end
+
+local function anchorOptionsFromTool(tool, side)
+    local prefix = side == "prop1" and "from" or "to"
+
+    return M.AnchorOptionsFromReader(function(name)
+        if not tool or not tool.GetClientInfo then return end
+        return tool:GetClientInfo(prefix .. "_" .. name)
+    end)
+end
+
+local function activeAnchorSelection(tool, state, side)
+    local prefix = side == "prop1" and "from" or "to"
+    local selected = tool and tool.GetClientInfo and string.lower(tool:GetClientInfo(prefix .. "_anchor") or "") or nil
+    local priority = tool and tool.GetClientInfo and tool:GetClientInfo(prefix .. "_priority") or nil
+    local selection = state and state.anchorSelection and state.anchorSelection[prefix]
+
+    if selection and selection.convarAnchor == selected then
+        return selection.anchor, selection.priority
+    end
+
+    return selected, priority
+end
+
+local function activeAnchorWorldPos(tool, state, ent, points, side)
+    if not ((isWorldTarget and isWorldTarget(ent)) or IsValid(ent)) or not istable(points) or #points == 0 then
+        return nil
+    end
+
+    local selected, priority = activeAnchorSelection(tool, state, side)
+    local _, localAnchor = M.ResolveAnchor(points, selected, priority, anchorOptionsFromTool(tool, side))
+    local localPos = safeVector(localAnchor)
+    if not localPos then return end
+
+    if isWorldTarget and isWorldTarget(ent) then
+        return localPos
+    end
+
+    return LocalToWorldPosPrecise(localPos, ent:GetPos(), ent:GetAngles())
 end
 
 local function commitUploadProgress()
@@ -493,13 +544,17 @@ local function drawCompass(cx, cy, radius, angle, accent)
     surface.DrawRect(cx - 1, cy - 1, 2, 2)
 end
 
-local function compassAngle(ent)
-    if not IsValid(ent) then return end
-
+local function compassAngle(ent, targetWorldPos)
     local player = LocalPlayer()
     if not IsValid(player) then return end
 
-    local yaw = (player:GetPos() - ent:GetPos()):Angle().y - player:EyeAngles().y
+    local target = safeVector(targetWorldPos)
+    if not target then
+        if not IsValid(ent) then return end
+        target = ent:GetPos()
+    end
+
+    local yaw = (player:GetPos() - target):Angle().y - player:EyeAngles().y
 
     if not isnumber(yaw) then
         return 0
@@ -619,7 +674,7 @@ local function drawLinkedCountInline(x, y, h, label, count, maxCount)
     draw.SimpleText(text, "MagicAlignToolgunTitleSoft", textX, lineY, color, TEXT_ALIGN_LEFT, TEXT_ALIGN_CENTER)
 end
 
-local function drawCompassPanel(x, y, w, h, needleKey, label, ent, accent, pointCount)
+local function drawCompassPanel(x, y, w, h, needleKey, label, ent, accent, pointCount, tool, state, points)
     draw.RoundedBox(12, x, y, w, h, palette.card)
     draw.RoundedBox(12, x, y, 8, h, colorAlpha(accent, 220))
     surface.SetDrawColor(colorAlpha(palette.border, 105))
@@ -636,15 +691,16 @@ local function drawCompassPanel(x, y, w, h, needleKey, label, ent, accent, point
         draw.SimpleText("No Prop Selected", "MagicAlignToolgunCaption", x + 18, y + h * 0.68, missingPropColor, TEXT_ALIGN_LEFT, TEXT_ALIGN_CENTER)
     end
 
-    local angle = isWorldTarget and isWorldTarget(ent) and 0 or compassAngle(ent)
+    local anchorWorldPos = activeAnchorWorldPos(tool, state, ent, points, needleKey)
+    local angle = compassAngle(ent, anchorWorldPos)
     if angle then
-        drawCompass(compassX, y + h * 0.5, COMPASS_RADIUS, smoothedCompassAngle(needleKey, angle, compassSignature(ent)), accent)
+        drawCompass(compassX, y + h * 0.5, COMPASS_RADIUS, smoothedCompassAngle(needleKey, angle, compassSignature(ent, anchorWorldPos)), accent)
     else
         compassNeedles[needleKey] = nil
     end
 end
 
-local function drawIdleCompasses(width, height, state)
+local function drawIdleCompasses(width, height, tool, state)
     local x, y, w, h = contentRect(width, height)
     local gap = 10
     local panelHeight = 56
@@ -660,7 +716,10 @@ local function drawIdleCompasses(width, height, state)
         spaceLabels.prop1 or "Prop 1",
         state and state.prop1 or nil,
         panelAccent.prop1 or palette.idle,
-        state and istable(state.source) and #state.source or 0
+        state and istable(state.source) and #state.source or 0,
+        tool,
+        state,
+        state and state.source or nil
     )
     drawLinkedCountInline(
         x,
@@ -679,7 +738,10 @@ local function drawIdleCompasses(width, height, state)
         spaceLabels.prop2 or "Prop 2",
         state and state.prop2 or nil,
         panelAccent.prop2 or palette.idle,
-        state and istable(state.target) and #state.target or 0
+        state and istable(state.target) and #state.target or 0,
+        tool,
+        state,
+        state and state.target or nil
     )
 end
 
@@ -845,7 +907,7 @@ function TOOL:DrawToolScreen(width, height)
     draw.SimpleText("MAGIC ALIGN", "MagicAlignToolgunBrand", 24, 30, palette.text, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
 
     if not data then
-        drawIdleCompasses(width, height, state)
+        drawIdleCompasses(width, height, self, state)
         drawFooter(width, height, self, state, data)
         return
     end
