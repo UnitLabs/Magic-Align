@@ -159,8 +159,8 @@ local persistedMenuConVars = {
     "magic_align_world_bsp_grid_mode",
     "magic_align_world_bsp_grid_size",
     "magic_align_world_bsp_budget_ms",
-    "magic_align_world_bsp_ignore_brush_blockers",
     "magic_align_world_bsp_show_blockers",
+    "magic_align_world_bsp_full_grid",
     "magic_align_display_rounding",
     "magic_align_preview_occluded",
     "magic_align_preview_occluded_r",
@@ -2296,8 +2296,25 @@ function TOOL.BuildCPanel(panel)
         spacing = 6
     })
     addStyledCheckBox(worldGridCategoryContent, "World BSP Snap / Grid", "magic_align_world_bsp_snap")
-    addStyledCheckBox(worldGridCategoryContent, "Ignore Brush Blockers", "magic_align_world_bsp_ignore_brush_blockers")
-    addStyledCheckBox(worldGridCategoryContent, "Show Brush Blockers", "magic_align_world_bsp_show_blockers")
+    local worldGridStyleCheckBox = addStyledCheckBox(worldGridCategoryContent, "", "magic_align_world_bsp_full_grid")
+    local function updateWorldGridStyleCheckBox()
+        if not IsValid(worldGridStyleCheckBox) then return end
+
+        local label = getBoolConVar("magic_align_world_bsp_full_grid", true)
+            and "Grid Style: Full Grid"
+            or "Grid Style: Cross-Grid"
+        if worldGridStyleCheckBox:GetText() ~= label then
+            worldGridStyleCheckBox:SetText(label)
+            worldGridStyleCheckBox:SizeToContents()
+            worldGridStyleCheckBox:SetTall(22)
+            worldGridCategoryContent:InvalidateLayout(true)
+        end
+    end
+    updateWorldGridStyleCheckBox()
+    worldGridStyleCheckBox.OnChange = function()
+        updateWorldGridStyleCheckBox()
+    end
+    addStyledCheckBox(worldGridCategoryContent, "Show Portal-Entities on Hover", "magic_align_world_bsp_show_blockers")
 
     local worldGridChoices = {
         { label = "Per Surface", value = "per_surface" },
@@ -2341,6 +2358,7 @@ function TOOL.BuildCPanel(panel)
     worldGridCategoryContent:AddItem(worldGridSizeSlider, 0)
 
     worldGridCategoryContent.Think = function()
+        updateWorldGridStyleCheckBox()
         syncComboToValue(worldGridModeCombo, worldGridChoices, currentWorldGridMode())
         if not worldGridSizeSlider:IsEditing() then
             local value = currentWorldGridSize()

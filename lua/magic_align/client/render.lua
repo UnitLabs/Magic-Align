@@ -49,6 +49,7 @@ local STRIPE_CONFIG = {
     materialFlags = bit.bor(16, 32, 128, 2048, 2097152),
     rebuildHook = "magic_align_stripe_pattern_rebuild"
 }
+local STATIC_TRIANGLE_STRIPE_PERIOD = math.max(0.01, STRIPE_CONFIG.worldTile * math.sqrt(2))
 local GRID_CONFIG = {
     alphaPrimary = 64,
     alphaSecondary = 64,
@@ -56,8 +57,8 @@ local GRID_CONFIG = {
     snapLabelAlpha = 235,
     snapLabelInset = 1.6,
     bspSurfacePush = 0.12,
-    bspGlobalAlpha = 85,
-    bspGlobalNeighborAlpha = 43
+    bspGlobalAlpha = 163,
+    bspGlobalNeighborAlpha = 96
 }
 client.worldGridRender = client.worldGridRender or {}
 client.worldGridRender.rtConfig = client.worldGridRender.rtConfig or {
@@ -65,10 +66,24 @@ client.worldGridRender.rtConfig = client.worldGridRender.rtConfig or {
     baseRtSize = 256,
     referenceStep = 32,
     minRtSize = 16,
+    lineWidthStepMin = 0.125,
+    lineWidthStepMax = 8,
+    lineWidthCapStep = 64,
+    lineWidthMin = 0.015625,
+    lineWidthMax = 0.25,
+    lineRtScale = 2,
+    alphaRtVersion = 15,
     maxRtSize = 4096,
     rebuildHook = "magic_align_world_grid_rebuild",
     maxRebuildsPerFrame = 1
 }
+client.worldGridRender.rtConfig.lineWidthStepMin = client.worldGridRender.rtConfig.lineWidthStepMin or 0.125
+client.worldGridRender.rtConfig.lineWidthStepMax = client.worldGridRender.rtConfig.lineWidthStepMax or 8
+client.worldGridRender.rtConfig.lineWidthCapStep = client.worldGridRender.rtConfig.lineWidthCapStep or 64
+client.worldGridRender.rtConfig.lineWidthMin = client.worldGridRender.rtConfig.lineWidthMin or 0.015625
+client.worldGridRender.rtConfig.lineWidthMax = client.worldGridRender.rtConfig.lineWidthMax or 0.25
+client.worldGridRender.rtConfig.lineRtScale = client.worldGridRender.rtConfig.lineRtScale or 2
+client.worldGridRender.rtConfig.alphaRtVersion = 15
 local TRANSLATION_CONFIG = {
     axisTickCount = 21,
     gridHalfCells = 5
@@ -263,17 +278,64 @@ unitCircle = circlePointsForSegments(RENDER_CONFIG.circleSegments)
 
 local ZERO_VEC = VectorP(0, 0, 0)
 local ZERO_ANG = AngleP(0, 0, 0)
-local BILLBOARD_FALLBACK_VIEW_DIR = VectorP(0, 0, 1)
+local DEG_TO_RAD = math.pi / 180
+
+local function numberOrZero(value)
+    value = tonumber(value)
+    if value ~= nil and value == value and value ~= math.huge and value ~= -math.huge then
+        return value
+    end
+
+    return 0
+end
+
+local function newRenderVector(x, y, z)
+    x, y, z = numberOrZero(x), numberOrZero(y), numberOrZero(z)
+    return Vector and Vector(x, y, z) or VectorP(x, y, z)
+end
+
+local reusableBillboardToViewer = newRenderVector(0, 0, 1)
+local reusableBillboardPos = newRenderVector(0, 0, 0)
+
+local function setVecComponents(out, x, y, z)
+    if not isvector(out) then
+        return newRenderVector(x, y, z)
+    end
+
+    out.x, out.y, out.z = x, y, z
+    return out
+end
 
 local function setVec(out, value)
     if not isvector(value) then return end
 
     if not isvector(out) then
-        return VectorP(value.x, value.y, value.z)
+        return newRenderVector(value.x, value.y, value.z)
     end
 
     out.x, out.y, out.z = value.x, value.y, value.z
     return out
+end
+
+local function localToWorldPosInto(out, localPos, originPos, originAng)
+    originPos = isvector(originPos) and originPos or ZERO_VEC
+    originAng = isangle(originAng) and originAng or ZERO_ANG
+
+    local x = isvector(localPos) and numberOrZero(localPos.x) or 0
+    local y = isvector(localPos) and numberOrZero(localPos.y) or 0
+    local z = isvector(localPos) and numberOrZero(localPos.z) or 0
+    local pitch = numberOrZero(originAng.p)
+    local yaw = numberOrZero(originAng.y)
+    local roll = numberOrZero(originAng.r)
+    local sp, sy, sr = math.sin(pitch * DEG_TO_RAD), math.sin(yaw * DEG_TO_RAD), math.sin(roll * DEG_TO_RAD)
+    local cp, cy, cr = math.cos(pitch * DEG_TO_RAD), math.cos(yaw * DEG_TO_RAD), math.cos(roll * DEG_TO_RAD)
+
+    return setVecComponents(
+        out,
+        numberOrZero(originPos.x) + (cp * cy) * x + (sp * sr * cy - cr * sy) * y + (sp * cr * cy + sr * sy) * z,
+        numberOrZero(originPos.y) + (cp * sy) * x + (sp * sr * sy + cr * cy) * y + (sp * cr * sy - sr * cy) * z,
+        numberOrZero(originPos.z) + (-sp) * x + (sr * cp) * y + (cr * cp) * z
+    )
 end
 
 function client.worldGridRender.setRenderVector(out, x, y, z)
@@ -282,7 +344,7 @@ function client.worldGridRender.setRenderVector(out, x, y, z)
     z = tonumber(z) or 0
 
     if not isvector(out) then
-        return Vector and Vector(x, y, z) or VectorP(x, y, z)
+        return newRenderVector(x, y, z)
     end
 
     out.x, out.y, out.z = x, y, z
@@ -320,6 +382,18 @@ end
 local function scaledAlphaColor(color, scale)
     local baseAlpha = color.a == nil and 255 or color.a
     return cachedColor(color.r, color.g, color.b, math.Clamp(math.floor(baseAlpha * scale + 0.5), 0, 255))
+end
+
+local function prop2BlueColor(alpha)
+    local palette = client.colors or colors
+    local target = palette and palette.target or colors.target
+
+    return cachedColor(
+        target and target.r or 80,
+        target and target.g or 220,
+        target and target.b or 255,
+        alpha
+    )
 end
 
 local function clampUnitInterval(value)
@@ -781,59 +855,373 @@ local function drawCachedShapePlane(origin, axisA, axisB, outerRadius, entry, co
     )
 end
 
+function client.worldGridRender.isWorldGridLineMode(lineMode)
+    return lineMode == "line_u" or lineMode == "line_v"
+end
+
 function client.worldGridRender.worldGridRtSize(step)
     local rtConfig = client.worldGridRender.rtConfig
     step = math.max(tonumber(step) or rtConfig.referenceStep, 0.001)
     local referenceStep = rtConfig.referenceStep
     local scale = step / referenceStep
+    local lineWidthStepMin = rtConfig.lineWidthStepMin or 0.125
+    local lineWidthStepMax = rtConfig.lineWidthStepMax or 8
+    local rtSize
 
-    if step >= referenceStep then
-        return math.Clamp(
+    if step >= lineWidthStepMin and step < lineWidthStepMax then
+        local range = math.max(lineWidthStepMax - lineWidthStepMin, 1e-6)
+        local t = math.Clamp((step - lineWidthStepMin) / range, 0, 1)
+        local minLineWidth = rtConfig.lineWidthMin or 0.015625
+        local lineWidth = minLineWidth + ((rtConfig.lineWidthMax or 0.25) - minLineWidth) * t
+        rtSize = math.Clamp(
+            math.floor((step * 2) / math.max(lineWidth, 1e-6) + 0.5),
+            1,
+            rtConfig.baseRtSize
+        )
+    elseif step >= lineWidthStepMax then
+        rtSize = math.floor((lineWidthStepMax * 2) / math.max(rtConfig.lineWidthMax or 0.25, 1e-6) + 0.5)
+        local lineWidthCapStep = math.max(tonumber(rtConfig.lineWidthCapStep) or 64, lineWidthStepMax)
+        if step >= lineWidthCapStep then
+            local snappedStep = lineWidthCapStep
+            while snappedStep < step and snappedStep < (rtConfig.maxRtSize or 4096) * lineWidthCapStep do
+                snappedStep = snappedStep * 2
+            end
+
+            rtSize = math.floor(rtSize * (snappedStep / lineWidthCapStep) + 0.5)
+        end
+
+        rtSize = math.Clamp(rtSize, 1, rtConfig.maxRtSize or rtConfig.baseRtSize)
+    else
+        rtSize = math.Clamp(
             math.floor(rtConfig.baseRtSize * scale + 0.5),
-            rtConfig.baseRtSize,
-            rtConfig.maxRtSize
+            rtConfig.minRtSize,
+            rtConfig.baseRtSize
         )
     end
 
-    local scaled = math.floor(rtConfig.baseRtSize * scale + 0.5)
-    return math.Clamp(scaled, rtConfig.minRtSize, rtConfig.baseRtSize)
+    return rtSize
 end
 
-function client.worldGridRender.drawWorldGridRtLines(size, lineMode, thin)
-    local centerThickness = thin and 1 or 2
-    local center = math.floor(size * 0.5 - centerThickness * 0.5)
+function client.worldGridRender.worldGridRtDimensions(step, lineMode)
+    local rtConfig = client.worldGridRender.rtConfig
+    local baseSize = client.worldGridRender.worldGridRtSize(step)
+    if not client.worldGridRender.isWorldGridLineMode(lineMode) then
+        return baseSize, baseSize
+    end
+
+    local lineSize = math.Clamp(
+        math.floor(baseSize * math.max(tonumber(rtConfig.lineRtScale) or 2, 1) + 0.5),
+        1,
+        rtConfig.maxRtSize or baseSize
+    )
+
+    if lineMode == "line_u" then
+        return lineSize, baseSize
+    end
+
+    return baseSize, lineSize
+end
+
+function client.worldGridRender.pushWorldGridTextureFilter()
+    if not TEXFILTER or TEXFILTER.POINT == nil then return false, false end
+
+    local pushedMin = false
+    local pushedMag = false
+    if isfunction(render.PushFilterMin) then
+        render.PushFilterMin(TEXFILTER.POINT)
+        pushedMin = true
+    end
+    if isfunction(render.PushFilterMag) then
+        render.PushFilterMag(TEXFILTER.POINT)
+        pushedMag = true
+    end
+
+    return pushedMin, pushedMag
+end
+
+function client.worldGridRender.popWorldGridTextureFilter(pushedMin, pushedMag)
+    if pushedMag and isfunction(render.PopFilterMag) then
+        render.PopFilterMag()
+    end
+    if pushedMin and isfunction(render.PopFilterMin) then
+        render.PopFilterMin()
+    end
+end
+
+function client.worldGridRender.drawWorldGridRtLines(width, height, lineMode, thin)
+    width = math.max(math.floor(tonumber(width) or 0), 1)
+    height = math.max(math.floor(tonumber(height) or width), 1)
+
+    local maxX = width - 1
+    local maxY = height - 1
+    local xTwelfth = math.Clamp(math.floor(maxX / 12 + 0.5), 0, maxX)
+    local yTwelfth = math.Clamp(math.floor(maxY / 12 + 0.5), 0, maxY)
+    local xElevenTwelfths = math.Clamp(math.floor(maxX * 11 / 12 + 0.5), 0, maxX)
+    local yElevenTwelfths = math.Clamp(math.floor(maxY * 11 / 12 + 0.5), 0, maxY)
+    local xCenterStart = math.Clamp(math.floor(maxX * 11 / 24 + 0.5), 0, maxX)
+    local xCenterEnd = math.Clamp(math.floor(maxX * 13 / 24 + 0.5), 0, maxX)
+    local yCenterStart = math.Clamp(math.floor(maxY * 11 / 24 + 0.5), 0, maxY)
+    local yCenterEnd = math.Clamp(math.floor(maxY * 13 / 24 + 0.5), 0, maxY)
+    local centerXA = math.Clamp(math.floor(width * 0.5 - 0.5), 0, maxX)
+    local centerXB = math.Clamp(centerXA + 1, 0, maxX)
+    local centerYA = math.Clamp(math.floor(height * 0.5 - 0.5), 0, maxY)
+    local centerYB = math.Clamp(centerYA + 1, 0, maxY)
+    local centerXSpan = math.max(xCenterEnd - xCenterStart + 1, 1)
+    local centerYSpan = math.max(yCenterEnd - yCenterStart + 1, 1)
+    local hybridXNearLength = math.max(math.floor(centerXSpan * 0.5), 1)
+    local hybridYNearLength = math.max(math.floor(centerYSpan * 0.5), 1)
+    local hybridXFarLength = math.max(centerXSpan - hybridXNearLength, 1)
+    local hybridYFarLength = math.max(centerYSpan - hybridYNearLength, 1)
+    local hybridXEnd = math.Clamp(hybridXNearLength - 1, 0, maxX)
+    local hybridYEnd = math.Clamp(hybridYNearLength - 1, 0, maxY)
+    local hybridXStart = math.Clamp(maxX - hybridXFarLength + 1, 0, maxX)
+    local hybridYStart = math.Clamp(maxY - hybridYFarLength + 1, 0, maxY)
+    local edgeOffsetY = math.min(1, maxY)
     local drawU = lineMode ~= "v"
     local drawV = lineMode ~= "u"
+    local crossOnly = lineMode == "cross"
 
-    if drawU then
-        surface.SetDrawColor(255, 255, 255, 255)
-        surface.DrawRect(0, 0, 1, size)
-        surface.DrawRect(size - 1, 0, 1, size)
-        surface.SetDrawColor(128, 128, 128, 255)
-        surface.DrawRect(center, 0, centerThickness, size)
+    local function drawHorizontal(y, x0, x1)
+        y = math.Clamp(math.floor(y + 0.5), 0, maxY)
+        x0 = math.Clamp(math.floor(x0 + 0.5), 0, maxX)
+        x1 = math.Clamp(math.floor(x1 + 0.5), 0, maxX)
+        if x1 < x0 then x0, x1 = x1, x0 end
+
+        surface.DrawRect(x0, y, x1 - x0 + 1, 1)
     end
 
-    if drawV then
-        surface.SetDrawColor(255, 255, 255, 255)
-        surface.DrawRect(0, 0, size, 1)
-        surface.DrawRect(0, size - 1, size, 1)
-        surface.SetDrawColor(128, 128, 128, 255)
-        surface.DrawRect(0, center, size, centerThickness)
+    local function drawVertical(x, y0, y1)
+        x = math.Clamp(math.floor(x + 0.5), 0, maxX)
+        y0 = math.Clamp(math.floor(y0 + 0.5), 0, maxY)
+        y1 = math.Clamp(math.floor(y1 + 0.5), 0, maxY)
+        if y1 < y0 then y0, y1 = y1, y0 end
+
+        surface.DrawRect(x, y0, 1, y1 - y0 + 1)
     end
+
+    local lineOnlyU = lineMode == "line_u"
+    local lineOnlyV = lineMode == "line_v"
+    if lineOnlyU or lineOnlyV then
+        surface.SetDrawColor(0, 0, 0, 255)
+        if lineOnlyU then
+            drawVertical(0, 0, maxY)
+            drawVertical(centerXB, 0, maxY)
+        end
+        if lineOnlyV then
+            drawHorizontal(maxY, 0, maxX)
+            drawHorizontal(centerYA, 0, maxX)
+        end
+
+        surface.SetDrawColor(255, 255, 255, 255)
+        if lineOnlyU then
+            drawVertical(maxX, 0, maxY)
+            drawVertical(centerXA, 0, maxY)
+        end
+        if lineOnlyV then
+            drawHorizontal(0, 0, maxX)
+            drawHorizontal(centerYB, 0, maxX)
+        end
+
+        surface.SetDrawColor(0, 0, 0, 255)
+        if lineOnlyU then
+            drawVertical(0, 0, maxY)
+            drawVertical(centerXB, 0, maxY)
+        end
+        return
+    end
+
+    local function drawEdgeHorizontal(y)
+        if crossOnly then
+            drawHorizontal(y, 0, xTwelfth)
+            drawHorizontal(y, xElevenTwelfths, maxX)
+        else
+            drawHorizontal(y, 0, maxX)
+        end
+    end
+
+    local function drawEdgeVertical(x, includeCorner)
+        local y0 = includeCorner and 0 or edgeOffsetY
+        if crossOnly then
+            drawVertical(x, y0, yTwelfth)
+            drawVertical(x, yElevenTwelfths, maxY)
+        else
+            drawVertical(x, y0, maxY)
+        end
+    end
+
+    local function drawCornerHorizontalShadow()
+        if drawV then
+            drawEdgeHorizontal(maxY)
+        end
+    end
+
+    local function drawCornerHorizontalLight()
+        if drawV then
+            drawEdgeHorizontal(0)
+        end
+    end
+
+    local function drawCornerVerticalShadow()
+        if drawU then
+            drawEdgeVertical(0, false)
+        end
+    end
+
+    local function drawCornerVerticalShadowForeground()
+        if drawU then
+            drawEdgeVertical(0, true)
+        end
+    end
+
+    local function drawCornerVerticalLight()
+        if drawU then
+            drawEdgeVertical(maxX, false)
+        end
+    end
+
+    local function drawHorizontalHalfVerticalShadow()
+        if drawU then
+            drawVertical(centerXB, 0, hybridYEnd)
+            drawVertical(centerXB, hybridYStart, maxY)
+        end
+    end
+
+    local function drawHorizontalEdgeVerticalShadowForeground()
+        if drawU then
+            drawVertical(centerXB, 0, hybridYEnd)
+            drawVertical(centerXB, hybridYStart, maxY)
+        end
+    end
+
+    local function drawHorizontalHalfVerticalLight()
+        if drawU then
+            drawVertical(centerXA, 0, hybridYEnd)
+            drawVertical(centerXA, hybridYStart, maxY)
+        end
+    end
+
+    local function drawHorizontalHalfHorizontalShadow()
+        if drawV then
+            drawHorizontal(maxY, xCenterStart, xCenterEnd)
+        end
+    end
+
+    local function drawHorizontalHalfHorizontalLight()
+        if drawV then
+            drawHorizontal(0, xCenterStart, xCenterEnd)
+        end
+    end
+
+    local function drawVerticalHalfHorizontalShadow()
+        if drawV then
+            drawHorizontal(centerYA, 0, hybridXEnd)
+            drawHorizontal(centerYA, hybridXStart, maxX)
+        end
+    end
+
+    local function drawVerticalHalfHorizontalLight()
+        if drawV then
+            drawHorizontal(centerYB, 0, hybridXEnd)
+            drawHorizontal(centerYB, hybridXStart, maxX)
+        end
+    end
+
+    local function drawVerticalHalfVerticalShadow()
+        if drawU then
+            drawVertical(0, yCenterStart, yCenterEnd)
+        end
+    end
+
+    local function drawVerticalHalfVerticalLight()
+        if drawU then
+            drawVertical(maxX, yCenterStart, yCenterEnd)
+        end
+    end
+
+    local function drawCenterHorizontalShadow()
+        if drawV then
+            drawHorizontal(centerYA, xCenterStart, xCenterEnd)
+        end
+    end
+
+    local function drawCenterHorizontalLight()
+        if drawV then
+            drawHorizontal(centerYB, xCenterStart, xCenterEnd)
+        end
+    end
+
+    local function drawCenterVerticalShadow()
+        if drawU then
+            drawVertical(centerXB, yCenterStart, yCenterEnd)
+        end
+    end
+
+    local function drawCenterVerticalLight()
+        if drawU then
+            drawVertical(centerXA, yCenterStart, yCenterEnd)
+        end
+    end
+
+    surface.SetDrawColor(0, 0, 0, 255)
+    drawCornerHorizontalShadow()
+    drawHorizontalHalfHorizontalShadow()
+    drawVerticalHalfHorizontalShadow()
+    drawCenterHorizontalShadow()
+
+    surface.SetDrawColor(255, 255, 255, 255)
+    drawCornerHorizontalLight()
+    drawHorizontalHalfHorizontalLight()
+    drawVerticalHalfHorizontalLight()
+    drawCenterHorizontalLight()
+
+    surface.SetDrawColor(0, 0, 0, 255)
+    drawCornerVerticalShadow()
+    drawHorizontalHalfVerticalShadow()
+    drawVerticalHalfVerticalShadow()
+
+    surface.SetDrawColor(255, 255, 255, 255)
+    drawCornerVerticalLight()
+    drawHorizontalHalfVerticalLight()
+    drawVerticalHalfVerticalLight()
+    drawCenterVerticalLight()
+
+    surface.SetDrawColor(0, 0, 0, 255)
+    drawCornerVerticalShadowForeground()
+    drawHorizontalEdgeVerticalShadowForeground()
+    drawVerticalHalfVerticalShadow()
+    drawCenterVerticalShadow()
 end
 
 function client.worldGridRender.rebuildWorldGridRtEntry(entry)
     if not entry or not entry.texture then return end
 
+    local overrideDepthAlpha = isfunction(render.SetWriteDepthToDestAlpha)
+    if overrideDepthAlpha then
+        render.SetWriteDepthToDestAlpha(false)
+    end
+
     render.PushRenderTarget(entry.texture)
-    render.Clear(0, 0, 0, 0, true, true)
+    if render.OverrideAlphaWriteEnable then
+        render.OverrideAlphaWriteEnable(true, true)
+    end
+    if render.ClearDepth then
+        render.ClearDepth()
+    end
+    render.Clear(0, 0, 0, 0)
     cam.Start2D()
         draw.NoTexture()
         setStripePatternCopyBlend(true)
-        client.worldGridRender.drawWorldGridRtLines(entry.rtSize, entry.lineMode, entry.thin)
+        client.worldGridRender.drawWorldGridRtLines(entry.rtWidth or entry.rtSize, entry.rtHeight or entry.rtSize, entry.lineMode, entry.thin)
         setStripePatternCopyBlend(false)
     cam.End2D()
+    if render.OverrideAlphaWriteEnable then
+        render.OverrideAlphaWriteEnable(false)
+    end
     render.PopRenderTarget()
+
+    if overrideDepthAlpha then
+        render.SetWriteDepthToDestAlpha(true)
+    end
 
     entry.ready = true
 end
@@ -874,22 +1262,23 @@ end
 
 function client.worldGridRender.ensureWorldGridMaterial(step, lineMode)
     local rtConfig = client.worldGridRender.rtConfig
-    local rtSize = client.worldGridRender.worldGridRtSize(step)
     lineMode = lineMode or "full"
+    local rtWidth, rtHeight = client.worldGridRender.worldGridRtDimensions(step, lineMode)
     local thin = (tonumber(step) or 0) < rtConfig.referenceStep
-    local cacheKey = ("%d_%s_%s"):format(rtSize, lineMode, thin and "thin" or "normal")
+    local cacheKey = ("%dx%d_%s_%s_a%d"):format(rtWidth, rtHeight, lineMode, thin and "thin" or "normal", rtConfig.alphaRtVersion or 0)
     local entry = client.worldGridRender.rtCache[cacheKey]
 
     if not entry then
+        local textureFlags = bit.bor(1, 256, 512, 8192)
         local texture = GetRenderTargetEx(
             rtConfig.cacheName .. "_" .. cacheKey .. "_rt",
-            rtSize,
-            rtSize,
+            rtWidth,
+            rtHeight,
             RT_SIZE_NO_CHANGE,
             MATERIAL_RT_DEPTH_NONE,
+            textureFlags,
             0,
-            0,
-            IMAGE_FORMAT_RGBA8888
+            IMAGE_FORMAT_BGRA8888 or 12
         )
         local material = CreateMaterial(rtConfig.cacheName .. "_" .. cacheKey .. "_mat", "UnlitGeneric", {
             ["$basetexture"] = texture:GetName(),
@@ -897,14 +1286,16 @@ function client.worldGridRender.ensureWorldGridMaterial(step, lineMode)
             ["$vertexalpha"] = "1",
             ["$vertexcolor"] = "1",
             ["$decal"] = "1",
-            ["$nocull"] = "0",
+            ["$nocull"] = "1",
             ["$model"] = "1"
         })
 
         entry = {
             texture = texture,
             material = material,
-            rtSize = rtSize,
+            rtSize = math.max(rtWidth, rtHeight),
+            rtWidth = rtWidth,
+            rtHeight = rtHeight,
             lineMode = lineMode,
             thin = thin,
             ready = false
@@ -915,7 +1306,7 @@ function client.worldGridRender.ensureWorldGridMaterial(step, lineMode)
 
     entry.material:SetTexture("$basetexture", entry.texture)
     entry.material:SetInt("$decal", 1)
-    entry.material:SetInt("$nocull", 0)
+    entry.material:SetInt("$nocull", 1)
 
     if not entry.ready then
         client.worldGridRender.queueWorldGridRtEntryRebuild(entry)
@@ -1149,7 +1540,7 @@ function client.worldGridRender.drawWorldGridSnapCross(face)
     local lines, lineCount = client.worldGridRender.ensureWorldGridSnapCrossData(face)
     if not istable(lines) or (lineCount or 0) <= 0 then return end
 
-    local color = cachedColor(255, 255, 255, GRID_CONFIG.snapLineAlpha)
+    local color = prop2BlueColor(GRID_CONFIG.snapLineAlpha)
     for i = 1, lineCount do
         local line = lines[i]
         if line and line.a and line.b then
@@ -1158,12 +1549,12 @@ function client.worldGridRender.drawWorldGridSnapCross(face)
     end
 end
 
-function client.worldGridRender.worldGridBatchKey(step, overlay, alpha)
+function client.worldGridRender.worldGridBatchKey(step, overlay, alpha, lineMode)
     return ("%.6f:%s:%s:%s:%d"):format(
         tonumber(step) or 0,
         tostring(overlay and overlay.axisU or ""),
         tostring(overlay and overlay.axisV or ""),
-        tostring(overlay and overlay.lineMode or "full"),
+        tostring(lineMode or (overlay and overlay.lineMode) or "full"),
         math.Clamp(math.floor(tonumber(alpha) or 0), 0, 255)
     )
 end
@@ -1229,7 +1620,12 @@ function client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlay, alpha
     local step = tonumber(face and face.globalGridStep) or 0
     if not istable(vertices) or vertexCount < 3 or not overlay or not overlay.axisU or not overlay.axisV or step <= 0 then return end
 
-    local material, materialEntry = client.worldGridRender.ensureWorldGridMaterial(step, overlay.lineMode or "full")
+    local lineMode = overlay.lineMode or "full"
+    if lineMode == "full" and face and face.worldBspFullGrid == false then
+        lineMode = "cross"
+    end
+
+    local material, materialEntry = client.worldGridRender.ensureWorldGridMaterial(step, lineMode)
     if not material then return end
 
     local batches = renderData.worldGridBatches
@@ -1238,7 +1634,7 @@ function client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlay, alpha
         renderData.worldGridBatches = batches
     end
 
-    local key = client.worldGridRender.worldGridBatchKey(step, overlay, alpha)
+    local key = client.worldGridRender.worldGridBatchKey(step, overlay, alpha, lineMode)
     local batch = batches[key]
     if batch and batch.sourceVersion == renderData.version then
         batch.material = material
@@ -1251,6 +1647,7 @@ function client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlay, alpha
 
     local batchVertices = batch.vertices
     local color = cachedColor(255, 255, 255, alpha)
+    -- Higher-res line RTs keep the same world tile size; only texel density changes.
     local textureStep = step * 2
     local axisU = overlay.axisU
     local axisV = overlay.axisV
@@ -1290,7 +1687,13 @@ function client.worldGridRender.prepareWorldGridSurface(face, alpha)
 
     local batchCount = 0
     for i = 1, #overlays do
-        local batch = client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlays[i], alpha)
+        local overlay = overlays[i]
+        local overlayAlpha = alpha
+        if overlay and overlay.alphaScale then
+            overlayAlpha = math.Clamp(math.floor((tonumber(alpha) or 0) * math.Clamp(tonumber(overlay.alphaScale) or 1, 0, 1) + 0.5), 0, 255)
+        end
+
+        local batch = client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlay, overlayAlpha)
         if batch then
             batchCount = batchCount + 1
             batches[batchCount] = batch
@@ -1303,6 +1706,8 @@ function client.worldGridRender.prepareWorldGridSurface(face, alpha)
 
     face._magicAlignWorldGridBatchCount = batchCount
     face._magicAlignWorldGridPreparedAlpha = alpha
+    face._magicAlignWorldGridPreparedFullGrid = face.worldBspFullGrid ~= false
+    face._magicAlignWorldGridPreparedRtVersion = client.worldGridRender.rtConfig and client.worldGridRender.rtConfig.alphaRtVersion or 0
     return batches, batchCount
 end
 
@@ -1320,23 +1725,32 @@ function client.worldGridRender.drawWorldGridSurfaceBatch(batch)
     if not batch or not batch.material or (batch.vertexCount or 0) <= 0 then return end
     if batch.materialEntry and batch.materialEntry.ready ~= true then return end
 
+    local pushedMin, pushedMag = client.worldGridRender.pushWorldGridTextureFilter()
     render.SetMaterial(batch.material)
     if batch.meshReady and batch.mesh and isfunction(batch.mesh.Draw) then
         batch.mesh:Draw()
-        return
+    else
+        mesh.Begin(MATERIAL_TRIANGLES, batch.triangleCount or math.floor((batch.vertexCount or 0) / 3))
+            for i = 1, batch.vertexCount do
+                client.worldGridRender.pushWorldGridBatchVertex(batch.vertices[i])
+            end
+        mesh.End()
     end
-
-    mesh.Begin(MATERIAL_TRIANGLES, batch.triangleCount or math.floor((batch.vertexCount or 0) / 3))
-        for i = 1, batch.vertexCount do
-            client.worldGridRender.pushWorldGridBatchVertex(batch.vertices[i])
-        end
-    mesh.End()
+    client.worldGridRender.popWorldGridTextureFilter(pushedMin, pushedMag)
 end
 
 function client.worldGridRender.drawWorldGridSurface(face, alpha)
     local batches = face and face._magicAlignWorldGridBatches
     local batchCount = face and face._magicAlignWorldGridBatchCount or 0
-    if face and face._magicAlignWorldGridPreparedAlpha ~= alpha then
+    local fullGrid = face and face.worldBspFullGrid ~= false
+    local rtVersion = client.worldGridRender.rtConfig and client.worldGridRender.rtConfig.alphaRtVersion or 0
+    if face
+        and (
+            face._magicAlignWorldGridPreparedAlpha ~= alpha
+            or face._magicAlignWorldGridPreparedFullGrid ~= fullGrid
+            or face._magicAlignWorldGridPreparedRtVersion ~= rtVersion
+        )
+    then
         batches, batchCount = client.worldGridRender.prepareWorldGridSurface(face, alpha)
     end
     if not istable(batches) or (batchCount or 0) <= 0 then return end
@@ -1347,7 +1761,12 @@ function client.worldGridRender.drawWorldGridSurface(face, alpha)
 end
 
 function client.worldGridRender.prepareWorldBspGlobalGrid(face)
-    if not face or face._magicAlignWorldGridGlobalPrepared then return end
+    local fullGrid = face and face.worldBspFullGrid ~= false
+    if not face then return end
+    if face._magicAlignWorldGridGlobalPrepared
+        and face._magicAlignWorldGridGlobalPreparedFullGrid == fullGrid then
+        return
+    end
 
     local neighbors = face and face.globalGridNeighbors
     if istable(neighbors) then
@@ -1359,6 +1778,7 @@ function client.worldGridRender.prepareWorldBspGlobalGrid(face)
     client.worldGridRender.prepareWorldGridSurface(face, GRID_CONFIG.bspGlobalAlpha)
     client.worldGridRender.ensureWorldGridSnapCrossData(face)
     face._magicAlignWorldGridGlobalPrepared = true
+    face._magicAlignWorldGridGlobalPreparedFullGrid = fullGrid
 end
 
 function client.prepareWorldBspRenderCandidate(candidate)
@@ -1614,14 +2034,6 @@ local function occludedStripeParallaxCenter(centerX, centerY)
     return centerX + (screenCenterX - centerX) * amount, centerY + (screenCenterY - centerY) * amount
 end
 
-local function screenPointDistance(a, b)
-    if not a or not b then return 0 end
-
-    local dx = (tonumber(a.x) or 0) - (tonumber(b.x) or 0)
-    local dy = (tonumber(a.y) or 0) - (tonumber(b.y) or 0)
-    return math.sqrt(dx * dx + dy * dy)
-end
-
 local function drawScreenStripePattern(color, tileSize, centerX, centerY)
     if ensureStripePatternMaterial then
         ensureStripePatternMaterial()
@@ -1753,16 +2165,28 @@ local function beginBillboard(worldPos, viewerPos)
     viewerPos = isvector(viewerPos)
         and viewerPos
         or (IsValid(LocalPlayer()) and LocalPlayer():GetShootPos() or EyePos())
-    local toViewer = viewerPos - worldPos
-    if toViewer:LengthSqr() < 1e-8 then
-        toViewer = BILLBOARD_FALLBACK_VIEW_DIR
+
+    local wx, wy, wz = numberOrZero(worldPos.x), numberOrZero(worldPos.y), numberOrZero(worldPos.z)
+    local dx = numberOrZero(viewerPos.x) - wx
+    local dy = numberOrZero(viewerPos.y) - wy
+    local dz = numberOrZero(viewerPos.z) - wz
+    local distanceSqr = dx * dx + dy * dy + dz * dz
+    local toViewer
+    if distanceSqr < 1e-8 then
+        toViewer = setVecComponents(reusableBillboardToViewer, 0, 0, 1)
     else
-        toViewer:Normalize()
+        local invDistance = 1 / math.sqrt(distanceSqr)
+        toViewer = setVecComponents(reusableBillboardToViewer, dx * invDistance, dy * invDistance, dz * invDistance)
     end
 
     local ang = toViewer:Angle()
     ang = M.RotateAngleAroundAxisPrecise(ang, M.AngleRightPrecise(ang), -90)
-    local pos = worldPos + toViewer * RENDER_CONFIG.billboardPush
+    local pos = setVecComponents(
+        reusableBillboardPos,
+        wx + toViewer.x * RENDER_CONFIG.billboardPush,
+        wy + toViewer.y * RENDER_CONFIG.billboardPush,
+        wz + toViewer.z * RENDER_CONFIG.billboardPush
+    )
 
     local drawPos = toVector(pos)
     local drawAng = toAngle(ang)
@@ -2570,6 +2994,8 @@ local function drawTranslationSnapOverlay(tool, state, g, spriteSettings, viewer
 end
 
 local reusablePointWorldPositions = {}
+local reusablePointAnchorLocalPositions = {}
+local reusablePointAnchorWorldPositions = {}
 
 local function drawDoubleSidedPlaneSquare(worldPos, axisA, axisB, halfSize, outline, preferredNormal)
     if not isvector(worldPos) or not isvector(axisA) or not isvector(axisB) then return end
@@ -2709,6 +3135,11 @@ local function drawTexturedTriangle(a, b, c, uvA, uvB, uvC, color, material)
 end
 
 local reusableTriangleUV = { {}, {}, {} }
+local reusableTrianglePositions = {
+    pa = newRenderVector(0, 0, 0),
+    pb = newRenderVector(0, 0, 0),
+    pc = newRenderVector(0, 0, 0)
+}
 
 ensureStripePatternMaterial = function()
     if not stripePatternTexture then
@@ -2842,53 +3273,49 @@ queueShapeCacheWarmup()
 local function drawStripedTriangle(a, b, c, frontColor, stripePhase, viewerPos)
     if not isvector(a) or not isvector(b) or not isvector(c) then return end
 
-    local ab = b - a
-    local ac = c - a
-    local normal = ab:Cross(ac)
-    if normal:LengthSqr() < 1e-8 then return end
-    normal:Normalize()
+    local ax, ay, az = numberOrZero(a.x), numberOrZero(a.y), numberOrZero(a.z)
+    local bx0, by0, bz0 = numberOrZero(b.x), numberOrZero(b.y), numberOrZero(b.z)
+    local cx0, cy0, cz0 = numberOrZero(c.x), numberOrZero(c.y), numberOrZero(c.z)
+    local abx, aby, abz = bx0 - ax, by0 - ay, bz0 - az
+    local acx, acy, acz = cx0 - ax, cy0 - ay, cz0 - az
+    local normalX = aby * acz - abz * acy
+    local normalY = abz * acx - abx * acz
+    local normalZ = abx * acy - aby * acx
+    local normalLengthSqr = normalX * normalX + normalY * normalY + normalZ * normalZ
+    if normalLengthSqr < 1e-8 then return end
+    local invNormalLength = 1 / math.sqrt(normalLengthSqr)
+    normalX, normalY, normalZ = normalX * invNormalLength, normalY * invNormalLength, normalZ * invNormalLength
 
     viewerPos = isvector(viewerPos)
         and viewerPos
         or setVec(shapeMetricCache.renderPerf.fallbackViewerPos, IsValid(LocalPlayer()) and LocalPlayer():GetShootPos() or EyePos())
     shapeMetricCache.renderPerf.fallbackViewerPos = viewerPos
-    local center = (a + b + c) / 3
-    local frontFacing = normal:Dot(viewerPos - center) >= 0
-    local visibleNormal = frontFacing and normal or -normal
-    local push = visibleNormal * 0.08
+    local centerX, centerY, centerZ = (ax + bx0 + cx0) / 3, (ay + by0 + cy0) / 3, (az + bz0 + cz0) / 3
+    local viewerX, viewerY, viewerZ = numberOrZero(viewerPos.x), numberOrZero(viewerPos.y), numberOrZero(viewerPos.z)
+    local frontFacing = normalX * (viewerX - centerX) + normalY * (viewerY - centerY) + normalZ * (viewerZ - centerZ) >= 0
+    local visibleNormalScale = frontFacing and 0.08 or -0.08
+    local pushX, pushY, pushZ = normalX * visibleNormalScale, normalY * visibleNormalScale, normalZ * visibleNormalScale
     local tintColor = frontFacing
         and cachedColor(frontColor.r, frontColor.g, frontColor.b, 220)
         or cachedColor(155, 155, 155, 255)
     local edgeColor = frontFacing and cappedAlpha(frontColor, 36) or cachedColor(165, 165, 165, 32)
 
-    local pa = a + push
-    local pb = b + push
-    local pc = c + push
+    local pa = setVecComponents(reusableTrianglePositions.pa, ax + pushX, ay + pushY, az + pushZ)
+    local pb = setVecComponents(reusableTrianglePositions.pb, bx0 + pushX, by0 + pushY, bz0 + pushZ)
+    local pc = setVecComponents(reusableTrianglePositions.pc, cx0 + pushX, cy0 + pushY, cz0 + pushZ)
 
-    local u = ab:GetNormalized()
-    local v = ac - u * ac:Dot(u)
-    if v:LengthSqr() < 1e-8 then return end
-    local vLen = v:Length()
-    v:Normalize()
+    local abLengthSqr = abx * abx + aby * aby + abz * abz
+    if abLengthSqr < 1e-8 then return end
+    local bx = math.sqrt(abLengthSqr)
+    local invAbLength = 1 / bx
+    local ux, uy, uz = abx * invAbLength, aby * invAbLength, abz * invAbLength
+    local cx = acx * ux + acy * uy + acz * uz
+    local vx, vy, vz = acx - ux * cx, acy - uy * cx, acz - uz * cx
+    local vLenSqr = vx * vx + vy * vy + vz * vz
+    if vLenSqr < 1e-8 then return end
 
-    local bx = ab:Length()
-    local cx = ac:Dot(u)
-    local cy = vLen
-    local distance = math.max(viewerPos:Distance(center), 1)
-    local tileSize = math.max(1, STRIPE_CONFIG.rtSize * stripeDistanceScale(distance))
-    local centerScreen = center:ToScreen()
-    local pixelsPerWorld = 0
-    if centerScreen then
-        pixelsPerWorld = (
-            screenPointDistance(centerScreen, (center + u):ToScreen())
-            + screenPointDistance(centerScreen, (center + v):ToScreen())
-        ) * 0.5
-    end
-
-    local stripePeriod = STRIPE_CONFIG.worldTile * math.sqrt(2)
-    if pixelsPerWorld > 1e-4 then
-        stripePeriod = math.max(0.01, tileSize / pixelsPerWorld)
-    end
+    local cy = math.sqrt(vLenSqr)
+    local stripePeriod = STATIC_TRIANGLE_STRIPE_PERIOD
     local phase = ((tonumber(stripePhase) or 0) % 1)
     local stripeMaterial = ensureStripePatternMaterial()
 
@@ -2911,7 +3338,7 @@ local function drawStripedTriangle(a, b, c, frontColor, stripePhase, viewerPos)
             stripeMaterial
         )
     else
-        drawFilledTriangle(pa, pb, pc, frontFacing and cappedAlpha(frontColor, STRIPE_CONFIG.fillAlpha) or Color(105, 105, 105, STRIPE_CONFIG.fillAlpha))
+        drawFilledTriangle(pa, pb, pc, frontFacing and cappedAlpha(frontColor, STRIPE_CONFIG.fillAlpha) or cachedColor(105, 105, 105, STRIPE_CONFIG.fillAlpha))
     end
 
     drawLine(pa, pb, edgeColor, false)
@@ -3025,6 +3452,47 @@ local function anchorPointFast(points, id, options)
     end
 end
 
+local function lerpPointInto(out, a, b, t)
+    if not isvector(a) or not isvector(b) then return end
+
+    return setVecComponents(
+        out,
+        numberOrZero(a.x) + (numberOrZero(b.x) - numberOrZero(a.x)) * t,
+        numberOrZero(a.y) + (numberOrZero(b.y) - numberOrZero(a.y)) * t,
+        numberOrZero(a.z) + (numberOrZero(b.z) - numberOrZero(a.z)) * t
+    )
+end
+
+local function anchorPointInto(out, points, id, options)
+    local p1, p2, p3 = points[1], points[2], points[3]
+
+    if id == "p1" then return p1 end
+    if id == "p2" then return p2 end
+    if id == "p3" then return p3 end
+    if id == "mid12" then return lerpPointInto(out, p1, p2, anchorPercent(options, "mid12")) end
+    if id == "mid23" then return lerpPointInto(out, p2, p3, anchorPercent(options, "mid23")) end
+    if id == "mid13" then return lerpPointInto(out, p1, p3, anchorPercent(options, "mid13")) end
+
+    if id == M.ANCHOR_CENTER_ID and p1 and p2 and p3 then
+        local t12 = anchorPercent(options, "mid12")
+        local t23 = anchorPercent(options, "mid23")
+        local t13 = anchorPercent(options, "mid13")
+        local p1x, p1y, p1z = numberOrZero(p1.x), numberOrZero(p1.y), numberOrZero(p1.z)
+        local p2x, p2y, p2z = numberOrZero(p2.x), numberOrZero(p2.y), numberOrZero(p2.z)
+        local p3x, p3y, p3z = numberOrZero(p3.x), numberOrZero(p3.y), numberOrZero(p3.z)
+        local m12x, m12y, m12z = p1x + (p2x - p1x) * t12, p1y + (p2y - p1y) * t12, p1z + (p2z - p1z) * t12
+        local m23x, m23y, m23z = p2x + (p3x - p2x) * t23, p2y + (p3y - p2y) * t23, p2z + (p3z - p2z) * t23
+        local m13x, m13y, m13z = p1x + (p3x - p1x) * t13, p1y + (p3y - p1y) * t13, p1z + (p3z - p1z) * t13
+
+        return setVecComponents(
+            out,
+            (m12x + m23x + m13x) / 3,
+            (m12y + m23y + m13y) / 3,
+            (m12z + m23z + m13z) / 3
+        )
+    end
+end
+
 local function drawPointSet(ent, points, color, posOverride, angOverride, stripePhase, triangleColor, anchorConfig, spriteSettings, viewerPos)
     if #points < 1 then return end
 
@@ -3041,7 +3509,7 @@ local function drawPointSet(ent, points, color, posOverride, angOverride, stripe
 
     local worldPoints = reusablePointWorldPositions
     for i = 1, #points do
-        worldPoints[i] = LocalToWorldPosPrecise(points[i], basePos, baseAng)
+        worldPoints[i] = localToWorldPosInto(worldPoints[i], points[i], basePos, baseAng)
     end
     for i = #points + 1, #worldPoints do
         worldPoints[i] = nil
@@ -3054,10 +3522,17 @@ local function drawPointSet(ent, points, color, posOverride, angOverride, stripe
     local mainRadius = 1.35
     local midRadius = mainRadius * 0.5
     local function anchorWorldPos(id)
-        local localPos = anchorPointFast(points, id, anchorConfig)
+        local localScratch = reusablePointAnchorLocalPositions[id]
+        local localPos = anchorPointInto(localScratch, points, id, anchorConfig)
         if not isvector(localPos) then return end
+        if localPos ~= points[1] and localPos ~= points[2] and localPos ~= points[3] then
+            reusablePointAnchorLocalPositions[id] = localPos
+        end
 
-        return LocalToWorldPosPrecise(localPos, basePos, baseAng)
+        local scratch = reusablePointAnchorWorldPositions[id]
+        scratch = localToWorldPosInto(scratch, localPos, basePos, baseAng)
+        reusablePointAnchorWorldPositions[id] = scratch
+        return scratch
     end
 
     local mid12World = anchorWorldPos("mid12")
@@ -3333,14 +3808,14 @@ function hoverRender.drawGrid(state, candidate)
     if face.snapGridU and face.uSnap then
         local a, b = faceLineWorldPoints(ent, face, face.snapGridU, "u", face.uSnap)
         if a and b then
-            drawLine(a, b, cachedColor(255, 255, 255, GRID_CONFIG.snapLineAlpha), false)
+            drawLine(a, b, prop2BlueColor(GRID_CONFIG.snapLineAlpha), false)
         end
     end
 
     if face.snapGridV and face.vSnap then
         local a, b = faceLineWorldPoints(ent, face, face.snapGridV, "v", face.vSnap)
         if a and b then
-            drawLine(a, b, cachedColor(255, 255, 255, GRID_CONFIG.snapLineAlpha), false)
+            drawLine(a, b, prop2BlueColor(GRID_CONFIG.snapLineAlpha), false)
         end
     end
 end

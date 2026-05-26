@@ -21,7 +21,7 @@ local normalizedVec = M.NormalizeVectorPrecise
 local dot = M.DotVectorsPrecise
 local cross = M.CrossVectorsPrecise
 
-local CACHE_VERSION = 7
+local CACHE_VERSION = 13
 
 local WORLD_AXIS_KEYS = { "x", "y", "z" }
 local WORLD_GRID = {
@@ -30,6 +30,7 @@ local WORLD_GRID = {
     maxStep = 512,
     familyEpsilonSqr = 1e-10,
     pairDetEpsilon = 1e-8,
+    extraLineAlphaScale = 0.35,
     verticalNormalZMax = 0.35,
     horizontalNormalZMin = 0.85
 }
@@ -41,7 +42,15 @@ local CONFIG = {
     planeTolerance = 1.25,
     boundsTolerance = 2,
     surfacePickTolerance = 0.15,
+    displacementHitTexture = "**displacement**",
+    displacementBoundsTolerance = 4,
+    displacementPlaneTolerance = 4,
+    displacementSurfacePickTolerance = 4,
+    displacementNormalDotMin = 0.94,
+    displacementEdgeProjectionTolerance = 4,
+    displacementRayPickTolerance = 5,
     edgePickTolerance = 0.35,
+    edgeProjectionTolerance = 2.5,
     polygonPickTolerance = 0.02,
     polygonTolerance = 0.001,
     rayPickTolerance = 2.5,
@@ -50,6 +59,8 @@ local CONFIG = {
     rayNormalWeight = 1.5,
     queryCellRadius = 1,
     vertexMergeToleranceSqr = 1e-8,
+    vertexNeighborCellSize = 16,
+    vertexNeighborTolerance = 0.05,
     hullTolerance = 0.001,
     edgeCellSize = 128,
     edgeParallelDotMin = 0.999,
@@ -65,6 +76,33 @@ local CONFIG = {
     defaultBudgetMs = 2.5,
     minBudgetMs = 0.1,
     maxBudgetMs = 8
+}
+
+local BSP = {
+    headerLumps = 64,
+    headerSize = 1036,
+    ident = "VBSP",
+    lumpFaces = 7,
+    lumpVertexes = 3,
+    lumpSurfEdges = 13,
+    lumpEdges = 12,
+    lumpTexInfo = 6,
+    lumpTexData = 2,
+    lumpTexDataStringData = 43,
+    lumpTexDataStringTable = 44,
+    lumpDispInfo = 26,
+    lumpDispVerts = 33,
+    faceSize = 56,
+    vertexSize = 12,
+    edgeSize = 4,
+    surfEdgeSize = 4,
+    texInfoSize = 72,
+    texDataSize = 32,
+    dispInfoSize = 176,
+    dispVertSize = 20,
+    maxDispPower = 4,
+    startPositionToleranceSqr = 1,
+    compressedLumpId = "LZMA"
 }
 
 local cache = worldBSP.cache or {}
@@ -100,10 +138,16 @@ local function resetCache(status)
     cache.index = {}
     cache.planeBuckets = {}
     cache.edgeIndex = {}
+    cache.vertexIndex = {}
     cache.largeSurfaces = {}
+    cache.sources = {}
     cache.total = 0
     cache.cached = 0
     cache.skipped = 0
+    cache.displacements = 0
+    cache.displacementSurfaces = 0
+    cache.displacementSkipped = 0
+    cache.displacementError = nil
     cache.startedAt = nil
     cache.readyAt = nil
     cache.worker = nil
@@ -354,6 +398,19 @@ local function worldFromUv(surfaceData, u, v)
     return surfaceData.origin + surfaceData.uAxis * u + surfaceData.vAxis * v
 end
 
+local function boundsDistanceSqr(surfaceData, x, y, z, tolerance)
+    local mins = surfaceData and surfaceData.worldMins
+    local maxs = surfaceData and surfaceData.worldMaxs
+    if not isvector(mins) or not isvector(maxs) then return math.huge end
+
+    local eps = tonumber(tolerance) or 0
+    local dx = x < mins.x - eps and (mins.x - eps) - x or x > maxs.x + eps and x - (maxs.x + eps) or 0
+    local dy = y < mins.y - eps and (mins.y - eps) - y or y > maxs.y + eps and y - (maxs.y + eps) or 0
+    local dz = z < mins.z - eps and (mins.z - eps) - z or z > maxs.z + eps and z - (maxs.z + eps) or 0
+
+    return dx * dx + dy * dy + dz * dz
+end
+
 local function axisComponent(value, axisKey)
     if not isvector(value) then return 0 end
     if axisKey == "x" then return value.x end
@@ -406,18 +463,25 @@ local function familiesAreIndependent(a, b)
     return math.abs(familyPairDet(a, b)) > WORLD_GRID.pairDetEpsilon
 end
 
-local function addGlobalProjectionPair(out, seen, familyU, familyV, lineMode)
+local function addGlobalProjectionPair(out, seen, familyU, familyV, lineMode, alphaScale)
     if not familyU or not familyV or not familiesAreIndependent(familyU, familyV) then return end
 
     local key = familyU.axis .. ":" .. familyV.axis .. ":" .. tostring(lineMode or "full")
     if seen[key] then return end
     seen[key] = true
 
-    out[#out + 1] = {
+    local overlay = {
         axisU = familyU.axis,
         axisV = familyV.axis,
         lineMode = lineMode or "full"
     }
+
+    if alphaScale then
+        overlay.alphaScale = alphaScale
+    end
+
+    out[#out + 1] = overlay
+    return overlay
 end
 
 local function sortedHorizontalFamilies(families)
@@ -448,7 +512,14 @@ local function globalProjectionPairs(surfaceData)
     if normalZ <= WORLD_GRID.verticalNormalZMax and zFamily then
         local horizontal = sortedHorizontalFamilies(families)
         for i = 1, #horizontal do
-            addGlobalProjectionPair(out, seen, horizontal[i], zFamily, i == 1 and "full" or "u")
+            addGlobalProjectionPair(
+                out,
+                seen,
+                horizontal[i],
+                zFamily,
+                i == 1 and "full" or "line_u",
+                i == 1 and nil or WORLD_GRID.extraLineAlphaScale
+            )
         end
     elseif normalZ >= WORLD_GRID.horizontalNormalZMin and families.x and families.y then
         addGlobalProjectionPair(out, seen, families.x, families.y, "full")
@@ -470,6 +541,42 @@ local function globalProjectionPairs(surfaceData)
         end
 
         addGlobalProjectionPair(out, seen, bestA, bestB, "full")
+    end
+
+    do
+        local rendered = {}
+        for i = 1, #out do
+            local overlay = out[i]
+            local lineMode = overlay and overlay.lineMode or "full"
+            if lineMode == "full" then
+                rendered[overlay.axisU] = true
+                rendered[overlay.axisV] = true
+            elseif lineMode == "u" or lineMode == "line_u" then
+                rendered[overlay.axisU] = true
+            elseif lineMode == "v" or lineMode == "line_v" then
+                rendered[overlay.axisV] = true
+            end
+        end
+
+        for i = 1, #WORLD_AXIS_KEYS do
+            local family = families[WORLD_AXIS_KEYS[i]]
+            if family and not rendered[family.axis] then
+                local partner, partnerWeight
+                for j = 1, #WORLD_AXIS_KEYS do
+                    local candidate = families[WORLD_AXIS_KEYS[j]]
+                    if candidate and candidate ~= family and familiesAreIndependent(family, candidate) then
+                        local weight = candidate.weight or 0
+                        if not partnerWeight or weight > partnerWeight then
+                            partner, partnerWeight = candidate, weight
+                        end
+                    end
+                end
+
+                if addGlobalProjectionPair(out, seen, family, partner, "line_u", WORLD_GRID.extraLineAlphaScale) then
+                    rendered[family.axis] = true
+                end
+            end
+        end
     end
 
     surfaceData.globalProjectionPairs = out
@@ -694,7 +801,25 @@ function worldBSP.faceLineWorldPoints(face, _, axisKey, value)
     return worldFromUv(surfaceData, minOther, value), worldFromUv(surfaceData, maxOther, value)
 end
 
-local function buildSurfaceData(surfaceInfo, index)
+local function surfaceMaterialName(surfaceInfo)
+    local getMaterial = surfaceInfo and surfaceInfo.GetMaterial
+    if not isfunction(getMaterial) then return end
+
+    local ok, material = pcall(getMaterial, surfaceInfo)
+    if not ok or material == nil then return end
+
+    local getName = material.GetName
+    if isfunction(getName) then
+        local nameOk, name = pcall(getName, material)
+        if nameOk and name ~= nil then
+            return tostring(name), material
+        end
+    end
+
+    return tostring(material), material
+end
+
+local function buildSurfaceData(surfaceInfo, index, source, sourceSurfaceIndex)
     if not visibleSurface(surfaceInfo) then
         return nil, "hidden"
     end
@@ -773,6 +898,13 @@ local function buildSurfaceData(surfaceInfo, index)
 
     local surfaceData = {
         id = index,
+        source = source,
+        sourceEnt = source and source.ent or nil,
+        sourceEntityIndex = source and source.entityIndex or nil,
+        sourceClass = source and source.class or nil,
+        sourceModel = source and source.model or nil,
+        sourceIsWorld = source and source.isWorld == true,
+        sourceSurfaceIndex = sourceSurfaceIndex,
         vertices = vertices,
         edges = buildSurfaceEdges(vertices),
         polygon = polygon,
@@ -789,6 +921,7 @@ local function buildSurfaceData(surfaceInfo, index)
         worldMaxs = worldMaxs,
         center = center / #vertices
     }
+    surfaceData.materialName, surfaceData.material = surfaceMaterialName(surfaceInfo)
 
     surfaceData.globalFamilies = buildGlobalFamilies(surfaceData)
 
@@ -900,6 +1033,42 @@ local function addEdgeToCell(key, edge)
     cell[#cell + 1] = edge
 end
 
+local function vertexCellCoord(value)
+    return math.floor(value / CONFIG.vertexNeighborCellSize)
+end
+
+local function vertexCellKey(x, y, z)
+    return tostring(x) .. ":" .. tostring(y) .. ":" .. tostring(z)
+end
+
+local function addVertexToCell(key, surfaceData, index, vertex)
+    local cell = cache.vertexIndex[key]
+    if not cell then
+        cell = {}
+        cache.vertexIndex[key] = cell
+    end
+
+    cell[#cell + 1] = {
+        surface = surfaceData,
+        index = index,
+        vertex = vertex
+    }
+end
+
+local function indexSurfaceVertices(surfaceData)
+    for i = 1, #(surfaceData.vertices or {}) do
+        local vertex = surfaceData.vertices[i]
+        if isvector(vertex) then
+            addVertexToCell(
+                vertexCellKey(vertexCellCoord(vertex.x), vertexCellCoord(vertex.y), vertexCellCoord(vertex.z)),
+                surfaceData,
+                i,
+                vertex
+            )
+        end
+    end
+end
+
 local function edgeCellBounds(edge)
     local tol = CONFIG.edgeCollinearTolerance
     return edgeCellCoord(edge.mins.x - tol),
@@ -969,14 +1138,25 @@ local function edgesAreAdjacent(edgeA, edgeB)
     return edgeIntervalsOverlap(edgeA, edgeB)
 end
 
+local function verticesAreAdjacent(surfaceData, vertex, other)
+    if not surfaceData or not other or surfaceData == other.surface then return false end
+    if not isvector(vertex) or not isvector(other.vertex) then return false end
+
+    local delta = other.vertex - vertex
+    local tolerance = tonumber(CONFIG.vertexNeighborTolerance) or 0
+    return M.VectorLengthSqrPrecise(delta) <= tolerance * tolerance
+end
+
 local function buildDirectNeighborCache()
     cache.edgeIndex = {}
+    cache.vertexIndex = {}
 
     for i = 1, #(cache.surfaces or {}) do
         local surfaceData = cache.surfaces[i]
         surfaceData.neighbors = {}
         surfaceData.neighborSeen = {}
         indexSurfaceEdges(surfaceData)
+        indexSurfaceVertices(surfaceData)
         maybeYield()
     end
 
@@ -1014,6 +1194,42 @@ local function buildDirectNeighborCache()
 
             maybeYield()
         end
+
+        for vertexIndex = 1, #(surfaceData.vertices or {}) do
+            local vertex = surfaceData.vertices[vertexIndex]
+            if isvector(vertex) then
+                local cellX = vertexCellCoord(vertex.x)
+                local cellY = vertexCellCoord(vertex.y)
+                local cellZ = vertexCellCoord(vertex.z)
+                for x = cellX - 1, cellX + 1 do
+                    for y = cellY - 1, cellY + 1 do
+                        for z = cellZ - 1, cellZ + 1 do
+                            local cell = cache.vertexIndex[vertexCellKey(x, y, z)]
+                            if cell then
+                                for j = 1, #cell do
+                                    local other = cell[j]
+                                    local otherSurface = other and other.surface
+                                    if otherSurface and otherSurface ~= surfaceData and not surfaceData.neighborSeen[otherSurface] then
+                                        local aId = math.min(surfaceData.id or 0, otherSurface.id or 0)
+                                        local bId = math.max(surfaceData.id or 0, otherSurface.id or 0)
+                                        local key = aId .. ":" .. bId .. ":v:" .. vertexIndex .. ":" .. tostring(other.index or j)
+                                        if not tested[key] then
+                                            tested[key] = true
+                                            if verticesAreAdjacent(surfaceData, vertex, other) then
+                                                addSurfaceNeighbor(surfaceData, otherSurface)
+                                                addSurfaceNeighbor(otherSurface, surfaceData)
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            maybeYield()
+        end
     end
 
     for i = 1, #(cache.surfaces or {}) do
@@ -1027,10 +1243,22 @@ local function finishBuild()
     cache.worker = nil
 
     local seconds = math.max(cache.readyAt - (cache.startedAt or cache.readyAt), 0)
-    print(("Magic Align: World BSP snapping ready in %.2fs (%d surfaces cached, %d skipped)."):format(
+    local displacementInfo = ""
+    if (cache.displacementSurfaces or 0) > 0 or (cache.displacementSkipped or 0) > 0 then
+        displacementInfo = (", %d displacement surfaces from %d displacements, %d displacement skips"):format(
+            cache.displacementSurfaces or 0,
+            cache.displacements or 0,
+            cache.displacementSkipped or 0
+        )
+    elseif cache.displacementError then
+        displacementInfo = ", displacement parser: " .. tostring(cache.displacementError)
+    end
+
+    print(("Magic Align: World BSP snapping ready in %.2fs (%d surfaces cached, %d skipped%s)."):format(
         seconds,
         cache.cached or 0,
-        cache.skipped or 0
+        cache.skipped or 0,
+        displacementInfo
     ))
 
     if notification and notification.AddLegacy then
@@ -1038,16 +1266,51 @@ local function finishBuild()
     end
 end
 
-local function readWorldBrushSurfaces()
+local function entityIndex(ent)
+    local entIndex = ent and ent.EntIndex
+    if not isfunction(entIndex) then return end
+
+    local ok, index = pcall(entIndex, ent)
+    if ok then return tonumber(index) end
+end
+
+local function entityClass(ent)
+    local getClass = ent and ent.GetClass
+    if not isfunction(getClass) then return end
+
+    local ok, class = pcall(getClass, ent)
+    if ok and class ~= nil then return tostring(class) end
+end
+
+local function entityModel(ent)
+    local getModel = ent and ent.GetModel
+    if not isfunction(getModel) then return end
+
+    local ok, model = pcall(getModel, ent)
+    if ok and model ~= nil then return tostring(model) end
+end
+
+local function isWorldBrushEntity(ent)
+    if game and isfunction(game.GetWorld) and ent == game.GetWorld() then
+        return true
+    end
+
+    return entityIndex(ent) == 0
+end
+
+local function readWorldBrushSurfaceSources()
     local candidates = {}
     local count = 0
+    local seen = {}
 
     local function addCandidate(ent)
         if ent == nil then return end
 
-        for i = 1, count do
-            if candidates[i] == ent then return end
+        local key = entityIndex(ent) or tostring(ent)
+        if seen[key] then
+            return
         end
+        seen[key] = true
 
         count = count + 1
         candidates[count] = ent
@@ -1059,23 +1322,635 @@ local function readWorldBrushSurfaces()
     if isfunction(Entity) then
         addCandidate(Entity(0))
     end
+    if ents and isfunction(ents.GetAll) then
+        local all = ents.GetAll()
+        if istable(all) then
+            for i = 1, #all do
+                addCandidate(all[i])
+            end
+        end
+    end
 
+    local sources = {}
     for i = 1, count do
         local ent = candidates[i]
         local getBrushSurfaces = ent and ent.GetBrushSurfaces or nil
         if isfunction(getBrushSurfaces) then
-            local surfaces = getBrushSurfaces(ent)
-            if istable(surfaces) then
-                return surfaces, ent
+            local ok, surfaces = pcall(getBrushSurfaces, ent)
+            if ok and istable(surfaces) and #surfaces > 0 then
+                local sourceIndex = #sources + 1
+                sources[sourceIndex] = {
+                    ent = ent,
+                    entityIndex = entityIndex(ent),
+                    class = entityClass(ent),
+                    model = entityModel(ent),
+                    isWorld = isWorldBrushEntity(ent),
+                    surfaces = surfaces,
+                    surfaceCount = #surfaces
+                }
             end
         end
     end
+
+    if #sources == 0 then return end
+    return sources
+end
+
+local function bspCanRead(data, offset, length)
+    return isstring(data)
+        and offset
+        and length
+        and offset >= 0
+        and length >= 0
+        and offset + length <= #data
+end
+
+local function bspByte(data, offset)
+    return string.byte(data, offset + 1, offset + 1) or 0
+end
+
+local function bspReadUInt16(data, offset)
+    if not bspCanRead(data, offset, 2) then return 0 end
+
+    return bspByte(data, offset) + bspByte(data, offset + 1) * 256
+end
+
+local function bspReadInt16(data, offset)
+    local value = bspReadUInt16(data, offset)
+    if value >= 0x8000 then value = value - 0x10000 end
+    return value
+end
+
+local function bspReadUInt32(data, offset)
+    if not bspCanRead(data, offset, 4) then return 0 end
+
+    return bspByte(data, offset)
+        + bspByte(data, offset + 1) * 0x100
+        + bspByte(data, offset + 2) * 0x10000
+        + bspByte(data, offset + 3) * 0x1000000
+end
+
+local function bspReadInt32(data, offset)
+    local value = bspReadUInt32(data, offset)
+    if value >= 0x80000000 then value = value - 0x100000000 end
+    return value
+end
+
+local function bspReadFloat(data, offset)
+    local value = bspReadUInt32(data, offset)
+    local sign = 1
+    if value >= 0x80000000 then
+        sign = -1
+        value = value - 0x80000000
+    end
+
+    local exponent = math.floor(value / 0x800000)
+    local mantissa = value - exponent * 0x800000
+    if exponent == 255 then
+        return sign * math.huge
+    elseif exponent == 0 then
+        return sign * (mantissa / 0x800000) * 2 ^ (-126)
+    end
+
+    return sign * (1 + mantissa / 0x800000) * 2 ^ (exponent - 127)
+end
+
+local function bspReadVector(data, offset)
+    if not bspCanRead(data, offset, 12) then return end
+
+    return VectorP(
+        bspReadFloat(data, offset),
+        bspReadFloat(data, offset + 4),
+        bspReadFloat(data, offset + 8)
+    )
+end
+
+local function bspReadCString(data, offset, maxLength)
+    if not bspCanRead(data, offset, 1) then return end
+
+    local limit = math.min(#data, offset + (tonumber(maxLength) or 256))
+    local first = offset + 1
+    for i = first, limit do
+        if string.byte(data, i, i) == 0 then
+            return string.sub(data, first, i - 1)
+        end
+    end
+
+    return string.sub(data, first, limit)
+end
+
+local function readCurrentMapBspData()
+    if not (file and isfunction(file.Read)) then
+        return nil, "file.Read unavailable"
+    end
+
+    local map = currentMap()
+    if map == "" then
+        return nil, "map name unavailable"
+    end
+
+    local path = "maps/" .. map .. ".bsp"
+    local data = file.Read(path, "GAME")
+    if not isstring(data) or #data == 0 then
+        return nil, "could not read " .. path
+    end
+
+    return data
+end
+
+local function readBspHeader(data)
+    if not bspCanRead(data, 0, BSP.headerSize) then
+        return nil, "BSP header is incomplete"
+    end
+    if string.sub(data, 1, 4) ~= BSP.ident then
+        return nil, "BSP header magic is not VBSP"
+    end
+
+    local header = {
+        version = bspReadInt32(data, 4),
+        lumps = {},
+        mapRevision = bspReadInt32(data, 8 + BSP.headerLumps * 16)
+    }
+
+    for i = 0, BSP.headerLumps - 1 do
+        local offset = 8 + i * 16
+        header.lumps[i] = {
+            fileofs = bspReadInt32(data, offset),
+            filelen = bspReadInt32(data, offset + 4),
+            version = bspReadInt32(data, offset + 8),
+            fourCC = bspReadUInt32(data, offset + 12)
+        }
+    end
+
+    return header
+end
+
+local function bspLump(header, id)
+    return header and header.lumps and header.lumps[id]
+end
+
+local function bspLumpCount(header, id, stride)
+    local lump = bspLump(header, id)
+    if not lump or (lump.filelen or 0) <= 0 or (stride or 0) <= 0 then return 0 end
+
+    return math.floor(lump.filelen / stride)
+end
+
+local function bspLumpIsReadable(data, lump)
+    return lump and lump.fileofs and lump.filelen and lump.filelen > 0
+        and bspCanRead(data, lump.fileofs, lump.filelen)
+end
+
+local function bspLumpIsCompressed(data, lump)
+    if not bspLumpIsReadable(data, lump) then return false end
+    if (tonumber(lump.fourCC) or 0) ~= 0 then return true end
+
+    return string.sub(data, lump.fileofs + 1, lump.fileofs + 4) == BSP.compressedLumpId
+end
+
+local function requiredBspDisplacementLumpsReadable(data, header)
+    local required = {
+        BSP.lumpFaces,
+        BSP.lumpVertexes,
+        BSP.lumpSurfEdges,
+        BSP.lumpEdges,
+        BSP.lumpDispInfo,
+        BSP.lumpDispVerts
+    }
+
+    for i = 1, #required do
+        local id = required[i]
+        local lump = bspLump(header, id)
+        if not bspLumpIsReadable(data, lump) then
+            return false, "required lump " .. tostring(id) .. " is missing"
+        end
+        if bspLumpIsCompressed(data, lump) then
+            return false, "required lump " .. tostring(id) .. " is LZMA-compressed"
+        end
+    end
+
+    return true
+end
+
+local function readBspVertex(data, header, index)
+    local lump = bspLump(header, BSP.lumpVertexes)
+    local count = bspLumpCount(header, BSP.lumpVertexes, BSP.vertexSize)
+    index = tonumber(index) or -1
+    if index < 0 or index >= count then return end
+
+    return bspReadVector(data, lump.fileofs + index * BSP.vertexSize)
+end
+
+local function readBspFace(data, header, index)
+    local lump = bspLump(header, BSP.lumpFaces)
+    local count = bspLumpCount(header, BSP.lumpFaces, BSP.faceSize)
+    index = tonumber(index) or -1
+    if index < 0 or index >= count then return end
+
+    local offset = lump.fileofs + index * BSP.faceSize
+    return {
+        index = index,
+        firstEdge = bspReadInt32(data, offset + 4),
+        numEdges = bspReadInt16(data, offset + 8),
+        texInfo = bspReadInt16(data, offset + 10),
+        dispInfo = bspReadInt16(data, offset + 12)
+    }
+end
+
+local function readBspFaceVertices(data, header, face)
+    if not face or not face.firstEdge or not face.numEdges or face.numEdges < 3 then return end
+
+    local surfEdgeLump = bspLump(header, BSP.lumpSurfEdges)
+    local edgeLump = bspLump(header, BSP.lumpEdges)
+    local surfEdgeCount = bspLumpCount(header, BSP.lumpSurfEdges, BSP.surfEdgeSize)
+    local edgeCount = bspLumpCount(header, BSP.lumpEdges, BSP.edgeSize)
+    if not surfEdgeLump or not edgeLump then return end
+
+    local vertices = {}
+    for i = 0, face.numEdges - 1 do
+        local surfEdgeIndex = face.firstEdge + i
+        if surfEdgeIndex < 0 or surfEdgeIndex >= surfEdgeCount then return end
+
+        local surfEdge = bspReadInt32(data, surfEdgeLump.fileofs + surfEdgeIndex * BSP.surfEdgeSize)
+        local edgeIndex = math.abs(surfEdge)
+        if edgeIndex < 0 or edgeIndex >= edgeCount then return end
+
+        local edgeOffset = edgeLump.fileofs + edgeIndex * BSP.edgeSize
+        local vertexIndex = surfEdge >= 0
+            and bspReadUInt16(data, edgeOffset)
+            or bspReadUInt16(data, edgeOffset + 2)
+        local vertex = readBspVertex(data, header, vertexIndex)
+        if not vertex then return end
+
+        vertices[#vertices + 1] = vertex
+    end
+
+    return vertices
+end
+
+local function readBspTextureName(data, header, texInfoIndex)
+    texInfoIndex = tonumber(texInfoIndex) or -1
+    if texInfoIndex < 0 then return end
+
+    local texInfoLump = bspLump(header, BSP.lumpTexInfo)
+    local texDataLump = bspLump(header, BSP.lumpTexData)
+    local stringTableLump = bspLump(header, BSP.lumpTexDataStringTable)
+    local stringDataLump = bspLump(header, BSP.lumpTexDataStringData)
+    if not (bspLumpIsReadable(data, texInfoLump)
+        and bspLumpIsReadable(data, texDataLump)
+        and bspLumpIsReadable(data, stringTableLump)
+        and bspLumpIsReadable(data, stringDataLump)) then
+        return
+    end
+    if bspLumpIsCompressed(data, texInfoLump)
+        or bspLumpIsCompressed(data, texDataLump)
+        or bspLumpIsCompressed(data, stringTableLump)
+        or bspLumpIsCompressed(data, stringDataLump) then
+        return
+    end
+
+    local texInfoCount = bspLumpCount(header, BSP.lumpTexInfo, BSP.texInfoSize)
+    if texInfoIndex >= texInfoCount then return end
+
+    local texInfoOffset = texInfoLump.fileofs + texInfoIndex * BSP.texInfoSize
+    local texDataIndex = bspReadInt32(data, texInfoOffset + 68)
+    local texDataCount = bspLumpCount(header, BSP.lumpTexData, BSP.texDataSize)
+    if texDataIndex < 0 or texDataIndex >= texDataCount then return end
+
+    local texDataOffset = texDataLump.fileofs + texDataIndex * BSP.texDataSize
+    local nameIndex = bspReadInt32(data, texDataOffset + 12)
+    local nameCount = math.floor((stringTableLump.filelen or 0) / 4)
+    if nameIndex < 0 or nameIndex >= nameCount then return end
+
+    local stringOffset = bspReadInt32(data, stringTableLump.fileofs + nameIndex * 4)
+    if stringOffset < 0 or stringOffset >= stringDataLump.filelen then return end
+
+    return bspReadCString(data, stringDataLump.fileofs + stringOffset, 256)
+end
+
+local function readBspDispInfo(data, header, index)
+    local lump = bspLump(header, BSP.lumpDispInfo)
+    local count = bspLumpCount(header, BSP.lumpDispInfo, BSP.dispInfoSize)
+    index = tonumber(index) or -1
+    if index < 0 or index >= count then return end
+
+    local offset = lump.fileofs + index * BSP.dispInfoSize
+    return {
+        index = index,
+        startPosition = bspReadVector(data, offset),
+        dispVertStart = bspReadInt32(data, offset + 12),
+        power = bspReadInt32(data, offset + 20),
+        mapFace = bspReadUInt16(data, offset + 36)
+    }
+end
+
+local function nearestDisplacementStartCorner(vertices, startPosition)
+    if not istable(vertices) or not isvector(startPosition) then return end
+
+    local bestIndex, bestDist
+    for i = 1, #vertices do
+        local vertex = vertices[i]
+        if isvector(vertex) then
+            local dx = vertex.x - startPosition.x
+            local dy = vertex.y - startPosition.y
+            local dz = vertex.z - startPosition.z
+            local dist = dx * dx + dy * dy + dz * dz
+            if not bestDist or dist < bestDist then
+                bestIndex = i
+                bestDist = dist
+            end
+        end
+    end
+
+    return bestIndex, bestDist
+end
+
+local function orderedDisplacementCorners(faceVertices, startPosition)
+    if not istable(faceVertices) or #faceVertices ~= 4 then
+        return nil, "base face is not a quad"
+    end
+
+    local startIndex, startDist = nearestDisplacementStartCorner(faceVertices, startPosition)
+    if not startIndex then
+        return nil, "start corner unavailable"
+    end
+    if startDist and startDist > BSP.startPositionToleranceSqr then
+        return nil, "start corner mismatch"
+    end
+
+    local count = #faceVertices
+    return {
+        c00 = faceVertices[startIndex],
+        c01 = faceVertices[startIndex % count + 1],
+        c11 = faceVertices[(startIndex + 1) % count + 1],
+        c10 = faceVertices[(startIndex - 2) % count + 1]
+    }
+end
+
+local function displacementBasePoint(corners, s, t)
+    local c00 = corners.c00
+    local c10 = corners.c10
+    local c01 = corners.c01
+    local c11 = corners.c11
+    local a = (1 - s) * (1 - t)
+    local b = s * (1 - t)
+    local c = (1 - s) * t
+    local d = s * t
+
+    return VectorP(
+        c00.x * a + c10.x * b + c01.x * c + c11.x * d,
+        c00.y * a + c10.y * b + c01.y * c + c11.y * d,
+        c00.z * a + c10.z * b + c01.z * c + c11.z * d
+    )
+end
+
+local function displacementVertexPosition(data, header, info, corners, side, row, col)
+    local dispVertsLump = bspLump(header, BSP.lumpDispVerts)
+    local dispVertCount = bspLumpCount(header, BSP.lumpDispVerts, BSP.dispVertSize)
+    local gridSize = side + 1
+    local dispVertIndex = (info.dispVertStart or -1) + row * gridSize + col
+    if dispVertIndex < 0 or dispVertIndex >= dispVertCount then return end
+
+    local offset = dispVertsLump.fileofs + dispVertIndex * BSP.dispVertSize
+    local dispVector = bspReadVector(data, offset)
+    local dispDistance = bspReadFloat(data, offset + 12)
+    if not dispVector or not dispDistance then return end
+
+    local base = displacementBasePoint(corners, col / side, row / side)
+    return VectorP(
+        base.x + dispVector.x * dispDistance,
+        base.y + dispVector.y * dispDistance,
+        base.z + dispVector.z * dispDistance
+    )
+end
+
+local function buildDisplacementVertexGrid(data, header, info, corners)
+    local power = tonumber(info and info.power) or 0
+    if power < 2 or power > BSP.maxDispPower then
+        return nil, "unsupported power"
+    end
+
+    local side = 2 ^ power
+    local gridSize = side + 1
+    local grid = {}
+
+    for row = 0, side do
+        for col = 0, side do
+            local vertex = displacementVertexPosition(data, header, info, corners, side, row, col)
+            if not vertex then
+                return nil, "disp vertex out of range"
+            end
+
+            grid[row * gridSize + col + 1] = vertex
+        end
+    end
+
+    return grid, side, gridSize
+end
+
+local function displacementGridVertex(grid, gridSize, row, col)
+    return grid[row * gridSize + col + 1]
+end
+
+local function makeDisplacementSurfaceInfo(vertices, materialName)
+    return {
+        GetVertices = function()
+            return vertices
+        end,
+        GetMaterial = function()
+            return materialName or "**displacement**"
+        end
+    }
+end
+
+local function addDisplacementTriangleSurface(source, group, materialName, vertices, surfaceId, sourceLabel, row, col, half, diagonal)
+    local surfaceInfo = makeDisplacementSurfaceInfo(vertices, materialName)
+    local surfaceData = buildSurfaceData(surfaceInfo, surfaceId, source, sourceLabel)
+    if not surfaceData then return nil, "surface" end
+
+    surfaceData.sourceIsDisplacement = true
+    surfaceData.displacementIndex = group.index
+    surfaceData.displacementMapFace = group.mapFace
+    surfaceData.displacementGroup = group
+    surfaceData.displacementRow = row
+    surfaceData.displacementCol = col
+    surfaceData.displacementHalf = half
+    surfaceData.displacementDiagonal = diagonal
+    surfaceData.materialName = materialName or surfaceData.materialName or "**displacement**"
+    group.surfaces[#group.surfaces + 1] = surfaceData
+
+    cache.cached = cache.cached + 1
+    cache.displacementSurfaces = cache.displacementSurfaces + 1
+    cache.surfaces[cache.cached] = surfaceData
+    indexSurface(surfaceData)
+    indexSurfacePlane(surfaceData)
+
+    return surfaceData
+end
+
+local function addSourceDisplacementQuadTriangles(source, group, materialName, grid, gridSize, row, col, surfaceId)
+    local p00 = displacementGridVertex(grid, gridSize, row, col)
+    local p10 = displacementGridVertex(grid, gridSize, row, col + 1)
+    local p01 = displacementGridVertex(grid, gridSize, row + 1, col)
+    local p11 = displacementGridVertex(grid, gridSize, row + 1, col + 1)
+
+    -- Source alternates displacement diagonals by the linear grid vertex index.
+    -- The vertex order below preserves this file's normal winding convention.
+    local odd = ((row * gridSize + col) % 2) == 1
+    local diagonal = odd and "source_tlbr" or "source_bltr"
+    local created = 0
+
+    local first = odd and { p00, p10, p01 } or { p00, p10, p11 }
+    local second = odd and { p10, p11, p01 } or { p00, p11, p01 }
+
+    surfaceId = surfaceId + 1
+    if addDisplacementTriangleSurface(
+        source,
+        group,
+        materialName,
+        first,
+        surfaceId,
+        ("disp:%d:%d:%d:a"):format(group.index, row, col),
+        row,
+        col,
+        "a",
+        diagonal
+    ) then
+        created = created + 1
+    else
+        cache.displacementSkipped = cache.displacementSkipped + 1
+    end
+
+    surfaceId = surfaceId + 1
+    if addDisplacementTriangleSurface(
+        source,
+        group,
+        materialName,
+        second,
+        surfaceId,
+        ("disp:%d:%d:%d:b"):format(group.index, row, col),
+        row,
+        col,
+        "b",
+        diagonal
+    ) then
+        created = created + 1
+    else
+        cache.displacementSkipped = cache.displacementSkipped + 1
+    end
+
+    return surfaceId, created
+end
+
+local function appendDisplacementSurfacesForInfo(data, header, info, surfaceId)
+    local face = readBspFace(data, header, info.mapFace)
+    local faceVertices = readBspFaceVertices(data, header, face)
+    local corners, cornerErr = orderedDisplacementCorners(faceVertices, info.startPosition)
+    if not corners then
+        return surfaceId, cornerErr
+    end
+
+    local grid, side, gridSize = buildDisplacementVertexGrid(data, header, info, corners)
+    if not grid then
+        return surfaceId, side
+    end
+
+    local materialName = readBspTextureName(data, header, face and face.texInfo) or "**displacement**"
+    local source = {
+        ent = game and isfunction(game.GetWorld) and game.GetWorld() or nil,
+        entityIndex = 0,
+        class = "worldspawn",
+        model = nil,
+        isWorld = true
+    }
+    local group = {
+        index = info.index + 1,
+        mapFace = info.mapFace,
+        power = info.power,
+        materialName = materialName,
+        surfaces = {}
+    }
+    local created = 0
+
+    for row = 0, side - 1 do
+        for col = 0, side - 1 do
+            local quadCreated
+            surfaceId, quadCreated = addSourceDisplacementQuadTriangles(
+                source,
+                group,
+                materialName,
+                grid,
+                gridSize,
+                row,
+                col,
+                surfaceId
+            )
+            created = created + (quadCreated or 0)
+        end
+
+        maybeYield()
+    end
+
+    if created > 0 then
+        cache.displacements = cache.displacements + 1
+        return surfaceId
+    end
+
+    return surfaceId, "no displacement triangles"
+end
+
+local function appendBspDisplacementSurfaces(surfaceId)
+    local data, readErr = readCurrentMapBspData()
+    if not data then
+        cache.displacementError = readErr
+        print("Magic Align: BSP displacement parser skipped: " .. tostring(readErr))
+        return surfaceId
+    end
+
+    local header, headerErr = readBspHeader(data)
+    if not header then
+        cache.displacementError = headerErr
+        print("Magic Align: BSP displacement parser skipped: " .. tostring(headerErr))
+        return surfaceId
+    end
+
+    local dispInfoLump = bspLump(header, BSP.lumpDispInfo)
+    if not bspLumpIsReadable(data, dispInfoLump) then
+        return surfaceId
+    end
+
+    local ok, lumpErr = requiredBspDisplacementLumpsReadable(data, header)
+    if not ok then
+        cache.displacementError = lumpErr
+        print("Magic Align: BSP displacement parser skipped: " .. tostring(lumpErr))
+        return surfaceId
+    end
+
+    local dispInfoCount = bspLumpCount(header, BSP.lumpDispInfo, BSP.dispInfoSize)
+    if dispInfoCount <= 0 then return surfaceId end
+
+    for i = 0, dispInfoCount - 1 do
+        local info = readBspDispInfo(data, header, i)
+        if info then
+            local err
+            surfaceId, err = appendDisplacementSurfacesForInfo(data, header, info, surfaceId)
+            if err then
+                cache.displacementSkipped = cache.displacementSkipped + 1
+            end
+        else
+            cache.displacementSkipped = cache.displacementSkipped + 1
+        end
+
+        maybeYield()
+    end
+
+    return surfaceId
 end
 
 local function buildWorker()
-    local surfaces = readWorldBrushSurfaces()
+    local sources = readWorldBrushSurfaceSources()
 
-    if not istable(surfaces) then
+    if not istable(sources) then
         cache.status = cache.STATUS.UNAVAILABLE
         cache.worker = nil
         cache.error = "world brush surfaces unavailable"
@@ -1083,7 +1958,11 @@ local function buildWorker()
         return
     end
 
-    cache.total = #surfaces
+    cache.sources = sources
+    cache.total = 0
+    for i = 1, #sources do
+        cache.total = cache.total + (tonumber(sources[i].surfaceCount) or 0)
+    end
     if cache.total <= 0 then
         cache.status = cache.STATUS.UNAVAILABLE
         cache.worker = nil
@@ -1092,20 +1971,29 @@ local function buildWorker()
         return
     end
 
-    for i = 1, cache.total do
-        local surfaceData = buildSurfaceData(surfaces[i], i)
-        if surfaceData then
-            cache.cached = cache.cached + 1
-            cache.surfaces[cache.cached] = surfaceData
-            indexSurface(surfaceData)
-            indexSurfacePlane(surfaceData)
-        else
-            cache.skipped = cache.skipped + 1
+    local surfaceId = 0
+    for sourceIndex = 1, #sources do
+        local source = sources[sourceIndex]
+        local surfaces = source.surfaces
+        for i = 1, #(surfaces or {}) do
+            surfaceId = surfaceId + 1
+            local surfaceData = buildSurfaceData(surfaces[i], surfaceId, source, i)
+            if surfaceData then
+                cache.cached = cache.cached + 1
+                cache.surfaces[cache.cached] = surfaceData
+                indexSurface(surfaceData)
+                indexSurfacePlane(surfaceData)
+            else
+                cache.skipped = cache.skipped + 1
+            end
+
+            maybeYield()
         end
 
-        maybeYield()
+        source.surfaces = nil
     end
 
+    surfaceId = appendBspDisplacementSurfaces(surfaceId)
     buildDirectNeighborCache()
     finishBuild()
 end
@@ -1276,6 +2164,59 @@ local function writeTraceMatch(out, surfaceData, normalSign, u, v, match)
     return out
 end
 
+local function traceHitsDisplacement(tr)
+    return tostring(tr and tr.HitTexture or "") == CONFIG.displacementHitTexture
+end
+
+local function useDisplacementTraceTolerances(surfaceData, displacementTrace)
+    return displacementTrace == true and surfaceData and surfaceData.sourceIsDisplacement == true
+end
+
+local function traceBoundsTolerance(surfaceData, displacementTrace)
+    return useDisplacementTraceTolerances(surfaceData, displacementTrace)
+        and CONFIG.displacementBoundsTolerance
+        or CONFIG.boundsTolerance
+end
+
+local function tracePlaneTolerance(surfaceData, displacementTrace)
+    return useDisplacementTraceTolerances(surfaceData, displacementTrace)
+        and CONFIG.displacementPlaneTolerance
+        or CONFIG.planeTolerance
+end
+
+local function traceSurfacePickTolerance(surfaceData, displacementTrace)
+    return useDisplacementTraceTolerances(surfaceData, displacementTrace)
+        and CONFIG.displacementSurfacePickTolerance
+        or CONFIG.surfacePickTolerance
+end
+
+local function traceNormalDotMin(surfaceData, displacementTrace)
+    return useDisplacementTraceTolerances(surfaceData, displacementTrace)
+        and CONFIG.displacementNormalDotMin
+        or CONFIG.normalDotMin
+end
+
+local function traceEdgeProjectionTolerance(surfaceData, displacementTrace)
+    return useDisplacementTraceTolerances(surfaceData, displacementTrace)
+        and CONFIG.displacementEdgeProjectionTolerance
+        or CONFIG.edgeProjectionTolerance
+end
+
+local function traceRayPickTolerance(surfaceData, displacementTrace)
+    return useDisplacementTraceTolerances(surfaceData, displacementTrace)
+        and CONFIG.displacementRayPickTolerance
+        or CONFIG.rayPickTolerance
+end
+
+local function traceMatchIsDisplacement(match)
+    return match
+        and match.surface
+        and match.surface.sourceIsDisplacement == true
+        and (match.match == "displacement"
+            or match.match == "displacement_edge"
+            or match.match == "same_displacement")
+end
+
 local function collectTracePlaneBucketSurfaces(hitPos, hitNormal, out)
     if not isvector(hitPos) or not isvector(hitNormal) or not istable(cache.planeBuckets) then return end
 
@@ -1324,6 +2265,7 @@ end
 local function selectSurfaceForTrace(tr, surfaces, surfaceCount, hitPos, hitNormal, planeSet)
     if not surfaces or surfaceCount == 0 then return end
 
+    local displacementTrace = traceHitsDisplacement(tr)
     local rayStart, rayDir, rayHitDistance = traceRayInfo(tr, hitPos)
     local bestStrict = traceScratch.bestStrict or {}
     local bestRay = traceScratch.bestRay or {}
@@ -1344,40 +2286,70 @@ local function selectSurfaceForTrace(tr, surfaces, surfaceCount, hitPos, hitNorm
         end
 
         if surfaceData then
-        if pointInsideWorldBounds(surfaceData, hitPos) then
-            local signedPlaneDist = signedPlaneDistance(surfaceData, hitPos.x, hitPos.y, hitPos.z)
-            local planeDist = math.abs(signedPlaneDist)
-            if planeDist <= CONFIG.planeTolerance then
-                local normalDot = dot(surfaceData.normal, hitNormal)
-                local absNormalDot = math.abs(normalDot)
-                if absNormalDot >= CONFIG.normalDotMin then
-                    local normal = surfaceData.normal
-                    local u, v = surfaceUvFromComponents(
-                        surfaceData,
-                        hitPos.x - normal.x * signedPlaneDist,
-                        hitPos.y - normal.y * signedPlaneDist,
-                        hitPos.z - normal.z * signedPlaneDist
-                    )
-                    if u >= surfaceData.uMin - CONFIG.boundsTolerance
-                        and u <= surfaceData.uMax + CONFIG.boundsTolerance
-                        and v >= surfaceData.vMin - CONFIG.boundsTolerance
-                        and v <= surfaceData.vMax + CONFIG.boundsTolerance then
+            local boundsTolerance = traceBoundsTolerance(surfaceData, displacementTrace)
+            if pointInsideWorldBounds(surfaceData, hitPos, boundsTolerance) then
+                local signedPlaneDist = signedPlaneDistance(surfaceData, hitPos.x, hitPos.y, hitPos.z)
+                local planeDist = math.abs(signedPlaneDist)
+                if planeDist <= tracePlaneTolerance(surfaceData, displacementTrace) then
+                    local normalDot = dot(surfaceData.normal, hitNormal)
+                    local absNormalDot = math.abs(normalDot)
+                    if absNormalDot >= traceNormalDotMin(surfaceData, displacementTrace) then
+                        local normal = surfaceData.normal
+                        local u, v = surfaceUvFromComponents(
+                            surfaceData,
+                            hitPos.x - normal.x * signedPlaneDist,
+                            hitPos.y - normal.y * signedPlaneDist,
+                            hitPos.z - normal.z * signedPlaneDist
+                        )
+                        local uvInBounds = u >= surfaceData.uMin - boundsTolerance
+                            and u <= surfaceData.uMax + boundsTolerance
+                            and v >= surfaceData.vMin - boundsTolerance
+                            and v <= surfaceData.vMax + boundsTolerance
                         local normalPenalty = (1 - absNormalDot) * 10
+                        local pickTolerance = traceSurfacePickTolerance(surfaceData, displacementTrace)
+                        local edgeProjectionTolerance = traceEdgeProjectionTolerance(surfaceData, displacementTrace)
+                        local displacementMatch = useDisplacementTraceTolerances(surfaceData, displacementTrace)
 
-                        if planeDist <= CONFIG.surfacePickTolerance
-                            and pointInPolygon2D(surfaceData.polygon, u, v, CONFIG.polygonPickTolerance) then
-                            local score = planeDist + normalPenalty
-                            if not bestStrictScore or score < bestStrictScore then
-                                writeTraceMatch(bestStrict, surfaceData, normalDot < 0 and -1 or 1, u, v, "strict")
-                                hasBestStrict = true
-                                bestStrictScore = score
+                        if uvInBounds then
+                            if planeDist <= pickTolerance
+                                and pointInPolygon2D(surfaceData.polygon, u, v, CONFIG.polygonPickTolerance) then
+                                local score = planeDist + normalPenalty
+                                if not bestStrictScore or score < bestStrictScore then
+                                    writeTraceMatch(
+                                        bestStrict,
+                                        surfaceData,
+                                        normalDot < 0 and -1 or 1,
+                                        u,
+                                        v,
+                                        displacementMatch and "displacement" or "strict"
+                                    )
+                                    hasBestStrict = true
+                                    bestStrictScore = score
+                                end
+                            else
+                                local edgeDistance = polygonEdgeDistance(surfaceData.polygon, u, v)
+                                if edgeDistance <= CONFIG.edgePickTolerance then
+                                    local score = planeDist + normalPenalty + edgeDistance * 4
+                                    if not bestEdgeScore or score < bestEdgeScore then
+                                        writeTraceMatch(bestEdge, surfaceData, normalDot < 0 and -1 or 1, u, v, "edge")
+                                        hasBestEdge = true
+                                        bestEdgeScore = score
+                                    end
+                                end
                             end
-                        else
+                        elseif planeDist <= pickTolerance then
                             local edgeDistance = polygonEdgeDistance(surfaceData.polygon, u, v)
-                            if edgeDistance <= CONFIG.edgePickTolerance then
-                                local score = planeDist + normalPenalty + edgeDistance * 4
+                            if edgeDistance <= edgeProjectionTolerance then
+                                local score = planeDist + normalPenalty + edgeDistance * 4 + 1
                                 if not bestEdgeScore or score < bestEdgeScore then
-                                    writeTraceMatch(bestEdge, surfaceData, normalDot < 0 and -1 or 1, u, v, "edge")
+                                    writeTraceMatch(
+                                        bestEdge,
+                                        surfaceData,
+                                        normalDot < 0 and -1 or 1,
+                                        u,
+                                        v,
+                                        displacementMatch and "displacement_edge" or "edge_project"
+                                    )
                                     hasBestEdge = true
                                     bestEdgeScore = score
                                 end
@@ -1386,42 +2358,47 @@ local function selectSurfaceForTrace(tr, surfaces, surfaceCount, hitPos, hitNorm
                     end
                 end
             end
-        end
 
-        if rayStart and rayDir and rayHitDistance then
-            local denom = dot(surfaceData.normal, rayDir)
-            if math.abs(denom) >= CONFIG.rayPlaneDotMin then
-                local normal = surfaceData.normal
-                local origin = surfaceData.origin
-                local t = ((origin.x - rayStart.x) * normal.x
-                    + (origin.y - rayStart.y) * normal.y
-                    + (origin.z - rayStart.z) * normal.z) / denom
-                local traceDistance = math.abs(t - rayHitDistance)
-                if t >= 0 and traceDistance <= CONFIG.rayPickTolerance then
-                    local rayX = rayStart.x + rayDir.x * t
-                    local rayY = rayStart.y + rayDir.y * t
-                    local rayZ = rayStart.z + rayDir.z * t
-                    if pointInsideWorldBoundsComponents(surfaceData, rayX, rayY, rayZ, CONFIG.boundsTolerance + CONFIG.rayPickTolerance) then
-                        local u, v = surfaceUvFromComponents(surfaceData, rayX, rayY, rayZ)
-                        if u >= surfaceData.uMin - CONFIG.boundsTolerance
-                            and u <= surfaceData.uMax + CONFIG.boundsTolerance
-                            and v >= surfaceData.vMin - CONFIG.boundsTolerance
-                            and v <= surfaceData.vMax + CONFIG.boundsTolerance
-                            and pointInPolygon2D(surfaceData.polygon, u, v, CONFIG.polygonPickTolerance) then
-                            local normalDot = dot(surfaceData.normal, hitNormal)
-                            local normalPenalty = (1 - math.min(math.abs(normalDot), 1)) * CONFIG.rayNormalWeight
-                            local score = traceDistance + (1 - math.min(math.abs(denom), 1)) * 0.25 + normalPenalty
-                            if not bestRayScore or score < bestRayScore then
-                                writeTraceMatch(bestRay, surfaceData, normalDot < 0 and -1 or 1, u, v, "ray")
-                                hasBestRay = true
-                                bestRayScore = score
+            if rayStart and rayDir and rayHitDistance then
+                local rayPickTolerance = traceRayPickTolerance(surfaceData, displacementTrace)
+                local boundsTolerance = traceBoundsTolerance(surfaceData, displacementTrace)
+                local denom = dot(surfaceData.normal, rayDir)
+                if math.abs(denom) >= CONFIG.rayPlaneDotMin then
+                    local normal = surfaceData.normal
+                    local origin = surfaceData.origin
+                    local t = ((origin.x - rayStart.x) * normal.x
+                        + (origin.y - rayStart.y) * normal.y
+                        + (origin.z - rayStart.z) * normal.z) / denom
+                    local traceDistance = math.abs(t - rayHitDistance)
+                    if t >= 0 and traceDistance <= rayPickTolerance then
+                        local rayX = rayStart.x + rayDir.x * t
+                        local rayY = rayStart.y + rayDir.y * t
+                        local rayZ = rayStart.z + rayDir.z * t
+                        if pointInsideWorldBoundsComponents(surfaceData, rayX, rayY, rayZ, boundsTolerance + rayPickTolerance) then
+                            local u, v = surfaceUvFromComponents(surfaceData, rayX, rayY, rayZ)
+                            if u >= surfaceData.uMin - boundsTolerance
+                                and u <= surfaceData.uMax + boundsTolerance
+                                and v >= surfaceData.vMin - boundsTolerance
+                                and v <= surfaceData.vMax + boundsTolerance
+                                and pointInPolygon2D(surfaceData.polygon, u, v, CONFIG.polygonPickTolerance) then
+                                local normalDot = dot(surfaceData.normal, hitNormal)
+                                local normalPenalty = (1 - math.min(math.abs(normalDot), 1)) * CONFIG.rayNormalWeight
+                                local score = traceDistance + (1 - math.min(math.abs(denom), 1)) * 0.25 + normalPenalty
+                                if not bestRayScore or score < bestRayScore then
+                                    writeTraceMatch(bestRay, surfaceData, normalDot < 0 and -1 or 1, u, v, "ray")
+                                    hasBestRay = true
+                                    bestRayScore = score
+                                end
                             end
                         end
                     end
                 end
             end
         end
-        end
+    end
+
+    if displacementTrace and hasBestStrict and traceMatchIsDisplacement(bestStrict) then
+        return bestStrict
     end
 
     if hasBestRay and bestRayScore and bestRayScore <= CONFIG.rayPreferScore then
@@ -1458,7 +2435,7 @@ local function findSurfaceForTrace(tr)
             and planeCount > 0
             and selectSurfaceForTrace(tr, surfaces, surfaceCount, hitPos, hitNormal, planeSeen)
             or nil
-        if match and match.match == "strict" then
+        if match and (match.match == "strict" or traceMatchIsDisplacement(match)) then
             return match
         end
     end
@@ -1630,6 +2607,7 @@ local function configureGlobalFace(face, surfaceData, settings)
     face.globalGrid = true
     face.globalGridStep = step
     face.activeGridStep = step
+    face.worldBspFullGrid = not (settings and settings.worldBspFullGrid == false)
     face.globalGridOverlays = globalProjectionPairs(surfaceData)
 end
 
@@ -2279,7 +3257,10 @@ local function applyVisibleSnapCandidate(snapped, candidate)
 end
 
 local function worldGridRenderCacheKey(settings)
-    return ("%.6f"):format(worldGridStep(settings))
+    return ("%.6f:%d"):format(
+        worldGridStep(settings),
+        settings and settings.worldBspFullGrid == false and 0 or 1
+    )
 end
 
 local function buildRenderOverlayFace(surfaceData, settings)
@@ -2292,7 +3273,7 @@ local function buildRenderOverlayFace(surfaceData, settings)
         surfaceData._magicAlignRenderOverlayFaces = cache
     end
 
-    local key = ("%.6f"):format(step)
+    local key = worldGridRenderCacheKey(settings)
     local cached = cache[key]
     if cached then return cached end
 
@@ -2307,6 +3288,7 @@ local function buildRenderOverlayFace(surfaceData, settings)
         origin = surfaceData.center,
         center = surfaceData.center,
         globalGridStep = step,
+        worldBspFullGrid = not (settings and settings.worldBspFullGrid == false),
         globalGridOverlays = globalProjectionPairs(surfaceData)
     }
     cache[key] = cached
@@ -2316,7 +3298,14 @@ end
 
 local function buildRenderNeighborFaces(surfaceData, settings)
     local neighbors = surfaceData and surfaceData.neighbors
-    if not istable(neighbors) or #neighbors == 0 then return end
+    local groupSurfaces = surfaceData
+        and surfaceData.displacementGroup
+        and surfaceData.displacementGroup.surfaces
+        or nil
+    if (not istable(neighbors) or #neighbors == 0)
+        and (not istable(groupSurfaces) or #groupSurfaces <= 1) then
+        return
+    end
 
     local cache = surfaceData._magicAlignRenderNeighborFaces
     if not cache then
@@ -2329,10 +3318,26 @@ local function buildRenderNeighborFaces(surfaceData, settings)
     if cached then return cached end
 
     local out = {}
-    for i = 1, #neighbors do
-        local face = buildRenderOverlayFace(neighbors[i], settings)
+    local seen = {}
+    local function addNeighbor(neighbor)
+        if not neighbor or neighbor == surfaceData or seen[neighbor] then return end
+
+        seen[neighbor] = true
+        local face = buildRenderOverlayFace(neighbor, settings)
         if face then
             out[#out + 1] = face
+        end
+    end
+
+    if istable(groupSurfaces) then
+        for i = 1, #groupSurfaces do
+            addNeighbor(groupSurfaces[i])
+        end
+    end
+
+    if istable(neighbors) then
+        for i = 1, #neighbors do
+            addNeighbor(neighbors[i])
         end
     end
 
@@ -2428,16 +3433,18 @@ local function sameSurfaceFastMatchFromTrace(tr)
     end
 
     local hitPos = tr.HitPos
-    if not pointInsideWorldBounds(surfaceData, hitPos) then return end
+    local displacementTrace = traceHitsDisplacement(tr)
+    local boundsTolerance = traceBoundsTolerance(surfaceData, displacementTrace)
+    if not pointInsideWorldBounds(surfaceData, hitPos, boundsTolerance) then return end
 
     local hitNormal = normalizedVec(tr.HitNormal, M.PICKING_VECTOR_EPSILON_SQR)
     if not hitNormal then return end
 
     local signedPlaneDist = signedPlaneDistance(surfaceData, hitPos.x, hitPos.y, hitPos.z)
-    if math.abs(signedPlaneDist) > CONFIG.surfacePickTolerance then return end
+    if math.abs(signedPlaneDist) > traceSurfacePickTolerance(surfaceData, displacementTrace) then return end
 
     local normalDot = dot(surfaceData.normal, hitNormal)
-    if math.abs(normalDot) < CONFIG.normalDotMin then return end
+    if math.abs(normalDot) < traceNormalDotMin(surfaceData, displacementTrace) then return end
 
     local normal = surfaceData.normal
     local u, v = surfaceUvFromComponents(
@@ -2447,17 +3454,24 @@ local function sameSurfaceFastMatchFromTrace(tr)
         hitPos.z - normal.z * signedPlaneDist
     )
 
-    if u < surfaceData.uMin - CONFIG.polygonTolerance
-        or u > surfaceData.uMax + CONFIG.polygonTolerance
-        or v < surfaceData.vMin - CONFIG.polygonTolerance
-        or v > surfaceData.vMax + CONFIG.polygonTolerance then
+    if u < surfaceData.uMin - boundsTolerance
+        or u > surfaceData.uMax + boundsTolerance
+        or v < surfaceData.vMin - boundsTolerance
+        or v > surfaceData.vMax + boundsTolerance then
         return
     end
     if not pointInPolygon2D(surfaceData.polygon, u, v, CONFIG.polygonTolerance) then return end
     if polygonEdgeDistance(surfaceData.polygon, u, v) <= CONFIG.sameSurfaceFastPathEdgeTolerance then return end
 
     traceScratch.sameSurfaceMatch = traceScratch.sameSurfaceMatch or {}
-    return writeTraceMatch(traceScratch.sameSurfaceMatch, surfaceData, normalDot < 0 and -1 or 1, u, v, "same_surface")
+    return writeTraceMatch(
+        traceScratch.sameSurfaceMatch,
+        surfaceData,
+        normalDot < 0 and -1 or 1,
+        u,
+        v,
+        useDisplacementTraceTolerances(surfaceData, displacementTrace) and "same_displacement" or "same_surface"
+    )
 end
 
 function worldBSP.candidateFromTrace(tr, settings)
@@ -2505,6 +3519,155 @@ local function formatVec(value)
     return ("%.2f %.2f %.2f"):format(value.x, value.y, value.z)
 end
 
+local function boolLabel(value)
+    return value and "yes" or "no"
+end
+
+local function surfaceSourceLabel(surfaceData)
+    if not surfaceData then return "unknown" end
+    if surfaceData.sourceIsDisplacement then
+        return ("world_displacement#%s"):format(tostring(surfaceData.displacementIndex or "?"))
+    end
+    if surfaceData.sourceIsWorld then
+        return "world"
+    end
+
+    local class = surfaceData.sourceClass or "entity"
+    local index = surfaceData.sourceEntityIndex
+    if index then
+        return ("%s#%d"):format(class, index)
+    end
+
+    return class
+end
+
+local function surfaceDisplacementDiagonalLabel(surfaceData)
+    if not surfaceData or not surfaceData.sourceIsDisplacement then return "-" end
+
+    return tostring(surfaceData.displacementDiagonal or "?")
+end
+
+local function traceRejectReason(info)
+    if not info.inBounds then return "bounds" end
+    if info.planeDist > (info.planeTolerance or CONFIG.planeTolerance) then return "plane" end
+    if info.absNormalDot < (info.normalDotMin or CONFIG.normalDotMin) then return "normal" end
+    if not info.uvInBounds then
+        if info.planeDist <= (info.pickTolerance or CONFIG.surfacePickTolerance)
+            and info.edgeDistance <= (info.edgeProjectionTolerance or CONFIG.edgeProjectionTolerance) then
+            return "edge_project_ok"
+        end
+
+        return "uv_bounds"
+    end
+    if info.planeDist <= (info.pickTolerance or CONFIG.surfacePickTolerance) and info.inside then
+        return info.displacement and "displacement_ok" or "strict_ok"
+    end
+    if info.edgeDistance <= CONFIG.edgePickTolerance then return "edge_ok" end
+
+    return "polygon"
+end
+
+local function traceDebugInfo(surfaceData, hitPos, hitNormal, displacementTrace)
+    if not surfaceData or not isvector(hitPos) or not isvector(hitNormal) then return end
+
+    local boundsTolerance = traceBoundsTolerance(surfaceData, displacementTrace)
+    local signedPlaneDist = signedPlaneDistance(surfaceData, hitPos.x, hitPos.y, hitPos.z)
+    local planeDist = math.abs(signedPlaneDist)
+    local normalDot = dot(surfaceData.normal, hitNormal)
+    local normal = surfaceData.normal
+    local u, v = surfaceUvFromComponents(
+        surfaceData,
+        hitPos.x - normal.x * signedPlaneDist,
+        hitPos.y - normal.y * signedPlaneDist,
+        hitPos.z - normal.z * signedPlaneDist
+    )
+    local uvInBounds = u >= surfaceData.uMin - boundsTolerance
+        and u <= surfaceData.uMax + boundsTolerance
+        and v >= surfaceData.vMin - boundsTolerance
+        and v <= surfaceData.vMax + boundsTolerance
+    local inside = pointInPolygon2D(surfaceData.polygon, u, v, CONFIG.polygonPickTolerance)
+    local edgeDistance = polygonEdgeDistance(surfaceData.polygon, u, v)
+    local boundsDistSqr = boundsDistanceSqr(surfaceData, hitPos.x, hitPos.y, hitPos.z, boundsTolerance)
+    local info = {
+        surface = surfaceData,
+        planeDist = planeDist,
+        normalDot = normalDot,
+        absNormalDot = math.abs(normalDot),
+        u = u,
+        v = v,
+        inBounds = boundsDistSqr <= M.COMPUTE_EPSILON,
+        boundsDist = math.sqrt(boundsDistSqr),
+        uvInBounds = uvInBounds,
+        inside = inside,
+        edgeDistance = edgeDistance,
+        displacement = useDisplacementTraceTolerances(surfaceData, displacementTrace),
+        planeTolerance = tracePlaneTolerance(surfaceData, displacementTrace),
+        pickTolerance = traceSurfacePickTolerance(surfaceData, displacementTrace),
+        normalDotMin = traceNormalDotMin(surfaceData, displacementTrace),
+        edgeProjectionTolerance = traceEdgeProjectionTolerance(surfaceData, displacementTrace)
+    }
+
+    info.reason = traceRejectReason(info)
+    info.score = planeDist
+        + info.boundsDist * 0.5
+        + math.max(0, (info.normalDotMin or CONFIG.normalDotMin) - info.absNormalDot) * 20
+        + (inside and 0 or math.min(edgeDistance, 64) * 0.1)
+    return info
+end
+
+local function insertTraceDebugCandidate(best, info, maxCount)
+    if not info then return end
+
+    local count = #best
+    local insertAt = count + 1
+    for i = 1, count do
+        if info.score < best[i].score then
+            insertAt = i
+            break
+        end
+    end
+    if insertAt > maxCount then return end
+
+    table.insert(best, insertAt, info)
+    if #best > maxCount then
+        best[#best] = nil
+    end
+end
+
+local function printTraceDebugCandidates(surfaces, surfaceCount, hitPos, hitNormal, displacementTrace)
+    surfaceCount = tonumber(surfaceCount) or 0
+    if not surfaces or surfaceCount <= 0 then return end
+
+    local best = {}
+    local maxCount = 5
+    for i = 1, surfaceCount do
+        insertTraceDebugCandidate(best, traceDebugInfo(surfaces[i], hitPos, hitNormal, displacementTrace), maxCount)
+    end
+
+    for i = 1, #best do
+        local info = best[i]
+        local surfaceData = info.surface
+        print(("Magic Align: World BSP debug candidate %d: surface=%d reason=%s plane=%.3f normalDot=%.3f bounds=%s boundsDist=%.3f uv=(%.3f, %.3f) uvBounds=%s inside=%s edge=%.3f source=%s sourceSurface=%s diag=%s material=%s."):format(
+            i,
+            tonumber(surfaceData and surfaceData.id) or -1,
+            tostring(info.reason or "?"),
+            tonumber(info.planeDist) or 0,
+            tonumber(info.normalDot) or 0,
+            boolLabel(info.inBounds),
+            tonumber(info.boundsDist) or 0,
+            tonumber(info.u) or 0,
+            tonumber(info.v) or 0,
+            boolLabel(info.uvInBounds),
+            boolLabel(info.inside),
+            tonumber(info.edgeDistance) or 0,
+            surfaceSourceLabel(surfaceData),
+            tostring(surfaceData and surfaceData.sourceSurfaceIndex or "?"),
+            surfaceDisplacementDiagonalLabel(surfaceData),
+            tostring(surfaceData and surfaceData.materialName or "?")
+        ))
+    end
+end
+
 function worldBSP.debugTrace(tr)
     tr = tr or (IsValid(LocalPlayer()) and LocalPlayer():GetEyeTrace() or nil)
     if not tr or not isvector(tr.HitPos) then
@@ -2521,6 +3684,13 @@ function worldBSP.debugTrace(tr)
             formatVec(tr.HitPos),
             formatVec(tr.HitNormal)
         ))
+        printTraceDebugCandidates(
+            surfaces,
+            #surfaces,
+            tr.HitPos,
+            normalizedVec(tr.HitNormal, M.PICKING_VECTOR_EPSILON_SQR) or tr.HitNormal,
+            traceHitsDisplacement(tr)
+        )
         return
     end
 
@@ -2535,7 +3705,7 @@ function worldBSP.debugTrace(tr)
         tonumber(last.snapIndexV) or -1
     ) or ""
 
-    print(("Magic Align: World BSP debug: match=%s surface=%d candidates=%d raw=(%.3f, %.3f)%s hit=%s hitNormal=%s surfaceNormal=%s."):format(
+    print(("Magic Align: World BSP debug: match=%s surface=%d candidates=%d raw=(%.3f, %.3f)%s hit=%s hitNormal=%s surfaceNormal=%s diag=%s."):format(
         tostring(match.match or "unknown"),
         tonumber(match.surface and match.surface.id) or -1,
         #surfaces,
@@ -2544,17 +3714,34 @@ function worldBSP.debugTrace(tr)
         snapDetails,
         formatVec(tr.HitPos),
         formatVec(tr.HitNormal),
-        formatVec(match.surface and match.surface.normal)
+        formatVec(match.surface and match.surface.normal),
+        surfaceDisplacementDiagonalLabel(match.surface)
+    ))
+end
+
+function worldBSP.debugCache()
+    print(("Magic Align: World BSP cache: status=%s cached=%d skipped=%d displacements=%d displacementSurfaces=%d displacementSkipped=%d error=%s."):format(
+        tostring(cache.status),
+        tonumber(cache.cached) or 0,
+        tonumber(cache.skipped) or 0,
+        tonumber(cache.displacements) or 0,
+        tonumber(cache.displacementSurfaces) or 0,
+        tonumber(cache.displacementSkipped) or 0,
+        tostring(cache.error or cache.displacementError or "nil")
     ))
 end
 
 if concommand and isfunction(concommand.Add) then
     if isfunction(concommand.Remove) then
         concommand.Remove("magic_align_world_bsp_debug_trace")
+        concommand.Remove("magic_align_world_bsp_debug_cache")
     end
 
     concommand.Add("magic_align_world_bsp_debug_trace", function()
         worldBSP.debugTrace()
+    end)
+    concommand.Add("magic_align_world_bsp_debug_cache", function()
+        worldBSP.debugCache()
     end)
 end
 

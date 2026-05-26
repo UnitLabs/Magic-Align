@@ -572,6 +572,14 @@ local function currentSpace(tool, state, data)
     return space
 end
 
+local function displayLabelForSpace(space, state)
+    if space == "prop2" and isWorldTarget and isWorldTarget(state and state.prop2) then
+        return spaceLabels.world or "World"
+    end
+
+    return spaceLabels[space] or tostring(space)
+end
+
 local function drawFooter(width, height, tool, state, data)
     local spaces = M.SPACES or { "prop1", "prop2", "points", "world" }
     if not istable(spaces) or #spaces == 0 then return end
@@ -605,7 +613,7 @@ local function drawFooter(width, height, tool, state, data)
             surface.DrawRect(tabX + 1, y + h - 3, math.max(tabW - 2, 0), 3)
         end
 
-        draw.SimpleText(spaceLabels[space] or tostring(space), "MagicAlignToolgunTab", tabX + tabW * 0.5, y + h * 0.48, textColor, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+        draw.SimpleText(displayLabelForSpace(space, state), "MagicAlignToolgunTab", tabX + tabW * 0.5, y + h * 0.48, textColor, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
         tabX = tabX + tabW + gap
     end
 end
@@ -735,7 +743,7 @@ local function drawIdleCompasses(width, height, tool, state)
         w,
         panelHeight,
         "prop2",
-        spaceLabels.prop2 or "Prop 2",
+        displayLabelForSpace("prop2", state),
         state and state.prop2 or nil,
         panelAccent.prop2 or palette.idle,
         state and istable(state.target) and #state.target or 0,

@@ -5,6 +5,7 @@ if SERVER then
     AddCSLuaFile("magic_align/anchor.lua")
     AddCSLuaFile("magic_align/compat/primitive_sh.lua")
     AddCSLuaFile("magic_align/compat/primitive_cl.lua")
+    AddCSLuaFile("magic_align/client/profiler.lua")
 end
 
 MAGIC_ALIGN = MAGIC_ALIGN or {}
@@ -49,6 +50,7 @@ M.COMMIT_COPY = 1
 M.COMMIT_COPY_MOVE = 2
 M.CLIENT_ACTION_RIGHTCLICK = 0
 M.CLIENT_ACTION_RESET = 1
+M.CLIENT_ACTION_LEFTCLICK = 2
 
 local MAX_LINKED_PROPS_CVAR = "magic_align_max_linked_props"
 local COMMIT_LINKED_PART_SIZE_CVAR = "magic_align_commit_linked_part_size"

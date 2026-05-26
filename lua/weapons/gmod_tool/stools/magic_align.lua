@@ -195,6 +195,7 @@ TOOL.ClientConVar = {
     world_bsp_budget_ms = "2.5",
     world_bsp_ignore_brush_blockers = "1",
     world_bsp_show_blockers = "0",
+    world_bsp_full_grid = "1",
     rotation_snap = "12",
     translation_snap = "0",
     world_target = "1",
@@ -405,6 +406,8 @@ local function performClientRightClick(trace)
     return true
 end
 
+local queueClientLeftClick
+
 local function resetSessionConVars()
     for _, space in ipairs(M.SPACES) do
         for _, suffix in ipairs(SESSION_CONFIG.convarSuffixes) do
@@ -481,6 +484,21 @@ local function setPlayerViewAngles(ply, ang)
 end
 
 function TOOL:LeftClick()
+    if SERVER then
+        if game.SinglePlayer() then
+            sendClientAction(self:GetOwner(), M.CLIENT_ACTION_LEFTCLICK)
+        end
+        return true
+    end
+
+    if game.SinglePlayer() then
+        return true
+    end
+
+    if queueClientLeftClick then
+        return queueClientLeftClick(self)
+    end
+
     return true
 end
 
@@ -578,6 +596,13 @@ local function state()
 
     M.ClientState = ensureStateShape(M.ClientState)
     return M.ClientState
+end
+
+queueClientLeftClick = function()
+    local currentState = state()
+    currentState.leftClickQueued = true
+    currentState.leftClickQueuedAt = RealTime()
+    return true
 end
 
 local function comp(v, key)
@@ -1095,11 +1120,23 @@ local lastToolDescription
 local lastToolShowsUse
 local lastToolShowsWorldPointHint
 
+local function targetDisplayLabel(state)
+    if geometry.isWorldTarget(state and state.prop2) then
+        return TOOL_UI.spaceLabels.world or "World"
+    end
+
+    return TOOL_UI.spaceLabels.prop2 or "Prop 2"
+end
+
 local function updateToolHelp(tool, state)
     if not tool then return end
 
     local stateName = istable(state) and state.state or nil
     local description = TOOL_UI.statusDescriptions[stateName] or TOOL_UI.defaultDescription
+    if stateName == "target_points" and geometry.isWorldTarget(state and state.prop2) then
+        description = ("Place points on %s."):format(targetDisplayLabel(state))
+    end
+
     local showUse = istable(state) and state.preview ~= nil
     local worldPoints = client.WorldPoints
     local showWorldPointHint = worldPoints
@@ -1381,7 +1418,9 @@ end
 net.Receive(M.NET_CLIENT_ACTION, function()
     local action = net.ReadUInt(2)
 
-    if action == M.CLIENT_ACTION_RIGHTCLICK then
+    if action == M.CLIENT_ACTION_LEFTCLICK then
+        queueClientLeftClick()
+    elseif action == M.CLIENT_ACTION_RIGHTCLICK then
         local ent = net.ReadEntity()
         local hasHitPos = net.ReadBool()
         local hitPos = hasHitPos and net.ReadPreciseVector() or nil
@@ -1564,8 +1603,9 @@ local function cfg(tool, out)
     end
     out.worldBspGridSize = math.Clamp(clientNumber(tool, "world_bsp_grid_size", 16), 0.125, 512)
     out.worldBspBudgetMs = math.Clamp(clientNumber(tool, "world_bsp_budget_ms", 2.5), 0.1, 8)
-    out.worldBspIgnoreBrushBlockers = clientNumber(tool, "world_bsp_ignore_brush_blockers", 1) == 1
+    out.worldBspIgnoreBrushBlockers = true
     out.worldBspShowBlockers = clientNumber(tool, "world_bsp_show_blockers", 0) == 1
+    out.worldBspFullGrid = clientNumber(tool, "world_bsp_full_grid", 1) == 1
     out.alt = input.IsKeyDown(KEY_LALT) or input.IsKeyDown(KEY_RALT)
     out.shift = input.IsKeyDown(KEY_LSHIFT) or input.IsKeyDown(KEY_RSHIFT)
 
@@ -2338,6 +2378,7 @@ function client.worldBspCandidateCacheMatches(entry, tr, settings)
         and entry.worldBspGridMode == (settings and settings.worldBspGridMode)
         and entry.worldBspGridSize == (settings and settings.worldBspGridSize)
         and entry.worldBspIgnoreBrushBlockers == (settings and settings.worldBspIgnoreBrushBlockers)
+        and entry.worldBspFullGrid == (settings and settings.worldBspFullGrid)
         and entry.gridA == (settings and settings.gridA)
         and entry.gridAMin == (settings and settings.gridAMin)
         and entry.gridB == (settings and settings.gridB)
@@ -2379,6 +2420,7 @@ function client.storeWorldBspCandidateCacheEntry(cache, tr, settings, candidate)
     entry.worldBspGridMode = settings and settings.worldBspGridMode
     entry.worldBspGridSize = settings and settings.worldBspGridSize
     entry.worldBspIgnoreBrushBlockers = settings and settings.worldBspIgnoreBrushBlockers
+    entry.worldBspFullGrid = settings and settings.worldBspFullGrid
     entry.gridA = settings and settings.gridA
     entry.gridAMin = settings and settings.gridAMin
     entry.gridB = settings and settings.gridB
@@ -4874,6 +4916,10 @@ function TOOL:Think()
     local attack = input.IsMouseDown(MOUSE_LEFT)
     local use = input.IsKeyDown(KEY_E)
     local blocked = uiBlocked()
+    local leftClickQueued = state.leftClickQueued == true
+        and RealTime() - (tonumber(state.leftClickQueuedAt) or 0) <= 0.25
+    state.leftClickQueued = false
+    state.leftClickQueuedAt = nil
     if worldPoints and isfunction(worldPoints.handleModifierToggle) then
         worldPoints.handleModifierToggle(state, blocked)
     end
@@ -4886,8 +4932,11 @@ function TOOL:Think()
         return
     end
 
-    if attack and not state.attackDown then
+    if leftClickQueued and not state.press then
         pressState.beginMouse(self, state, worldPoints)
+        if not attack and state.press then
+            pressState.finishMouse(self, state, worldPoints)
+        end
     elseif not attack and state.attackDown then
         pressState.finishMouse(self, state, worldPoints)
     end
