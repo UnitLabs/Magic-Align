@@ -24,6 +24,11 @@ local function clonePrimitiveEntity(ply, src, pos, ang)
         return true
     end
 
+    if istable(data.EntityMods) and M.ENTITY_MIRROR_MODIFIER_ID then
+        data.EntityMods = table.Copy(data.EntityMods)
+        data.EntityMods[M.ENTITY_MIRROR_MODIFIER_ID] = nil
+    end
+
     if istable(data.BuildDupeInfo) then
         data.BuildDupeInfo = table.Copy(data.BuildDupeInfo)
         data.BuildDupeInfo.DupeParentID = nil

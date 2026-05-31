@@ -2169,7 +2169,12 @@ function PANEL:SyncFromConVar(force)
     end
 
     manager:RegisterConVar(cvarName)
-    manager:PollConVar(cvarName, force)
+    local shouldPoll = force
+        or not isfunction(manager.ShouldPollConVar)
+        or manager:ShouldPollConVar(cvarName, false)
+    if shouldPoll then
+        manager:PollConVar(cvarName, force)
+    end
 
     local snapshot = manager:GetSnapshot(cvarName)
     if not snapshot then

@@ -3,6 +3,8 @@ if SERVER then
     AddCSLuaFile("magic_align/precision.lua")
     AddCSLuaFile("magic_align/rounding.lua")
     AddCSLuaFile("magic_align/anchor.lua")
+    AddCSLuaFile("magic_align/mirror.lua")
+    AddCSLuaFile("magic_align/entity_mirror.lua")
     AddCSLuaFile("magic_align/compat/primitive_sh.lua")
     AddCSLuaFile("magic_align/compat/primitive_cl.lua")
     AddCSLuaFile("magic_align/client/profiler.lua")
@@ -31,6 +33,8 @@ end
 M.NET = "magic_align_commit"
 M.NET_COMMIT_LINKED_PART = "magic_align_commit_linked_part"
 M.NET_COMMIT_FINISH = "magic_align_commit_finish"
+M.NET_COMMIT_RESULT = "magic_align_commit_result"
+M.NET_UNDO_RESTORE = "magic_align_undo_restore"
 M.NET_BOUNDS_REQUEST = "magic_align_bounds_request"
 M.NET_BOUNDS_REPLY = "magic_align_bounds_reply"
 M.NET_CLIENT_ACTION = "magic_align_client_action"
@@ -51,6 +55,15 @@ M.COMMIT_COPY_MOVE = 2
 M.CLIENT_ACTION_RIGHTCLICK = 0
 M.CLIENT_ACTION_RESET = 1
 M.CLIENT_ACTION_LEFTCLICK = 2
+M.COMMIT_RESULT_OK = 0
+M.COMMIT_RESULT_BUSY = 1
+M.COMMIT_RESULT_INVALID = 2
+M.COMMIT_RESULT_TIMEOUT = 3
+M.COMMIT_RESULT_FAILED = 4
+M.SESSION_SNAPSHOT_SCHEMA = 2
+M.SESSION_SNAPSHOT_ACTION_UNKNOWN = 0
+M.SESSION_SNAPSHOT_ACTION_ALIGN = 1
+M.SESSION_SNAPSHOT_ACTION_MIRROR = 2
 
 local MAX_LINKED_PROPS_CVAR = "magic_align_max_linked_props"
 local COMMIT_LINKED_PART_SIZE_CVAR = "magic_align_commit_linked_part_size"
@@ -117,6 +130,13 @@ end
 -- points = lokaler Raum der gewaehlten Point-Axis
 -- world = Weltachsen ohne lokale Rotation
 M.SPACES = { "prop1", "prop2", "points", "world" }
+M.UI_SPACES = { "prop1", "prop2", "points", "world", "mirror" }
+M.MIRROR_SPACE = "mirror"
+M.TRANSFORM_MODE_MIRROR = "mirror"
+M.MIRROR_POINT = "point"
+M.MIRROR_AXIS = "axis"
+M.MIRROR_PLANE = "plane"
+M.MIRROR_EPSILON_SQR = M.COMPUTE_VECTOR_EPSILON_SQR
 M.WORLD_TARGET = M.WORLD_TARGET or setmetatable({
     __magic_align_world = true
 }, {
@@ -153,11 +173,17 @@ function M.NewSession()
         state = "source_prop",
         prop1 = nil,
         prop2 = nil,
+        activeSpace = "prop1",
         selectedWorldPointIndex = nil,
         linked = {},
         anchorSelection = {},
         source = {},
         target = {},
+        mirror = {
+            enabled = false,
+            points = {},
+            classification = nil
+        },
         bounds = {},
         preview = nil,
         pending = nil,
@@ -169,6 +195,43 @@ function M.NewSession()
         attackDown = false,
         useDown = false
     }
+end
+
+function M.PointReferenceFromEntity(ent)
+    if M.IsWorldTarget(ent) then
+        return { kind = "world" }
+    end
+
+    if IsValid(ent) then
+        return { kind = "entity", ent = ent, entIndex = ent:EntIndex() }
+    end
+end
+
+function M.CopyPointReference(ref)
+    if not istable(ref) then return end
+
+    if ref.kind == "world" then
+        return { kind = "world" }
+    end
+
+    if ref.kind == "entity" then
+        local entIndex = tonumber(ref.entIndex)
+        if IsValid(ref.ent) then
+            entIndex = ref.ent:EntIndex()
+        end
+
+        return { kind = "entity", ent = ref.ent, entIndex = entIndex }
+    end
+end
+
+function M.SetPointReference(point, ent)
+    if not isvector(point) then return point end
+
+    local ref = M.PointReferenceFromEntity(ent)
+    point.reference = M.CopyPointReference(ref)
+    point.world = ref and ref.kind == "world" or nil
+
+    return point
 end
 
 function M.CopyPoints(points)
@@ -187,6 +250,11 @@ function M.CopyPoints(points)
 
             if p.world == true then
                 out[i].world = true
+            end
+
+            local ref = M.CopyPointReference(p.reference)
+            if ref then
+                out[i].reference = ref
             end
         end
     end
@@ -466,8 +534,18 @@ function M.GetLocalBounds(ent)
 end
 
 function M.RefreshState(session)
+    local mirrorActive = M.IsMirrorMode and M.IsMirrorMode(session)
+
     if not IsValid(session.prop1) then
         session.state = "source_prop"
+    elseif mirrorActive and not (M.ResolveMirrorState and M.ResolveMirrorState(
+        session.mirror,
+        M.GetMirrorStateCache and M.GetMirrorStateCache(session) or nil,
+        { activeSpace = session.activeSpace }
+    ).valid) then
+        session.state = "mirror_points"
+    elseif mirrorActive then
+        session.state = "ready"
     elseif #session.source == 0 then
         session.state = "source_points"
     elseif not M.HasTargetEntity(session.prop2) then
@@ -507,6 +585,447 @@ local function worldToLocalSafe(worldPos, worldAng, originPos, originAng)
         copyAng(originAng)
     )
 end
+
+function M.ResolvePointReference(point, fallbackEnt)
+    if isvector(point) and istable(point.reference) then
+        local ref = point.reference
+        if ref.kind == "world" then
+            return M.WORLD_TARGET
+        elseif ref.kind == "entity" and IsValid(ref.ent) then
+            return ref.ent
+        elseif ref.kind == "entity" then
+            return nil
+        end
+    end
+
+    if isvector(point) and point.world == true then
+        return M.WORLD_TARGET
+    end
+
+    return fallbackEnt
+end
+
+local function pointCacheFrame()
+    return isfunction(FrameNumber) and FrameNumber() or nil
+end
+
+local function pointCacheSetVec(out, value)
+    if not isvector(value) then return end
+
+    if not isvector(out) then
+        return VectorP(value.x, value.y, value.z)
+    end
+
+    out.x, out.y, out.z = value.x, value.y, value.z
+    return out
+end
+
+local function pointCacheSetVecComponents(out, x, y, z)
+    if not isvector(out) then
+        return VectorP(x, y, z)
+    end
+
+    out.x, out.y, out.z = x, y, z
+    return out
+end
+
+local function pointCacheEntPose(entry, prefix, ent)
+    if M.IsWorldTarget(ent) then
+        local changed = entry[prefix .. "Ent"] ~= M.WORLD_TARGET
+            or entry[prefix .. "Valid"] ~= true
+            or entry[prefix .. "World"] ~= true
+
+        entry[prefix .. "Ent"] = M.WORLD_TARGET
+        entry[prefix .. "Valid"] = true
+        entry[prefix .. "World"] = true
+        entry[prefix .. "PX"], entry[prefix .. "PY"], entry[prefix .. "PZ"] = 0, 0, 0
+        entry[prefix .. "AP"], entry[prefix .. "AY"], entry[prefix .. "AR"] = 0, 0, 0
+        return changed
+    end
+
+    if not IsValid(ent) then
+        local changed = entry[prefix .. "Ent"] ~= ent
+            or entry[prefix .. "Valid"] ~= false
+            or entry[prefix .. "World"] ~= nil
+
+        entry[prefix .. "Ent"] = ent
+        entry[prefix .. "Valid"] = false
+        entry[prefix .. "World"] = nil
+        entry[prefix .. "PX"], entry[prefix .. "PY"], entry[prefix .. "PZ"] = nil, nil, nil
+        entry[prefix .. "AP"], entry[prefix .. "AY"], entry[prefix .. "AR"] = nil, nil, nil
+        return changed
+    end
+
+    local pos = ent:GetPos()
+    local ang = ent:GetAngles()
+    local changed = entry[prefix .. "Ent"] ~= ent
+        or entry[prefix .. "Valid"] ~= true
+        or entry[prefix .. "World"] ~= nil
+        or entry[prefix .. "PX"] ~= pos.x
+        or entry[prefix .. "PY"] ~= pos.y
+        or entry[prefix .. "PZ"] ~= pos.z
+        or entry[prefix .. "AP"] ~= ang.p
+        or entry[prefix .. "AY"] ~= ang.y
+        or entry[prefix .. "AR"] ~= ang.r
+
+    entry[prefix .. "Ent"] = ent
+    entry[prefix .. "Valid"] = true
+    entry[prefix .. "World"] = nil
+    entry[prefix .. "PX"], entry[prefix .. "PY"], entry[prefix .. "PZ"] = pos.x, pos.y, pos.z
+    entry[prefix .. "AP"], entry[prefix .. "AY"], entry[prefix .. "AR"] = ang.p, ang.y, ang.r
+    return changed
+end
+
+local function pointReferenceSignature(entry, point, fallbackEnt)
+    local ref = isvector(point) and point.reference or nil
+    local refKind = istable(ref) and ref.kind or nil
+    local refEnt = istable(ref) and ref.ent or nil
+    local refEntIndex = istable(ref) and ref.entIndex or nil
+    local world = isvector(point) and point.world == true or nil
+    local ent = M.ResolvePointReference(point, fallbackEnt)
+    local changed = entry.point ~= point
+        or entry.fallbackEnt ~= fallbackEnt
+        or entry.refKind ~= refKind
+        or entry.refEnt ~= refEnt
+        or entry.refEntIndex ~= refEntIndex
+        or entry.pointWorld ~= world
+        or entry.resolvedEnt ~= ent
+
+    entry.point = point
+    entry.fallbackEnt = fallbackEnt
+    entry.refKind = refKind
+    entry.refEnt = refEnt
+    entry.refEntIndex = refEntIndex
+    entry.pointWorld = world
+    entry.resolvedEnt = ent
+
+    if pointCacheEntPose(entry, "ref", ent) then
+        changed = true
+    end
+
+    return ent, changed
+end
+
+local function pointValueSignature(entry, point, includeNormal)
+    local changed = entry.pointX ~= point.x or entry.pointY ~= point.y or entry.pointZ ~= point.z
+    entry.pointX, entry.pointY, entry.pointZ = point.x, point.y, point.z
+
+    if includeNormal then
+        local normal = point.normal
+        if isvector(normal) then
+            if entry.normalX ~= normal.x or entry.normalY ~= normal.y or entry.normalZ ~= normal.z then
+                changed = true
+            end
+            entry.normalX, entry.normalY, entry.normalZ = normal.x, normal.y, normal.z
+        elseif entry.normalX ~= nil then
+            changed = true
+            entry.normalX, entry.normalY, entry.normalZ = nil, nil, nil
+        end
+    end
+
+    return changed
+end
+
+local function pointCacheEntries(cache, name)
+    if not istable(cache) then return end
+
+    local entries = cache[name]
+    if not istable(entries) then
+        entries = {}
+        cache[name] = entries
+    end
+
+    return entries
+end
+
+local function pointCacheEntry(cache, name, point, fallbackEnt)
+    local entries = pointCacheEntries(cache, name)
+    if not entries then return end
+
+    local count = tonumber(entries.count) or 0
+    if count > 64 then
+        entries.count = 0
+        count = 0
+    end
+
+    for i = 1, count do
+        local entry = entries[i]
+        if entry and entry.point == point and entry.fallbackEnt == fallbackEnt then
+            return entry
+        end
+    end
+
+    count = count + 1
+    entries.count = count
+    local entry = entries[count]
+    if not istable(entry) then
+        entry = {}
+        entries[count] = entry
+    end
+
+    return entry
+end
+
+function M.ClearPointWorldCache(cache)
+    if not istable(cache) then return end
+
+    for _, name in ipairs({ "positions", "normals" }) do
+        local entries = cache[name]
+        if istable(entries) then
+            entries.count = 0
+        end
+    end
+end
+
+function M.ResolvePointWorldPositionInto(out, point, fallbackEnt)
+    if not isvector(point) then return end
+
+    local ent = M.ResolvePointReference(point, fallbackEnt)
+    if M.IsWorldTarget(ent) then
+        return pointCacheSetVec(out, point)
+    end
+
+    if IsValid(ent) then
+        local pos = ent:GetPos()
+        local ang = ent:GetAngles()
+        local x, y, z = point.x, point.y, point.z
+        local pitch, yaw, roll = ang.p, ang.y, ang.r
+        local sp, sy, sr = math.sin(pitch * math.pi / 180), math.sin(yaw * math.pi / 180), math.sin(roll * math.pi / 180)
+        local cp, cy, cr = math.cos(pitch * math.pi / 180), math.cos(yaw * math.pi / 180), math.cos(roll * math.pi / 180)
+
+        return pointCacheSetVecComponents(
+            out,
+            pos.x + (cp * cy) * x + (sp * sr * cy - cr * sy) * y + (sp * cr * cy + sr * sy) * z,
+            pos.y + (cp * sy) * x + (sp * sr * sy + cr * cy) * y + (sp * cr * sy - sr * cy) * z,
+            pos.z + (-sp) * x + (sr * cp) * y + (cr * cp) * z
+        )
+    end
+end
+
+function M.ResolvePointWorldPositionCached(cache, point, fallbackEnt, options)
+    if not isvector(point) then return end
+    if not istable(cache) then
+        local world = M.ResolvePointWorldPosition(point, fallbackEnt)
+        return istable(options) and options.copy and isvector(world) and copyVec(world) or world
+    end
+
+    options = istable(options) and options or {}
+    local entry = pointCacheEntry(cache, "positions", point, fallbackEnt)
+    if not entry then
+        local world = M.ResolvePointWorldPosition(point, fallbackEnt)
+        return options.copy and isvector(world) and copyVec(world) or world
+    end
+
+    local frame = pointCacheFrame()
+    local revision = options.revision
+    local ent, changed = pointReferenceSignature(entry, point, fallbackEnt)
+    if pointValueSignature(entry, point, false) then changed = true end
+    if entry.revision ~= revision then entry.revision = revision; changed = true end
+    if options.frameOnly and entry.frame ~= frame then changed = true end
+
+    if changed or entry.valid == nil then
+        local out = entry.world
+        if M.IsWorldTarget(ent) then
+            out = pointCacheSetVec(out, point)
+        elseif IsValid(ent) then
+            out = M.ResolvePointWorldPositionInto(out, point, ent)
+        else
+            out = nil
+        end
+
+        entry.world = out
+        entry.valid = isvector(out)
+        entry.frame = frame
+    end
+
+    local world = entry.valid and entry.world or nil
+    if options.copy and isvector(world) then
+        return copyVec(world)
+    end
+
+    return world
+end
+
+function M.IsPointReferenceValid(point, fallbackEnt, options)
+    options = istable(options) and options or {}
+
+    local ent = M.ResolvePointReference(point, fallbackEnt)
+    if not ent then return false end
+
+    local forbidden = options.forbiddenEnt
+    if IsValid(forbidden) and ent == forbidden then
+        return false
+    end
+
+    if M.IsWorldTarget(ent) then
+        return options.allowWorld ~= false
+    end
+
+    if not IsValid(ent) then return false end
+    if options.requireProp == true and M.IsProp and not M.IsProp(ent) then return false end
+
+    return true
+end
+
+function M.ResolvePointWorldPosition(point, fallbackEnt)
+    if not isvector(point) then return end
+
+    local ent = M.ResolvePointReference(point, fallbackEnt)
+    if M.IsWorldTarget(ent) then
+        return copyVec(point)
+    end
+
+    if IsValid(ent) then
+        return M.LocalToWorldPosPrecise(point, ent:GetPos(), ent:GetAngles())
+    end
+end
+
+function M.ResolvePointWorldNormalCached(cache, point, fallbackEnt, worldPos, options)
+    if not isvector(point) then return end
+    if not istable(cache) then
+        local normal = M.ResolvePointWorldNormal(point, fallbackEnt, worldPos)
+        return istable(options) and options.copy and isvector(normal) and copyVec(normal) or normal
+    end
+
+    options = istable(options) and options or {}
+    local entry = pointCacheEntry(cache, "normals", point, fallbackEnt)
+    if not entry then
+        local normal = M.ResolvePointWorldNormal(point, fallbackEnt, worldPos)
+        return options.copy and isvector(normal) and copyVec(normal) or normal
+    end
+
+    local frame = pointCacheFrame()
+    local revision = options.revision
+    local _, changed = pointReferenceSignature(entry, point, fallbackEnt)
+    if pointValueSignature(entry, point, true) then changed = true end
+    if entry.revision ~= revision then entry.revision = revision; changed = true end
+    if options.frameOnly and entry.frame ~= frame then changed = true end
+    if isvector(worldPos) then
+        if entry.worldX ~= worldPos.x or entry.worldY ~= worldPos.y or entry.worldZ ~= worldPos.z then
+            changed = true
+        end
+        entry.worldX, entry.worldY, entry.worldZ = worldPos.x, worldPos.y, worldPos.z
+    elseif entry.worldX ~= nil then
+        changed = true
+        entry.worldX, entry.worldY, entry.worldZ = nil, nil, nil
+    end
+
+    if changed or entry.valid == nil then
+        local normal = M.ResolvePointWorldNormal(point, fallbackEnt, worldPos)
+        entry.normal = isvector(normal) and pointCacheSetVec(entry.normal, normal) or nil
+        entry.valid = isvector(entry.normal)
+        entry.frame = frame
+    end
+
+    local normal = entry.valid and entry.normal or nil
+    if options.copy and isvector(normal) then
+        return copyVec(normal)
+    end
+
+    return normal
+end
+
+function M.ResolvePointWorldNormal(point, fallbackEnt, worldPos)
+    if not isvector(point) then return end
+
+    local normal = M.NormalizeVectorPrecise(point.normal, M.COMPUTE_VECTOR_EPSILON_SQR)
+    if not normal then return end
+
+    local ent = M.ResolvePointReference(point, fallbackEnt)
+    if M.IsWorldTarget(ent) then
+        return copyVec(normal)
+    end
+
+    if not IsValid(ent) then return end
+
+    local basePos = ent:GetPos()
+    local baseAng = ent:GetAngles()
+    if not isvector(basePos) or not isangle(baseAng) then return end
+
+    local origin = isvector(worldPos) and worldPos or M.LocalToWorldPosPrecise(point, basePos, baseAng)
+    local tip = M.LocalToWorldPosPrecise(M.AddVectorsPrecise(point, normal), basePos, baseAng)
+    if not isvector(origin) or not isvector(tip) then return end
+
+    return M.NormalizeVectorPrecise(M.SubtractVectorsPrecise(tip, origin), M.COMPUTE_VECTOR_EPSILON_SQR)
+end
+
+function M.ResolvePointPositionInReference(point, fallbackEnt, referenceEnt)
+    local worldPos = M.ResolvePointWorldPosition(point, fallbackEnt)
+    if not isvector(worldPos) then return end
+
+    if M.IsWorldTarget(referenceEnt) then
+        return copyVec(worldPos)
+    end
+
+    if IsValid(referenceEnt) then
+        return M.WorldToLocalPosPrecise(worldPos, referenceEnt:GetPos(), referenceEnt:GetAngles())
+    end
+end
+
+function M.ResolvePointNormalInReference(point, fallbackEnt, referenceEnt, worldPos)
+    worldPos = isvector(worldPos) and worldPos or M.ResolvePointWorldPosition(point, fallbackEnt)
+    if not isvector(worldPos) then return end
+
+    local worldNormal = M.ResolvePointWorldNormal(point, fallbackEnt, worldPos)
+    if not isvector(worldNormal) then return end
+
+    if M.IsWorldTarget(referenceEnt) then
+        return copyVec(worldNormal)
+    end
+
+    if not IsValid(referenceEnt) then return end
+
+    local basePos = referenceEnt:GetPos()
+    local baseAng = referenceEnt:GetAngles()
+    if not isvector(basePos) or not isangle(baseAng) then return end
+
+    local localPos = M.WorldToLocalPosPrecise(worldPos, basePos, baseAng)
+    local localTip = M.WorldToLocalPosPrecise(M.AddVectorsPrecise(worldPos, worldNormal), basePos, baseAng)
+    if not isvector(localPos) or not isvector(localTip) then return end
+
+    return M.NormalizeVectorPrecise(M.SubtractVectorsPrecise(localTip, localPos), M.COMPUTE_VECTOR_EPSILON_SQR)
+end
+
+function M.ResolvePointSetWorld(points, fallbackEnt, options)
+    points = istable(points) and points or {}
+    options = istable(options) and options or {}
+
+    local out = {}
+    local count = math.min(#points, tonumber(options.maxPoints) or #points)
+    local pointCache = options.pointWorldCache or options.cache
+    local cacheOptions = {
+        copy = false,
+        revision = options.revision,
+        frameOnly = options.frameOnly
+    }
+
+    for i = 1, count do
+        local point = points[i]
+        if not M.IsPointReferenceValid(point, fallbackEnt, options) then
+            return
+        end
+
+        local worldPos = pointCache
+            and M.ResolvePointWorldPositionCached(pointCache, point, fallbackEnt, cacheOptions)
+            or M.ResolvePointWorldPosition(point, fallbackEnt)
+        if not isvector(worldPos) then return end
+
+        local copy = VectorP(worldPos.x, worldPos.y, worldPos.z)
+        local worldNormal = pointCache
+            and M.ResolvePointWorldNormalCached(pointCache, point, fallbackEnt, worldPos, cacheOptions)
+            or M.ResolvePointWorldNormal(point, fallbackEnt, worldPos)
+        if isvector(worldNormal) then
+            copy.normal = VectorP(worldNormal.x, worldNormal.y, worldNormal.z)
+        end
+
+        out[i] = copy
+    end
+
+    return out
+end
+
+include("magic_align/mirror.lua")
+include("magic_align/entity_mirror.lua")
 
 local function normalized(v)
     return M.NormalizeVectorPrecise(v, M.COMPUTE_VECTOR_EPSILON_SQR)
@@ -602,30 +1121,57 @@ local function signedAngle(axis, fromVec, toVec)
     ))
 end
 
-function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourcePriority, targetSelected, targetPriority, sourceAnchorOptions, targetAnchorOptions)
+function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourcePriority, targetSelected, targetPriority, sourceAnchorOptions, targetAnchorOptions, options)
+    options = istable(options) and options or {}
+
     local sourceCount = #sourcePoints
     local targetIsWorld = M.IsWorldTarget(prop2)
     local hasTarget = (targetIsWorld or IsValid(prop2)) and #targetPoints > 0
+    local resolvedTargetPoints = hasTarget and M.ResolvePointSetWorld(targetPoints, prop2, {
+        allowWorld = true,
+        requireProp = true,
+        maxPoints = M.MAX_POINTS,
+        pointWorldCache = options.pointWorldCache,
+        revision = options.pointWorldRevision,
+        frameOnly = options.pointWorldFrameOnly
+    }) or nil
 
     if not IsValid(prop1) or sourceCount < 1 then return end
+    if hasTarget and not resolvedTargetPoints then return end
 
-    local sourceAnchorId, sourceAnchorLocal = M.ResolveAnchor(sourcePoints, sourceSelected, sourcePriority, sourceAnchorOptions)
+    local anchorCache = options.anchorCache
+    local sourceAnchorId, sourceAnchorLocal
+    if anchorCache then
+        sourceAnchorId, sourceAnchorLocal = M.ResolveAnchorCached(anchorCache, sourcePoints, sourceSelected, sourcePriority, sourceAnchorOptions, {
+            revision = options.sourceAnchorRevision,
+            copy = true
+        })
+    else
+        sourceAnchorId, sourceAnchorLocal = M.ResolveAnchor(sourcePoints, sourceSelected, sourcePriority, sourceAnchorOptions)
+    end
     if not isvector(sourceAnchorLocal) then return end
 
     local targetAnchorId, targetAnchorLocal
     if hasTarget then
-        targetAnchorId, targetAnchorLocal = M.ResolveAnchor(targetPoints, targetSelected, targetPriority, targetAnchorOptions)
+        if anchorCache then
+            targetAnchorId, targetAnchorLocal = M.ResolveAnchorCached(anchorCache, resolvedTargetPoints, targetSelected, targetPriority, targetAnchorOptions, {
+                revision = options.targetAnchorRevision,
+                copy = true
+            })
+        else
+            targetAnchorId, targetAnchorLocal = M.ResolveAnchor(resolvedTargetPoints, targetSelected, targetPriority, targetAnchorOptions)
+        end
         if not isvector(targetAnchorLocal) then return end
     end
 
     local sourceContext = pointContext(sourcePoints, sourceAnchorOptions) or { pos = sourceAnchorLocal, anchorId = sourceAnchorId }
-    local targetContext = hasTarget and (pointContext(targetPoints, targetAnchorOptions) or { pos = targetAnchorLocal, anchorId = targetAnchorId }) or nil
-    local targetSinglePointContext = hasTarget and #targetPoints == 1 and singlePointNormalContext(targetPoints) or nil
-    local targetBasePos = targetIsWorld and VectorP(0, 0, 0) or (IsValid(prop2) and copyVec(prop2:GetPos()) or nil)
-    local targetBaseAng = targetIsWorld and AngleP(0, 0, 0) or (IsValid(prop2) and copyAng(prop2:GetAngles()) or nil)
+    local targetContext = hasTarget and (pointContext(resolvedTargetPoints, targetAnchorOptions) or { pos = targetAnchorLocal, anchorId = targetAnchorId }) or nil
+    local targetSinglePointContext = hasTarget and #resolvedTargetPoints == 1 and singlePointNormalContext(resolvedTargetPoints) or nil
+    local targetBasePos = hasTarget and VectorP(0, 0, 0) or nil
+    local targetBaseAng = hasTarget and AngleP(0, 0, 0) or nil
 
     if sourceCount >= 2 and not sourceContext.primary then return end
-    if hasTarget and #targetPoints >= 2 and (not targetContext or not targetContext.primary) then return end
+    if hasTarget and #resolvedTargetPoints >= 2 and (not targetContext or not targetContext.primary) then return end
 
     local solveSourceAnchorId, solveSourceAnchorLocal = sourceAnchorId, sourceAnchorLocal
     local solveTargetAnchorId, solveTargetAnchorLocal = targetAnchorId, targetAnchorLocal
@@ -642,11 +1188,11 @@ function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourc
     if not hasTarget then
         partial = sourceCount < 3
         pointsLocalAng = sourceContext.ang
-    elseif sourceCount == 1 and #targetPoints == 1 then
+    elseif sourceCount == 1 and #resolvedTargetPoints == 1 then
         partial = false
-    elseif sourceCount >= 2 and #targetPoints >= 2 then
+    elseif sourceCount >= 2 and #resolvedTargetPoints >= 2 then
         -- Hier passiert die eigentliche Rotation von Prop 1 auf den
-        -- Referenzraum von Prop 2:
+        -- aufgeloesten Ziel-Welt-Raum:
         -- primary richtet die Hauptachse aus, secondary loest den verbleibenden Twist.
         local targetAxisWorld = localToWorldSafe(targetContext.primary, nil, nil, targetBaseAng)
         ang = rotateToAxis(ang, sourceContext.primary, targetAxisWorld)
@@ -659,9 +1205,9 @@ function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourc
 
         if sourceHintWorld and targetHintWorld then
             ang = M.RotateAngleAroundAxisPrecise(ang, targetAxisWorld, signedAngle(targetAxisWorld, sourceHintWorld, targetHintWorld))
-            partial = sourceCount < 3 or #targetPoints < 3
+            partial = sourceCount < 3 or #resolvedTargetPoints < 3
         end
-    elseif sourceCount == 1 and #targetPoints >= 2 then
+    elseif sourceCount == 1 and #resolvedTargetPoints >= 2 then
         partial = true
         pointsWorldAng = targetContext.ang and select(2, localToWorldSafe(nil, targetContext.ang, nil, targetBaseAng)) or nil
     else
@@ -671,9 +1217,7 @@ function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourc
 
     if targetSinglePointContext and targetSinglePointContext.ang then
         pointsLocalAng = nil
-        pointsWorldAng = targetIsWorld
-            and copyAng(targetSinglePointContext.ang)
-            or select(2, localToWorldSafe(nil, targetSinglePointContext.ang, nil, targetBaseAng))
+        pointsWorldAng = copyAng(targetSinglePointContext.ang)
     end
 
     local targetAnchorWorld = hasTarget
@@ -688,7 +1232,7 @@ function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourc
     end
 
     return {
-        mode = M.ModeName(sourceCount, #targetPoints, hasTarget),
+        mode = M.ModeName(sourceCount, hasTarget and #resolvedTargetPoints or #targetPoints, hasTarget),
         partial = partial,
         pos = pos,
         ang = ang,
@@ -701,8 +1245,9 @@ function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourc
         targetAnchorId = solveTargetAnchorId,
         targetAnchorLocal = solveTargetAnchorLocal,
         targetAnchorWorld = targetAnchorWorld,
+        targetContextWorld = targetContext,
         sourceCount = sourceCount,
-        targetCount = #targetPoints,
+        targetCount = hasTarget and #resolvedTargetPoints or #targetPoints,
         hasTarget = hasTarget
     }
 end
@@ -725,6 +1270,52 @@ local function lPI(viewVec, viewOri, norm, ori, ang)
     local localPos = worldToLocalSafe(worldPos, nil, ori, ang)
 
     return worldPos, localPos
+end
+
+local function worldToLocalPosInto(out, worldPos, originPos, originAng)
+    if not isvector(worldPos) or not isvector(originPos) or not isangle(originAng) then return end
+
+    local x = worldPos.x - originPos.x
+    local y = worldPos.y - originPos.y
+    local z = worldPos.z - originPos.z
+    local pitch = originAng.p
+    local yaw = originAng.y
+    local roll = originAng.r
+    local sp, sy, sr = math.sin(pitch * math.pi / 180), math.sin(yaw * math.pi / 180), math.sin(roll * math.pi / 180)
+    local cp, cy, cr = math.cos(pitch * math.pi / 180), math.cos(yaw * math.pi / 180), math.cos(roll * math.pi / 180)
+
+    local m11, m12, m13 = cp * cy, sp * sr * cy - cr * sy, sp * cr * cy + sr * sy
+    local m21, m22, m23 = cp * sy, sp * sr * sy + cr * cy, sp * cr * sy - sr * cy
+    local m31, m32, m33 = -sp, sr * cp, cr * cp
+
+    return pointCacheSetVecComponents(
+        out,
+        m11 * x + m21 * y + m31 * z,
+        m12 * x + m22 * y + m32 * z,
+        m13 * x + m23 * y + m33 * z
+    )
+end
+
+function M.LinePlaneIntersectionInto(outWorld, outLocal, viewVec, viewOri, norm, ori, ang)
+    if not isvector(viewVec) or not isvector(viewOri) or not isvector(norm) or not isvector(ori) or not isangle(ang) then
+        return nil, nil
+    end
+
+    local denominator = M.DotVectorsPrecise(norm, viewVec)
+    if math.abs(denominator) <= M.LINE_PLANE_EPSILON then
+        return nil, nil
+    end
+
+    local distance = (M.DotVectorsPrecise(norm, ori) - M.DotVectorsPrecise(norm, viewOri)) / denominator
+    outWorld = pointCacheSetVecComponents(
+        outWorld,
+        viewOri.x + viewVec.x * distance,
+        viewOri.y + viewVec.y * distance,
+        viewOri.z + viewVec.z * distance
+    )
+    outLocal = worldToLocalPosInto(outLocal, outWorld, ori, ang)
+
+    return outWorld, outLocal
 end
 
 function M.LinePlaneIntersection(viewVec, viewOri, norm, ori, ang)
@@ -838,6 +1429,694 @@ function M.ComposePose(solve, offsets, prop2)
     end
 
     return pos, ang, spaceBasis, referenceBasis
+end
+
+local function snapshotEntityRef(ent)
+    if M.IsWorldTarget(ent) then
+        return { kind = "world" }
+    end
+
+    if IsValid(ent) then
+        return {
+            kind = "entity",
+            ent = ent,
+            entIndex = ent:EntIndex()
+        }
+    end
+end
+
+local function resolveSnapshotEntityRef(ref)
+    if not istable(ref) then return end
+
+    if ref.kind == "world" then
+        return M.WORLD_TARGET
+    end
+
+    if ref.kind == "entity" and IsValid(ref.ent) then
+        return ref.ent
+    end
+end
+
+local function snapshotPoints(points)
+    points = istable(points) and points or {}
+    local out = {}
+
+    for i = 1, #points do
+        local point = points[i]
+        if M.IsFiniteVector(point) then
+            local copy = VectorP(point.x, point.y, point.z)
+            if M.IsFiniteVector(point.normal) then
+                copy.normal = VectorP(point.normal.x, point.normal.y, point.normal.z)
+            end
+            if point.world == true then
+                copy.world = true
+            end
+            copy.reference = M.CopyPointReference(point.reference)
+            out[#out + 1] = copy
+        end
+    end
+
+    return out
+end
+
+local function restoreSnapshotPoint(point, fallbackEnt)
+    if not M.IsFiniteVector(point) then return end
+
+    local refEnt
+    if istable(point.reference) then
+        refEnt = resolveSnapshotEntityRef(point.reference)
+        if not refEnt then return end
+    elseif point.world == true then
+        refEnt = M.WORLD_TARGET
+    elseif fallbackEnt ~= nil then
+        refEnt = resolveSnapshotEntityRef(snapshotEntityRef(fallbackEnt))
+        if not refEnt then return end
+    end
+
+    local copy = VectorP(point.x, point.y, point.z)
+    if M.IsFiniteVector(point.normal) then
+        copy.normal = VectorP(point.normal.x, point.normal.y, point.normal.z)
+    end
+
+    if point.world == true or M.IsWorldTarget(refEnt) then
+        copy.world = true
+    end
+
+    if istable(point.reference) and M.SetPointReference then
+        M.SetPointReference(copy, refEnt)
+    elseif point.world == true and M.SetPointReference then
+        M.SetPointReference(copy, M.WORLD_TARGET)
+    end
+
+    return copy
+end
+
+local function restoreSnapshotPoints(points, fallbackEnt)
+    points = istable(points) and points or {}
+    local out = {}
+
+    for i = 1, math.min(#points, M.MAX_POINTS) do
+        local point = restoreSnapshotPoint(points[i], fallbackEnt)
+        if point then
+            out[#out + 1] = point
+        end
+    end
+
+    return out
+end
+
+local function snapshotOffsets(offsets)
+    if not istable(offsets) then return end
+
+    local out = {}
+    for i = 1, #(M.SPACES or {}) do
+        local space = M.SPACES[i]
+        local offset = offsets[space]
+        if istable(offset) then
+            out[space] = {
+                pos = M.IsFiniteVector(offset.pos) and VectorP(offset.pos.x, offset.pos.y, offset.pos.z) or nil,
+                rot = M.IsFiniteAngle(offset.rot) and AngleP(offset.rot.p, offset.rot.y, offset.rot.r) or nil
+            }
+        end
+    end
+
+    return out
+end
+
+local function copySnapshotOffsets(offsets)
+    offsets = istable(offsets) and offsets or {}
+    local out = {}
+
+    for i = 1, #(M.SPACES or {}) do
+        local space = M.SPACES[i]
+        local offset = offsets[space]
+        if istable(offset) then
+            out[space] = {
+                pos = M.IsFiniteVector(offset.pos) and VectorP(offset.pos.x, offset.pos.y, offset.pos.z) or nil,
+                rot = M.IsFiniteAngle(offset.rot) and AngleP(offset.rot.p, offset.rot.y, offset.rot.r) or nil
+            }
+        end
+    end
+
+    return out
+end
+
+local function normalizeActionType(actionType, isMirror)
+    actionType = string.lower(tostring(actionType or ""))
+    if isMirror == true or actionType == "mirror" then
+        return "mirror", true
+    end
+    if actionType == "align" or actionType == "commit" or actionType == "" then
+        return "align", false
+    end
+
+    return actionType, false
+end
+
+local function snapshotAnchorOptions(options)
+    return M.NormalizeAnchorOptions(options)
+end
+
+local function snapshotAnchorSide(side)
+    side = istable(side) and side or {}
+    return {
+        selected = string.lower(tostring(side.selected or side.anchor or "")),
+        priority = table.concat(M.ParsePriority(side.priority), ","),
+        options = snapshotAnchorOptions(side.options)
+    }
+end
+
+local function snapshotAnchors(anchors, selection)
+    anchors = istable(anchors) and anchors or {}
+    selection = istable(selection) and selection or {}
+
+    return {
+        from = snapshotAnchorSide(anchors.from or selection.from),
+        to = snapshotAnchorSide(anchors.to or selection.to)
+    }
+end
+
+local function validUiSpace(space)
+    space = tostring(space or "")
+    for i = 1, #(M.UI_SPACES or M.SPACES or {}) do
+        if (M.UI_SPACES or M.SPACES)[i] == space then
+            return space
+        end
+    end
+end
+
+local function validNonMirrorSpace(space)
+    space = validUiSpace(space)
+    if space and not (M.IsMirrorMode and M.IsMirrorMode(space)) and space ~= M.MIRROR_SPACE then
+        return space
+    end
+end
+
+function M.ResolveSnapshotRestoreSpace(snapshot, currentSpace)
+    snapshot = istable(snapshot) and snapshot or {}
+    local ui = istable(snapshot.ui) and snapshot.ui or {}
+
+    if snapshot.isMirrorAction == true then
+        return M.MIRROR_SPACE
+    end
+
+    local selected = validUiSpace(ui.selectedTab) or validUiSpace(snapshot.activeSpace)
+    local lastNonMirror = validNonMirrorSpace(ui.lastNonMirrorTab)
+        or validNonMirrorSpace(snapshot.lastNonMirrorTab)
+        or validNonMirrorSpace(selected)
+
+    if (M.IsMirrorMode and M.IsMirrorMode(currentSpace)) or selected == M.MIRROR_SPACE then
+        return lastNonMirror or "points"
+    end
+
+    return selected or lastNonMirror or "points"
+end
+
+function M.CreateSessionSnapshot(session, options)
+    if not istable(session) then return end
+
+    options = istable(options) and options or {}
+    local mirror = istable(session.mirror) and session.mirror or {}
+    local mirrorPoints = snapshotPoints(mirror.points)
+    local activeSpace = options.activeSpace or session.activeSpace
+    local lastNonMirrorTab = validNonMirrorSpace(options.lastNonMirrorTab)
+        or validNonMirrorSpace(session.lastNonMirrorSpace)
+        or validNonMirrorSpace(session.lastNonMirrorTab)
+        or validNonMirrorSpace(activeSpace)
+    local actionType, isMirrorAction = normalizeActionType(
+        options.actionType or options.lastActionType,
+        options.isMirrorAction
+    )
+    local mirrorCache = M.ResolveMirrorState
+        and M.ResolveMirrorState(mirror, M.GetMirrorStateCache and M.GetMirrorStateCache(session) or nil, {
+            activeSpace = activeSpace
+        })
+        or nil
+
+    local linked = {}
+    for i = 1, #(session.linked or {}) do
+        local ent = session.linked[i]
+        if IsValid(ent) then
+            linked[#linked + 1] = snapshotEntityRef(ent)
+        end
+    end
+
+    return {
+        schema = M.SESSION_SNAPSHOT_SCHEMA,
+        lastActionType = actionType,
+        isMirrorAction = isMirrorAction,
+        lastAction = {
+            type = actionType,
+            isMirror = isMirrorAction,
+            mode = options.mode
+        },
+        prop1 = snapshotEntityRef(session.prop1),
+        prop2 = snapshotEntityRef(session.prop2),
+        activeSpace = activeSpace,
+        source = snapshotPoints(session.source),
+        target = snapshotPoints(session.target),
+        linked = linked,
+        anchors = snapshotAnchors(options.anchors, session.anchorSelection),
+        offsets = snapshotOffsets(options.offsets or session.offsets),
+        selectedWorldPointIndex = tonumber(session.selectedWorldPointIndex),
+        mirror = {
+            enabled = mirror.enabled == true,
+            activeTab = M.IsMirrorMode and M.IsMirrorMode(activeSpace) or activeSpace == M.MIRROR_SPACE,
+            points = mirrorPoints,
+            classification = mirrorCache and mirrorCache.label or nil,
+            entityMirrorEnabled = options.entityMirrorEnabled == true
+        },
+        ui = {
+            selectedTab = validUiSpace(activeSpace) or "prop1",
+            lastNonMirrorTab = lastNonMirrorTab
+        }
+    }
+end
+
+local function actionId(actionType, isMirror)
+    actionType = normalizeActionType(actionType, isMirror)
+    if actionType == "mirror" then return M.SESSION_SNAPSHOT_ACTION_MIRROR end
+    if actionType == "align" then return M.SESSION_SNAPSHOT_ACTION_ALIGN end
+    return M.SESSION_SNAPSHOT_ACTION_UNKNOWN
+end
+
+local function actionName(id)
+    id = tonumber(id) or M.SESSION_SNAPSHOT_ACTION_UNKNOWN
+    if id == M.SESSION_SNAPSHOT_ACTION_MIRROR then return "mirror" end
+    if id == M.SESSION_SNAPSHOT_ACTION_ALIGN then return "align" end
+    return "unknown"
+end
+
+local function spaceId(space)
+    space = validUiSpace(space)
+    local spaces = M.UI_SPACES or M.SPACES or {}
+    for i = 1, #spaces do
+        if spaces[i] == space then
+            return i
+        end
+    end
+
+    return 0
+end
+
+local function spaceName(id)
+    id = math.floor(tonumber(id) or 0)
+    local spaces = M.UI_SPACES or M.SPACES or {}
+    return spaces[id]
+end
+
+local function anchorId(anchor)
+    anchor = string.lower(tostring(anchor or ""))
+    for i = 1, #(M.ANCHORS or {}) do
+        if M.ANCHORS[i].id == anchor then
+            return i
+        end
+    end
+
+    return 0
+end
+
+local function anchorName(id)
+    id = math.floor(tonumber(id) or 0)
+    return M.ANCHORS and M.ANCHORS[id] and M.ANCHORS[id].id or nil
+end
+
+local function writeEntityRef(ref)
+    if istable(ref) and ref.kind == "world" then
+        net.WriteUInt(2, 2)
+    elseif istable(ref) and ref.kind == "entity" then
+        net.WriteUInt(1, 2)
+        net.WriteEntity(IsValid(ref.ent) and ref.ent or NULL)
+    else
+        net.WriteUInt(0, 2)
+    end
+end
+
+local function readEntityRef()
+    local kind = net.ReadUInt(2)
+
+    if kind == 2 then
+        return { kind = "world" }, false
+    elseif kind == 1 then
+        local ent = net.ReadEntity()
+        if IsValid(ent) then
+            return snapshotEntityRef(ent), false
+        end
+
+        return nil, true
+    end
+
+    return nil, false
+end
+
+local function writeSnapshotPoint(point)
+    net.WritePreciseVector(M.IsFiniteVector(point) and point or M.ZERO)
+    net.WriteBool(M.IsFiniteVector(point and point.normal))
+    if M.IsFiniteVector(point and point.normal) then
+        net.WritePreciseVector(point.normal)
+    end
+    net.WriteBool(point and point.world == true)
+    writeEntityRef(point and point.reference)
+end
+
+local function readSnapshotPoint()
+    local pos = net.ReadPreciseVector()
+    local hasNormal = net.ReadBool()
+    local normal = hasNormal and net.ReadPreciseVector() or nil
+    local world = net.ReadBool()
+    local ref, invalidRef = readEntityRef()
+
+    if not M.IsFiniteVector(pos) or invalidRef then return end
+
+    local point = VectorP(pos.x, pos.y, pos.z)
+    if M.IsFiniteVector(normal) then
+        point.normal = VectorP(normal.x, normal.y, normal.z)
+    end
+    if world == true then
+        point.world = true
+    end
+    point.reference = ref
+
+    return point
+end
+
+local function writeSnapshotPoints(points)
+    points = istable(points) and points or {}
+    local writable = {}
+
+    for i = 1, #points do
+        if M.IsFiniteVector(points[i]) then
+            writable[#writable + 1] = points[i]
+        end
+        if #writable >= M.MAX_POINTS then break end
+    end
+
+    local count = #writable
+
+    net.WriteUInt(count, 2)
+    for i = 1, count do
+        writeSnapshotPoint(writable[i])
+    end
+end
+
+local function readSnapshotPoints()
+    local count = net.ReadUInt(2)
+    local points = {}
+
+    for i = 1, count do
+        local point = readSnapshotPoint()
+        if point then
+            points[#points + 1] = point
+        end
+    end
+
+    return points
+end
+
+local function writeSnapshotOffsets(offsets)
+    offsets = istable(offsets) and offsets or {}
+
+    for i = 1, #(M.SPACES or {}) do
+        local offset = offsets[M.SPACES[i]]
+        local hasOffset = istable(offset)
+            and M.IsFiniteVector(offset.pos)
+            and M.IsFiniteAngle(offset.rot)
+        net.WriteBool(hasOffset)
+        if hasOffset then
+            net.WritePreciseVector(offset.pos)
+            net.WritePreciseAngle(offset.rot)
+        end
+    end
+end
+
+local function readSnapshotOffsets()
+    local offsets = {}
+
+    for i = 1, #(M.SPACES or {}) do
+        local space = M.SPACES[i]
+        if net.ReadBool() then
+            local pos = net.ReadPreciseVector()
+            local rot = net.ReadPreciseAngle()
+            if M.IsFiniteVector(pos) and M.IsFiniteAngle(rot) then
+                offsets[space] = {
+                    pos = VectorP(pos.x, pos.y, pos.z),
+                    rot = AngleP(rot.p, rot.y, rot.r)
+                }
+            end
+        end
+    end
+
+    return offsets
+end
+
+local function writePriority(priority)
+    local parsed = M.ParsePriority(priority)
+    local written = {}
+
+    for i = 1, #parsed do
+        local id = anchorId(parsed[i])
+        if id > 0 then
+            written[#written + 1] = id
+        end
+        if #written >= #(M.ANCHORS or {}) then break end
+    end
+
+    net.WriteUInt(#written, 4)
+    for i = 1, #written do
+        net.WriteUInt(written[i], 4)
+    end
+end
+
+local function readPriority()
+    local count = math.min(net.ReadUInt(4), #(M.ANCHORS or {}))
+    local out = {}
+
+    for i = 1, count do
+        local name = anchorName(net.ReadUInt(4))
+        if name then
+            out[#out + 1] = name
+        end
+    end
+
+    return table.concat(out, ",")
+end
+
+local function writeAnchorSide(side)
+    side = snapshotAnchorSide(side)
+    local options = snapshotAnchorOptions(side.options)
+
+    net.WriteUInt(anchorId(side.selected), 4)
+    writePriority(side.priority)
+    net.WriteFloat(options.mid12_pct)
+    net.WriteFloat(options.mid23_pct)
+    net.WriteFloat(options.mid13_pct)
+end
+
+local function readAnchorSide()
+    return {
+        selected = anchorName(net.ReadUInt(4)) or "p1",
+        priority = readPriority(),
+        options = M.NormalizeAnchorOptions({
+            mid12_pct = net.ReadFloat(),
+            mid23_pct = net.ReadFloat(),
+            mid13_pct = net.ReadFloat()
+        })
+    }
+end
+
+function M.WriteSessionSnapshot(snapshot)
+    local hasSnapshot = istable(snapshot)
+    net.WriteBool(hasSnapshot)
+    if not hasSnapshot then return end
+
+    local actionType, isMirrorAction = normalizeActionType(snapshot.lastActionType, snapshot.isMirrorAction)
+    local lastAction = istable(snapshot.lastAction) and snapshot.lastAction or {}
+    local mirror = istable(snapshot.mirror) and snapshot.mirror or {}
+    local ui = istable(snapshot.ui) and snapshot.ui or {}
+
+    net.WriteUInt(math.Clamp(math.floor(tonumber(snapshot.schema) or M.SESSION_SNAPSHOT_SCHEMA), 1, 255), 8)
+    net.WriteUInt(actionId(actionType, isMirrorAction), 3)
+    net.WriteBool(isMirrorAction)
+    net.WriteUInt(math.Clamp(math.floor(tonumber(lastAction.mode) or 0), 0, 3), 2)
+    writeEntityRef(snapshot.prop1)
+    writeEntityRef(snapshot.prop2)
+    net.WriteUInt(spaceId(snapshot.activeSpace), 3)
+    writeSnapshotPoints(snapshot.source)
+    writeSnapshotPoints(snapshot.target)
+
+    local linked = istable(snapshot.linked) and snapshot.linked or {}
+    local linkedCount = math.min(#linked, M.GetMaxLinkedProps(), M.MAX_COMMIT_PROPS)
+    net.WriteUInt(linkedCount, 8)
+    for i = 1, linkedCount do
+        writeEntityRef(linked[i])
+    end
+
+    local anchors = istable(snapshot.anchors) and snapshot.anchors or {}
+    writeAnchorSide(anchors.from)
+    writeAnchorSide(anchors.to)
+    writeSnapshotOffsets(snapshot.offsets)
+
+    net.WriteBool(mirror.enabled == true)
+    net.WriteBool(mirror.activeTab == true)
+    net.WriteBool(mirror.entityMirrorEnabled == true)
+    writeSnapshotPoints(mirror.points)
+
+    net.WriteUInt(spaceId(ui.selectedTab or snapshot.activeSpace), 3)
+    net.WriteUInt(spaceId(ui.lastNonMirrorTab or snapshot.lastNonMirrorTab), 3)
+    net.WriteBool(tonumber(snapshot.selectedWorldPointIndex) ~= nil)
+    if tonumber(snapshot.selectedWorldPointIndex) ~= nil then
+        net.WriteUInt(math.Clamp(math.floor(tonumber(snapshot.selectedWorldPointIndex) or 0), 0, M.MAX_POINTS), 2)
+    end
+end
+
+function M.ReadSessionSnapshot()
+    if not net.ReadBool() then return end
+
+    local schema = net.ReadUInt(8)
+    local action = actionName(net.ReadUInt(3))
+    local isMirrorAction = net.ReadBool()
+    local mode = net.ReadUInt(2)
+    local prop1 = readEntityRef()
+    local prop2 = readEntityRef()
+    local activeSpace = spaceName(net.ReadUInt(3))
+    local source = readSnapshotPoints()
+    local target = readSnapshotPoints()
+    local linkedCount = net.ReadUInt(8)
+    local linked = {}
+
+    for i = 1, linkedCount do
+        local ref = readEntityRef()
+        if ref and #linked < M.GetMaxLinkedProps() then
+            linked[#linked + 1] = ref
+        end
+    end
+
+    local anchors = {
+        from = readAnchorSide(),
+        to = readAnchorSide()
+    }
+    local offsets = readSnapshotOffsets()
+    local mirrorEnabled = net.ReadBool()
+    local mirrorActiveTab = net.ReadBool()
+    local entityMirrorEnabled = net.ReadBool()
+    local mirrorPoints = readSnapshotPoints()
+    local selectedTab = spaceName(net.ReadUInt(3))
+    local lastNonMirrorTab = spaceName(net.ReadUInt(3))
+    local hasSelectedWorldPoint = net.ReadBool()
+    local selectedWorldPointIndex = hasSelectedWorldPoint and net.ReadUInt(2) or nil
+
+    if schema < 1 or schema > M.SESSION_SNAPSHOT_SCHEMA then return end
+
+    return {
+        schema = schema,
+        lastActionType = action,
+        isMirrorAction = isMirrorAction == true or action == "mirror",
+        lastAction = {
+            type = action,
+            isMirror = isMirrorAction == true or action == "mirror",
+            mode = mode
+        },
+        prop1 = prop1,
+        prop2 = prop2,
+        activeSpace = activeSpace,
+        source = source,
+        target = target,
+        linked = linked,
+        anchors = anchors,
+        offsets = offsets,
+        mirror = {
+            enabled = mirrorEnabled,
+            activeTab = mirrorActiveTab,
+            entityMirrorEnabled = entityMirrorEnabled,
+            points = mirrorPoints
+        },
+        ui = {
+            selectedTab = selectedTab,
+            lastNonMirrorTab = validNonMirrorSpace(lastNonMirrorTab)
+        },
+        selectedWorldPointIndex = selectedWorldPointIndex
+    }
+end
+
+function M.RestoreSessionSnapshot(snapshot, options)
+    if not istable(snapshot) then return end
+
+    local schema = tonumber(snapshot.schema) or 1
+    if schema < 1 or schema > M.SESSION_SNAPSHOT_SCHEMA then return end
+
+    options = istable(options) and options or {}
+    local restored = M.NewSession()
+    local prop1 = resolveSnapshotEntityRef(snapshot.prop1)
+    local prop2 = resolveSnapshotEntityRef(snapshot.prop2)
+
+    if IsValid(prop1) and M.IsProp(prop1) then
+        restored.prop1 = prop1
+    end
+
+    if M.IsWorldTarget(prop2) or (IsValid(prop2) and M.IsProp(prop2) and prop2 ~= restored.prop1) then
+        restored.prop2 = prop2
+    end
+
+    restored.source = restoreSnapshotPoints(snapshot.source, restored.prop1)
+    restored.target = restoreSnapshotPoints(snapshot.target, restored.prop2)
+    for i = #restored.target, 1, -1 do
+        if not M.IsPointReferenceValid(restored.target[i], restored.prop2, {
+            allowWorld = true,
+            requireProp = true
+        }) then
+            table.remove(restored.target, i)
+        end
+    end
+    restored.linked = {}
+
+    for i = 1, math.min(#(snapshot.linked or {}), M.GetMaxLinkedProps()) do
+        local ent = resolveSnapshotEntityRef(snapshot.linked[i])
+        if IsValid(ent) and M.IsProp(ent) and ent ~= restored.prop1 and ent ~= restored.prop2 then
+            restored.linked[#restored.linked + 1] = ent
+        end
+    end
+
+    restored.offsets = copySnapshotOffsets(snapshot.offsets)
+    restored.anchors = snapshotAnchors(snapshot.anchors)
+    restored.anchorSelection = {
+        from = {
+            anchor = restored.anchors.from.selected,
+            convarAnchor = restored.anchors.from.selected,
+            pointCount = #restored.source,
+            priority = restored.anchors.from.priority
+        },
+        to = {
+            anchor = restored.anchors.to.selected,
+            convarAnchor = restored.anchors.to.selected,
+            pointCount = #restored.target,
+            priority = restored.anchors.to.priority
+        }
+    }
+
+    local mirror = istable(snapshot.mirror) and snapshot.mirror or {}
+    restored.mirror = {
+        enabled = mirror.enabled == true,
+        activeTab = mirror.activeTab == true,
+        points = restoreSnapshotPoints(mirror.points, nil),
+        classification = mirror.classification,
+        entityMirrorEnabled = mirror.entityMirrorEnabled == true
+    }
+
+    local ui = istable(snapshot.ui) and snapshot.ui or {}
+    restored.lastNonMirrorSpace = validNonMirrorSpace(ui.lastNonMirrorTab)
+        or validNonMirrorSpace(snapshot.lastNonMirrorTab)
+        or validNonMirrorSpace(snapshot.activeSpace)
+    restored.activeSpace = M.ResolveSnapshotRestoreSpace(snapshot, options.currentSpace)
+    restored.selectedWorldPointIndex = tonumber(snapshot.selectedWorldPointIndex)
+
+    M.RefreshState(restored)
+
+    return restored, {
+        activeSpace = restored.activeSpace,
+        offsets = restored.offsets,
+        anchors = restored.anchors,
+        entityMirrorEnabled = restored.mirror.entityMirrorEnabled
+    }
 end
 
 function M.PointInsideAABB(localPos, mins, maxs)

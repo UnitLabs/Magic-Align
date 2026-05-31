@@ -57,10 +57,20 @@ local GRID_CONFIG = {
     snapLabelAlpha = 235,
     snapLabelInset = 1.6,
     bspSurfacePush = 0.12,
-    bspGlobalAlpha = 163,
-    bspGlobalNeighborAlpha = 96
+    bspGlobalAlpha = 255,
+    bspGlobalNeighborAlpha = 120
 }
 client.worldGridRender = client.worldGridRender or {}
+client.worldGridRender.queueConfig = client.worldGridRender.queueConfig or {
+    defaultBudgetMs = 1.5,
+    maxBudgetMs = 3,
+    frameBudgetFraction = 0.10,
+    fallbackFrameMs = 16.666,
+    inactiveJobSeconds = 8,
+    maxJobsPerFrame = 24
+}
+client.worldGridRender.queueConfig.frameBudgetFraction = client.worldGridRender.queueConfig.frameBudgetFraction or 0.10
+client.worldGridRender.queueConfig.fallbackFrameMs = client.worldGridRender.queueConfig.fallbackFrameMs or 16.666
 client.worldGridRender.rtConfig = client.worldGridRender.rtConfig or {
     cacheName = "magic_align_world_grid",
     baseRtSize = 256,
@@ -140,6 +150,12 @@ client.worldGridRender.rtCache = client.worldGridRender.rtCache or {}
 client.worldGridRender.rtRebuildQueue = client.worldGridRender.rtRebuildQueue or {}
 client.worldGridRender.rtRebuildScheduled = client.worldGridRender.rtRebuildScheduled or false
 client.worldGridRender.bspRenderCache = client.worldGridRender.bspRenderCache or setmetatable({}, { __mode = "k" })
+client.worldGridRender.renderQueue = client.worldGridRender.renderQueue or {
+    activeJobs = {},
+    frame = 0
+}
+client.worldGridRender.renderQueue.activeJobs = client.worldGridRender.renderQueue.activeJobs or {}
+client.worldGridRender.renderQueue.frame = client.worldGridRender.renderQueue.frame or 0
 local shapeMetricCache = {}
 local shapeWhiteMaterial
 local reusableCirclePolyCache = {}
@@ -398,13 +414,6 @@ end
 
 local function clampUnitInterval(value)
     return math.Clamp(tonumber(value) or 0, 0, 1)
-end
-
-local function readClampedConVarInt(name, fallback, minValue, maxValue)
-    local cvar = name and GetConVar(name) or nil
-    local value = cvar and cvar:GetFloat() or fallback
-
-    return math.Clamp(math.floor((tonumber(value) or fallback or 0) + 0.5), minValue or 0, maxValue or 255)
 end
 
 local function ringQualityIndex(tool)
@@ -1356,6 +1365,11 @@ function client.worldGridRender.ensureWorldBspRenderData(surfaceData)
     return entry
 end
 
+function client.worldGridRender.lookupWorldBspRenderData(surfaceData)
+    if not surfaceData then return end
+    return client.worldGridRender.bspRenderCache[surfaceData]
+end
+
 function client.worldGridRender.worldGridSurfaceComponent(surfaceData, u, v, axisKey)
     if not surfaceData then return 0 end
     if axisKey == "x" then
@@ -1537,10 +1551,13 @@ function client.worldGridRender.ensureWorldGridSnapCrossData(face)
 end
 
 function client.worldGridRender.drawWorldGridSnapCross(face)
-    local lines, lineCount = client.worldGridRender.ensureWorldGridSnapCrossData(face)
+    if not (face and face._magicAlignWorldGridSnapReady) then return end
+
+    local lines = face._magicAlignWorldGridSnapLines
+    local lineCount = face._magicAlignWorldGridSnapLineCount or 0
     if not istable(lines) or (lineCount or 0) <= 0 then return end
 
-    local color = prop2BlueColor(GRID_CONFIG.snapLineAlpha)
+    local color = client.worldGridRender.cursorLineColor or prop2BlueColor(GRID_CONFIG.snapLineAlpha)
     for i = 1, lineCount do
         local line = lines[i]
         if line and line.a and line.b then
@@ -1639,6 +1656,9 @@ function client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlay, alpha
     if batch and batch.sourceVersion == renderData.version then
         batch.material = material
         batch.materialEntry = materialEntry
+        batch.surfaceData = face and face.surface or batch.surfaceData
+        batch.alpha = alpha
+        batch.lineMode = lineMode
         return batch
     end
 
@@ -1669,6 +1689,9 @@ function client.worldGridRender.ensureWorldGridSurfaceBatch(face, overlay, alpha
 
     batch.material = material
     batch.materialEntry = materialEntry
+    batch.surfaceData = face and face.surface or nil
+    batch.alpha = alpha
+    batch.lineMode = lineMode
     batch.sourceVersion = renderData.version
     batch.vertexCount = writeIndex
     batch.triangleCount = math.floor(writeIndex / 3)
@@ -1711,13 +1734,565 @@ function client.worldGridRender.prepareWorldGridSurface(face, alpha)
     return batches, batchCount
 end
 
-function client.worldGridRender.pushWorldGridBatchVertex(vertex)
+(function()
+local queueConfig = client.worldGridRender.queueConfig
+
+local function worldGridQueueNow()
+    if SysTime and isfunction(SysTime) then
+        return SysTime()
+    end
+    return RealTime()
+end
+
+local function worldGridFrameBudgetMs()
+    local frameSeconds = FrameTime and isfunction(FrameTime) and FrameTime() or nil
+    local frameMs = tonumber(frameSeconds) and frameSeconds * 1000 or queueConfig.fallbackFrameMs
+    if frameMs <= 0 then
+        frameMs = queueConfig.fallbackFrameMs
+    end
+
+    local fraction = math.Clamp(tonumber(queueConfig.frameBudgetFraction) or 0.10, 0.001, 1)
+    return frameMs * fraction
+end
+
+local function worldGridQueueBudgetMs(settings)
+    local configured = tonumber(settings and (settings.worldBspRenderBudgetMs or settings.worldBspBudgetMs))
+        or queueConfig.defaultBudgetMs
+    configured = math.Clamp(configured, 0, queueConfig.maxBudgetMs)
+    return math.min(configured, worldGridFrameBudgetMs())
+end
+
+local function worldGridRequestKey(face)
+    return ("%.6f:%d:%d"):format(
+        tonumber(face and face.globalGridStep) or 0,
+        face and face.worldBspFullGrid == false and 0 or 1,
+        client.worldGridRender.rtConfig and client.worldGridRender.rtConfig.alphaRtVersion or 0
+    )
+end
+
+local function worldGridJobOwner(surfaceData)
+    if not surfaceData then return end
+    return surfaceData.displacementGroup or surfaceData
+end
+
+local function worldGridJobStore(owner)
+    if not owner then return end
+
+    local jobs = owner._magicAlignWorldGridRenderJobs
+    if not istable(jobs) then
+        jobs = {}
+        owner._magicAlignWorldGridRenderJobs = jobs
+    end
+
+    return jobs
+end
+
+local function worldGridOverlayAlpha(alpha, overlay)
+    local overlayAlpha = tonumber(alpha) or 0
+    if overlay and overlay.alphaScale then
+        overlayAlpha = overlayAlpha * math.Clamp(tonumber(overlay.alphaScale) or 1, 0, 1)
+    end
+
+    return math.Clamp(math.floor(overlayAlpha + 0.5), 0, 255)
+end
+
+local function worldGridOverlayLineMode(face, overlay)
+    local lineMode = overlay and overlay.lineMode or "full"
+    if lineMode == "full" and face and face.worldBspFullGrid == false then
+        return "cross"
+    end
+
+    return lineMode
+end
+
+local function worldGridUnitKey(face, overlay, alpha, lineMode)
+    return ("%s:%s:%s:%s:%d"):format(
+        tostring(face and face.surface or ""),
+        tostring(overlay and overlay.axisU or ""),
+        tostring(overlay and overlay.axisV or ""),
+        tostring(lineMode or ""),
+        math.Clamp(math.floor(tonumber(alpha) or 0), 0, 255)
+    )
+end
+
+local function worldGridUnitQueued(job, unit)
+    if not (job and unit) then return false end
+
+    local units = job.units
+    local index = tonumber(unit.index)
+    if index and units and units[index] == unit then
+        return true
+    end
+
+    local limit = job.unitCount or (units and #units or 0)
+    for i = 1, limit do
+        if units[i] == unit then
+            unit.index = i
+            return true
+        end
+    end
+
+    return false
+end
+
+local function registerWorldGridPrimaryUnit(job, surfaceData)
+    if not (job and surfaceData) then return end
+
+    job.unitsBySurface = job.unitsBySurface or {}
+    job.unitsBySurface[surfaceData] = true
+    job.primaryUnitsBySurface = job.primaryUnitsBySurface or {}
+    job.primaryUnitsBySurface[surfaceData] = true
+end
+
+local function registerWorldGridSurfaceUnit(job, surfaceData)
+    if not (job and surfaceData) then return end
+
+    job.unitsBySurface = job.unitsBySurface or {}
+    job.unitsBySurface[surfaceData] = true
+end
+
+local function activateWorldGridJob(job)
+    if not job or job._magicAlignQueueActive then return end
+
+    local queue = client.worldGridRender.renderQueue
+    local activeJobs = queue.activeJobs
+    activeJobs[#activeJobs + 1] = job
+    job._magicAlignQueueActive = true
+end
+
+local function pushWorldGridPriorityUnit(job, unit)
+    if not job or not unit or unit.done or unit.failed or unit.priorityQueued then return end
+
+    local priorityUnits = job.priorityUnits
+    job.priorityUnitCount = (job.priorityUnitCount or 0) + 1
+    priorityUnits[job.priorityUnitCount] = unit
+    unit.priorityQueued = true
+end
+
+local function appendWorldGridSurfaceUnits(job, face, alpha, primary)
+    local overlays = face and face.globalGridOverlays
+    local surfaceData = face and face.surface
+    if not (job and surfaceData and istable(overlays)) then return false end
+
+    local registered = false
+    for i = 1, #overlays do
+        local overlay = overlays[i]
+        if overlay and overlay.axisU and overlay.axisV then
+            local overlayAlpha = worldGridOverlayAlpha(alpha, overlay)
+            local lineMode = worldGridOverlayLineMode(face, overlay)
+            local key = worldGridUnitKey(face, overlay, overlayAlpha, lineMode)
+            local unit = job.unitsByKey[key]
+            if unit and (unit.surfaceData ~= surfaceData or not worldGridUnitQueued(job, unit)) then
+                job.unitsByKey[key] = nil
+                unit = nil
+            end
+
+            if not unit then
+                local index = (job.unitCount or 0) + 1
+                unit = {
+                    key = key,
+                    face = face,
+                    surfaceData = surfaceData,
+                    overlay = overlay,
+                    alpha = overlayAlpha,
+                    primary = primary == true,
+                    lineMode = lineMode,
+                    index = index
+                }
+
+                job.unitCount = index
+                job.units[index] = unit
+                job.unitsByKey[key] = unit
+                job.totalUnits = (job.totalUnits or 0) + 1
+            elseif primary then
+                unit.face = face
+                unit.primary = true
+            end
+
+            registered = registered or unit.surfaceData == surfaceData
+            if unit.surfaceData == surfaceData then
+                registerWorldGridSurfaceUnit(job, surfaceData)
+            end
+            if primary then
+                pushWorldGridPriorityUnit(job, unit)
+                if unit.surfaceData == surfaceData then
+                    registerWorldGridPrimaryUnit(job, surfaceData)
+                end
+            end
+        end
+    end
+
+    if primary and registered then
+        job.seededPrimaryBySurface = job.seededPrimaryBySurface or {}
+        job.seededPrimaryBySurface[surfaceData] = true
+    end
+
+    return registered
+end
+
+local function seedWorldGridJob(job, face, includeNeighbors)
+    appendWorldGridSurfaceUnits(job, face, GRID_CONFIG.bspGlobalAlpha, true)
+
+    if includeNeighbors then
+        local neighbors = face and face.globalGridNeighbors
+        if istable(neighbors) then
+            for i = 1, #neighbors do
+                appendWorldGridSurfaceUnits(job, neighbors[i], GRID_CONFIG.bspGlobalNeighborAlpha, false)
+            end
+        end
+    end
+
+    if (job.doneUnits or 0) < (job.totalUnits or 0) then
+        activateWorldGridJob(job)
+    end
+end
+
+local function worldGridVisibleNeighborSet(job, face)
+    local surfaceData = face and face.surface
+    if not (job and surfaceData) then return end
+
+    local sets = job.visibleNeighborSetBySurface
+    if not istable(sets) then
+        sets = {}
+        job.visibleNeighborSetBySurface = sets
+    end
+    local cached = sets[surfaceData]
+    if cached then return cached end
+
+    cached = {}
+    local neighbors = face.globalGridNeighbors
+    if istable(neighbors) then
+        for i = 1, #neighbors do
+            local neighborSurface = neighbors[i] and neighbors[i].surface
+            if neighborSurface then
+                cached[neighborSurface] = true
+            end
+        end
+    end
+
+    sets[surfaceData] = cached
+    return cached
+end
+
+local function worldGridJobHasPrimarySurface(job, surfaceData)
+    if not (job and surfaceData) then return false end
+
+    local primary = job.readyPrimaryBySurface and job.readyPrimaryBySurface[surfaceData]
+    if primary and (primary.count or 0) > 0 then return true end
+
+    local registered = job.primaryUnitsBySurface
+    if registered and registered[surfaceData] then return true end
+
+    local units = job.units
+    local limit = job.unitCount or (units and #units or 0)
+    for i = 1, limit do
+        local unit = units and units[i]
+        if unit and unit.surfaceData == surfaceData and unit.primary then
+            registerWorldGridPrimaryUnit(job, surfaceData)
+            return true
+        end
+    end
+
+    return false
+end
+
+local function worldGridFaceNeedsUnit(face)
+    local overlays = face and face.globalGridOverlays
+    if not istable(overlays) then return false end
+
+    for i = 1, #overlays do
+        local overlay = overlays[i]
+        if overlay and overlay.axisU and overlay.axisV then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function worldGridJobHasSurfaceUnit(job, surfaceData)
+    if not (job and surfaceData) then return false end
+
+    local registered = job.unitsBySurface
+    if registered and registered[surfaceData] then return true end
+
+    local units = job.units
+    local limit = job.unitCount or (units and #units or 0)
+    for i = 1, limit do
+        local unit = units and units[i]
+        if unit and unit.surfaceData == surfaceData then
+            registerWorldGridSurfaceUnit(job, surfaceData)
+            return true
+        end
+    end
+
+    return false
+end
+
+local function worldGridJobCoversFace(job, face)
+    if not (job and face and face.surface) then return false end
+
+    if worldGridFaceNeedsUnit(face) and not worldGridJobHasPrimarySurface(job, face.surface) then
+        return false
+    end
+
+    local neighbors = face.globalGridNeighbors
+    if istable(neighbors) then
+        for i = 1, #neighbors do
+            local neighbor = neighbors[i]
+            if worldGridFaceNeedsUnit(neighbor) and not worldGridJobHasSurfaceUnit(job, neighbor.surface) then
+                return false
+            end
+        end
+    end
+
+    return true
+end
+
+local function publishWorldGridBatch(job, unit, batch)
+    if not job or not unit or not batch then return end
+
+    if unit.primary then
+        local bySurface = job.readyPrimaryBySurface
+        local surfaceData = unit.surfaceData
+        local surfaceBatches = bySurface[surfaceData]
+        if not surfaceBatches then
+            surfaceBatches = { count = 0, seen = {} }
+            bySurface[surfaceData] = surfaceBatches
+        end
+
+        if not surfaceBatches.seen[batch] then
+            surfaceBatches.seen[batch] = true
+            surfaceBatches.count = surfaceBatches.count + 1
+            surfaceBatches[surfaceBatches.count] = batch
+        end
+
+        return
+    end
+
+    if job.readyNeighborBatchSeen[batch] then return end
+
+    job.readyNeighborBatchSeen[batch] = true
+    job.readyNeighborBatchCount = (job.readyNeighborBatchCount or 0) + 1
+    job.readyNeighborBatches[job.readyNeighborBatchCount] = batch
+end
+
+local function nextWorldGridUnit(job)
+    local priorityUnits = job.priorityUnits
+    while (job.priorityUnitCount or 0) > 0 do
+        local index = job.priorityUnitCount
+        local unit = priorityUnits[index]
+        priorityUnits[index] = nil
+        job.priorityUnitCount = index - 1
+
+        if unit then
+            unit.priorityQueued = false
+            if not unit.done and not unit.failed then
+                return unit
+            end
+        end
+    end
+
+    local units = job.units
+    local cursor = tonumber(job.cursor) or 1
+    while cursor <= (job.unitCount or #units) do
+        local unit = units[cursor]
+        cursor = cursor + 1
+        job.cursor = cursor
+
+        if unit and not unit.done and not unit.failed then
+            return unit
+        end
+    end
+end
+
+local function buildWorldGridUnit(job, unit)
+    if not job or not unit or unit.done or unit.failed then return end
+
+    unit.building = true
+    local ok, batch = pcall(client.worldGridRender.ensureWorldGridSurfaceBatch, unit.face, unit.overlay, unit.alpha)
+    unit.building = false
+    unit.done = true
+    job.doneUnits = (job.doneUnits or 0) + 1
+
+    if not ok then
+        unit.failed = true
+        job.failedUnits = (job.failedUnits or 0) + 1
+        job.lastError = tostring(batch)
+        return
+    end
+
+    publishWorldGridBatch(job, unit, batch)
+end
+
+local function processWorldGridJob(job, deadline)
+    if not job or (job.doneUnits or 0) >= (job.totalUnits or 0) then return end
+
+    while worldGridQueueNow() < deadline do
+        local unit = nextWorldGridUnit(job)
+        if not unit then return end
+
+        buildWorldGridUnit(job, unit)
+        if (job.doneUnits or 0) >= (job.totalUnits or 0) then return end
+    end
+end
+
+local function compactWorldGridActiveJobs(nowTime)
+    local queue = client.worldGridRender.renderQueue
+    local activeJobs = queue.activeJobs
+    local writeIndex = 0
+
+    for i = 1, #activeJobs do
+        local job = activeJobs[i]
+        local active = job
+            and (job.doneUnits or 0) < (job.totalUnits or 0)
+            and nowTime - (tonumber(job.lastTouched) or nowTime) <= queueConfig.inactiveJobSeconds
+
+        if active then
+            writeIndex = writeIndex + 1
+            activeJobs[writeIndex] = job
+            job._magicAlignQueueActive = true
+        elseif job then
+            job._magicAlignQueueActive = false
+        end
+    end
+
+    for i = writeIndex + 1, #activeJobs do
+        activeJobs[i] = nil
+    end
+end
+
+function client.worldGridRender.requestWorldBspGlobalGrid(face)
+    if not (face and face.worldBSP and face.globalGrid and face.surface) then return end
+
+    local key = worldGridRequestKey(face)
+    local frame = isfunction(FrameNumber) and FrameNumber() or nil
+    if frame ~= nil
+        and face._magicAlignWorldGridRequestFrame == frame
+        and face._magicAlignWorldGridRequestKey == key then
+        local job = face._magicAlignWorldGridJob
+        if job then
+            return job
+        end
+    end
+
+    local owner = worldGridJobOwner(face.surface)
+    local jobs = worldGridJobStore(owner)
+    if not jobs then return end
+
+    local job = jobs[key]
+    if not job then
+        job = {
+            key = key,
+            owner = owner,
+            units = {},
+            unitsByKey = {},
+            priorityUnits = {},
+            readyNeighborBatches = {},
+            readyNeighborBatchSeen = {},
+            readyPrimaryBySurface = {},
+            unitsBySurface = {},
+            primaryUnitsBySurface = {},
+            seededPrimaryBySurface = {},
+            visibleNeighborSetBySurface = {},
+            cursor = 1,
+            totalUnits = 0,
+            doneUnits = 0,
+            failedUnits = 0,
+            readyNeighborBatchCount = 0
+        }
+        jobs[key] = job
+    else
+        job.unitsBySurface = job.unitsBySurface or {}
+        job.primaryUnitsBySurface = job.primaryUnitsBySurface or {}
+        job.seededPrimaryBySurface = job.seededPrimaryBySurface or {}
+        job.readyPrimaryBySurface = job.readyPrimaryBySurface or {}
+    end
+
+    local nowTime = worldGridQueueNow()
+    local coversFace = worldGridJobCoversFace(job, face)
+    if face._magicAlignWorldGridJob == job
+        and face._magicAlignWorldGridRequestKey == key
+        and job.seeded
+        and job.lastRequestedSurface == face.surface
+        and coversFace then
+        job.lastTouched = nowTime
+        job.currentSurface = face.surface
+        job.currentFace = face
+        face._magicAlignWorldGridVisibleNeighborSet = face._magicAlignWorldGridVisibleNeighborSet or worldGridVisibleNeighborSet(job, face)
+        face._magicAlignWorldGridProgressDone = job.doneUnits or 0
+        face._magicAlignWorldGridProgressTotal = job.totalUnits or 0
+        face._magicAlignWorldGridRequestFrame = frame
+        client.worldGridRender.renderQueue.focusJob = job
+        client.worldGridRender.renderQueue.focusTouchedAt = nowTime
+        return job
+    end
+
+    job.lastTouched = nowTime
+    job.currentSurface = face.surface
+    job.currentFace = face
+
+    local includeNeighbors = not coversFace or not job.seeded or job.lastRequestedSurface ~= face.surface
+    seedWorldGridJob(job, face, includeNeighbors)
+    job.seeded = true
+    job.lastRequestedSurface = face.surface
+
+    face._magicAlignWorldGridJob = job
+    face._magicAlignWorldGridRequestKey = key
+    face._magicAlignWorldGridRequestFrame = frame
+    face._magicAlignWorldGridVisibleNeighborSet = worldGridVisibleNeighborSet(job, face)
+    face._magicAlignWorldGridProgressDone = job.doneUnits or 0
+    face._magicAlignWorldGridProgressTotal = job.totalUnits or 0
+
+    client.worldGridRender.renderQueue.focusJob = job
+    client.worldGridRender.renderQueue.focusTouchedAt = nowTime
+    return job
+end
+
+function client.worldGridRender.processQueue(settings)
+    local queue = client.worldGridRender.renderQueue
+    queue.frame = (queue.frame or 0) + 1
+
+    local nowTime = worldGridQueueNow()
+    local budgetMs = worldGridQueueBudgetMs(settings)
+    local deadline = nowTime + budgetMs * 0.001
+    local focusJob = queue.focusJob
+    if focusJob and nowTime - (tonumber(queue.focusTouchedAt) or 0) > 0.2 then
+        queue.focusJob = nil
+        focusJob = nil
+    end
+
+    if focusJob then
+        processWorldGridJob(focusJob, deadline)
+    end
+
+    local activeJobs = queue.activeJobs
+    local processed = 0
+    for i = 1, #activeJobs do
+        if worldGridQueueNow() >= deadline then break end
+
+        local job = activeJobs[i]
+        if job and job ~= focusJob then
+            processWorldGridJob(job, deadline)
+            processed = processed + 1
+            if processed >= queueConfig.maxJobsPerFrame then
+                break
+            end
+        end
+    end
+
+    compactWorldGridActiveJobs(worldGridQueueNow())
+end
+end)()
+
+function client.worldGridRender.pushWorldGridBatchVertex(vertex, alphaScale)
     if not vertex or not vertex.pos then return end
 
     local color = vertex.color or color_white
+    alphaScale = math.Clamp(tonumber(alphaScale) or 1, 0, 1)
     meshPosition(vertex.pos)
     mesh.TexCoord(0, vertex.u or 0, vertex.v or 0)
-    mesh.Color(color.r, color.g, color.b, color.a)
+    mesh.Color(color.r, color.g, color.b, math.Clamp(math.floor((color.a or 255) * alphaScale + 0.5), 0, 255))
     mesh.AdvanceVertex()
 end
 
@@ -1725,14 +2300,15 @@ function client.worldGridRender.drawWorldGridSurfaceBatch(batch)
     if not batch or not batch.material or (batch.vertexCount or 0) <= 0 then return end
     if batch.materialEntry and batch.materialEntry.ready ~= true then return end
 
+    local alphaScale = client.worldGridRender.currentLightBlend and client.worldGridRender.currentLightBlend() or 1
     local pushedMin, pushedMag = client.worldGridRender.pushWorldGridTextureFilter()
     render.SetMaterial(batch.material)
-    if batch.meshReady and batch.mesh and isfunction(batch.mesh.Draw) then
+    if alphaScale >= 0.999 and batch.meshReady and batch.mesh and isfunction(batch.mesh.Draw) then
         batch.mesh:Draw()
     else
         mesh.Begin(MATERIAL_TRIANGLES, batch.triangleCount or math.floor((batch.vertexCount or 0) / 3))
             for i = 1, batch.vertexCount do
-                client.worldGridRender.pushWorldGridBatchVertex(batch.vertices[i])
+                client.worldGridRender.pushWorldGridBatchVertex(batch.vertices[i], alphaScale)
             end
         mesh.End()
     end
@@ -1742,17 +2318,6 @@ end
 function client.worldGridRender.drawWorldGridSurface(face, alpha)
     local batches = face and face._magicAlignWorldGridBatches
     local batchCount = face and face._magicAlignWorldGridBatchCount or 0
-    local fullGrid = face and face.worldBspFullGrid ~= false
-    local rtVersion = client.worldGridRender.rtConfig and client.worldGridRender.rtConfig.alphaRtVersion or 0
-    if face
-        and (
-            face._magicAlignWorldGridPreparedAlpha ~= alpha
-            or face._magicAlignWorldGridPreparedFullGrid ~= fullGrid
-            or face._magicAlignWorldGridPreparedRtVersion ~= rtVersion
-        )
-    then
-        batches, batchCount = client.worldGridRender.prepareWorldGridSurface(face, alpha)
-    end
     if not istable(batches) or (batchCount or 0) <= 0 then return end
 
     for i = 1, batchCount do
@@ -1761,51 +2326,290 @@ function client.worldGridRender.drawWorldGridSurface(face, alpha)
 end
 
 function client.worldGridRender.prepareWorldBspGlobalGrid(face)
-    local fullGrid = face and face.worldBspFullGrid ~= false
     if not face then return end
-    if face._magicAlignWorldGridGlobalPrepared
-        and face._magicAlignWorldGridGlobalPreparedFullGrid == fullGrid then
-        return
-    end
 
-    local neighbors = face and face.globalGridNeighbors
-    if istable(neighbors) then
-        for i = 1, #neighbors do
-            client.worldGridRender.prepareWorldGridSurface(neighbors[i], GRID_CONFIG.bspGlobalNeighborAlpha)
-        end
-    end
-
-    client.worldGridRender.prepareWorldGridSurface(face, GRID_CONFIG.bspGlobalAlpha)
     client.worldGridRender.ensureWorldGridSnapCrossData(face)
-    face._magicAlignWorldGridGlobalPrepared = true
-    face._magicAlignWorldGridGlobalPreparedFullGrid = fullGrid
+    return client.worldGridRender.requestWorldBspGlobalGrid(face)
 end
 
 function client.prepareWorldBspRenderCandidate(candidate)
     local face = candidate and candidate.face
     if not (face and face.worldBSP) then return end
-    if candidate._magicAlignWorldBspRenderPrepared then return end
-    candidate._magicAlignWorldBspRenderPrepared = true
+
+    local frame = isfunction(FrameNumber) and FrameNumber() or nil
+    local token = face.surface
+    if frame ~= nil
+        and candidate._magicAlignPreparedFrame == frame
+        and candidate._magicAlignPreparedFace == face
+        and candidate._magicAlignPreparedToken == token then
+        return
+    end
+    candidate._magicAlignPreparedFrame = frame
+    candidate._magicAlignPreparedFace = face
+    candidate._magicAlignPreparedToken = token
 
     client.worldGridRender.ensureWorldBspRenderData(face.surface)
     if face.globalGrid then
-        client.worldGridRender.prepareWorldBspGlobalGrid(face)
+        client.worldGridRender.ensureWorldGridSnapCrossData(face)
+        client.worldGridRender.requestWorldBspGlobalGrid(face)
     end
 end
 
 function client.worldGridRender.drawWorldBspGlobalGrid(face)
-    client.worldGridRender.prepareWorldBspGlobalGrid(face)
+    local job = face and face._magicAlignWorldGridJob
+    if not job then return end
 
-    local neighbors = face and face.globalGridNeighbors
-    if istable(neighbors) then
-        for i = 1, #neighbors do
-            client.worldGridRender.drawWorldGridSurface(neighbors[i], GRID_CONFIG.bspGlobalNeighborAlpha)
+    local surfaceData = face.surface
+    local visibleNeighbors = face._magicAlignWorldGridVisibleNeighborSet
+    local primary = job.readyPrimaryBySurface and job.readyPrimaryBySurface[surfaceData]
+    local primaryCount = primary and primary.count or 0
+    local neighborBatches = job.readyNeighborBatches
+    for i = 1, (job.readyNeighborBatchCount or 0) do
+        local batch = neighborBatches[i]
+        if batch
+            and (batch.surfaceData ~= surfaceData or primaryCount <= 0)
+            and (batch.surfaceData == surfaceData or not visibleNeighbors or visibleNeighbors[batch.surfaceData]) then
+            client.worldGridRender.drawWorldGridSurfaceBatch(batch)
         end
     end
 
-    client.worldGridRender.drawWorldGridSurface(face, GRID_CONFIG.bspGlobalAlpha)
+    if primary then
+        for i = 1, primaryCount do
+            client.worldGridRender.drawWorldGridSurfaceBatch(primary[i])
+        end
+    end
+
     client.worldGridRender.drawWorldGridSnapCross(face)
 end
+
+(function()
+local function debugBool(value)
+    return value and "yes" or "no"
+end
+
+local function debugSurfaceId(surfaceData)
+    return tostring(surfaceData and surfaceData.id or "nil")
+end
+
+local function debugHoverFace()
+    local state = M.ClientState
+    local hover = state and state.hover
+    local candidate = hover and (hover.candidate or hover.overlay)
+    return candidate and candidate.face or nil
+end
+
+local function debugOverlayList(face)
+    local overlays = face and face.globalGridOverlays
+    if not istable(overlays) then return "nil" end
+
+    local out = {}
+    for i = 1, #overlays do
+        local overlay = overlays[i]
+        out[#out + 1] = ("%s/%s/%s"):format(
+            tostring(overlay and overlay.axisU or "?"),
+            tostring(overlay and overlay.axisV or "?"),
+            tostring(overlay and overlay.lineMode or "full")
+        )
+    end
+
+    return table.concat(out, ",")
+end
+
+local function debugBatchDrawable(batch)
+    if not batch or not batch.material or (batch.vertexCount or 0) <= 0 then return false end
+    return not batch.materialEntry or batch.materialEntry.ready == true
+end
+
+local function countPrimaryBatches(job, surfaceData)
+    local primary = job and job.readyPrimaryBySurface and job.readyPrimaryBySurface[surfaceData]
+    local count = primary and (primary.count or 0) or 0
+    local drawable = 0
+    for i = 1, count do
+        if debugBatchDrawable(primary[i]) then
+            drawable = drawable + 1
+        end
+    end
+
+    return count, drawable
+end
+
+local function countSurfaceUnits(job, surfaceData)
+    local unitCount = 0
+    local primaryCount = 0
+    local doneCount = 0
+    local failedCount = 0
+    local buildingCount = 0
+    local sameIdCount = 0
+    local id = surfaceData and surfaceData.id
+
+    local units = job and job.units
+    local limit = job and (job.unitCount or (units and #units or 0)) or 0
+    for i = 1, limit do
+        local unit = units and units[i]
+        if unit and unit.surfaceData == surfaceData then
+            unitCount = unitCount + 1
+            if unit.primary then primaryCount = primaryCount + 1 end
+            if unit.done then doneCount = doneCount + 1 end
+            if unit.failed then failedCount = failedCount + 1 end
+            if unit.building then buildingCount = buildingCount + 1 end
+        elseif unit and id ~= nil and unit.surfaceData and unit.surfaceData.id == id then
+            sameIdCount = sameIdCount + 1
+        end
+    end
+
+    return unitCount, primaryCount, doneCount, failedCount, buildingCount, sameIdCount
+end
+
+local function countNeighborBatches(job, surfaceData)
+    local count = 0
+    local drawable = 0
+    local batches = job and job.readyNeighborBatches
+    for i = 1, job and (job.readyNeighborBatchCount or 0) or 0 do
+        local batch = batches and batches[i]
+        if batch and batch.surfaceData == surfaceData then
+            count = count + 1
+            if debugBatchDrawable(batch) then
+                drawable = drawable + 1
+            end
+        end
+    end
+
+    return count, drawable
+end
+
+local function groupGapSummary(job, face)
+    local surfaceData = face and face.surface
+    local group = surfaceData and surfaceData.displacementGroup
+    local surfaces = group and group.surfaces
+    if not istable(surfaces) then return end
+
+    local visibleSet = face._magicAlignWorldGridVisibleNeighborSet
+    local missing = {}
+    local notVisible = {}
+    local noUnits = {}
+    local failed = {}
+    local readyCount = 0
+    local drawableCount = 0
+    local registered = job and job.unitsBySurface
+
+    for i = 1, #surfaces do
+        local surface = surfaces[i]
+        local primaryReady, primaryDrawable = countPrimaryBatches(job, surface)
+        local neighborReady, neighborDrawable = countNeighborBatches(job, surface)
+        local unitCount, _primaryCount, _doneCount, failedCount = countSurfaceUnits(job, surface)
+        local visible = surface == surfaceData or not visibleSet or visibleSet[surface] == true
+        local hasReady = primaryReady > 0 or neighborReady > 0
+        local hasDrawable = primaryDrawable > 0 or neighborDrawable > 0
+        local hasSurfaceUnit = registered and registered[surface] == true
+
+        if hasReady then readyCount = readyCount + 1 end
+        if hasDrawable then drawableCount = drawableCount + 1 end
+        if not visible and #notVisible < 16 then notVisible[#notVisible + 1] = surface.id end
+        if unitCount <= 0 and #noUnits < 16 then noUnits[#noUnits + 1] = surface.id end
+        if failedCount > 0 and #failed < 16 then failed[#failed + 1] = surface.id end
+        if visible and not hasDrawable and not hasSurfaceUnit and #missing < 16 then
+            missing[#missing + 1] = surface.id
+        end
+    end
+
+    print(("Magic Align: World BSP grid group: group=%s surfaces=%d readySurfaces=%d drawableSurfaces=%d missingVisibleNoDrawableOrUnit(first16)=%s noUnits(first16)=%s notVisible(first16)=%s failed(first16)=%s."):format(
+        tostring(group.index or "?"),
+        #surfaces,
+        readyCount,
+        drawableCount,
+        table.concat(missing, ","),
+        table.concat(noUnits, ","),
+        table.concat(notVisible, ","),
+        table.concat(failed, ",")
+    ))
+end
+
+function client.worldGridRender.debugWorldBspGlobalGrid()
+    local face = debugHoverFace()
+    if not (face and face.worldBSP and face.surface) then
+        print("Magic Align: World BSP grid debug: no hovered world BSP face.")
+        return
+    end
+
+    local surfaceData = face.surface
+    local group = surfaceData.displacementGroup
+    local job = face._magicAlignWorldGridJob
+    local primaryReady, primaryDrawable = countPrimaryBatches(job, surfaceData)
+    local neighborReady, neighborDrawable = countNeighborBatches(job, surfaceData)
+    local units, primaryUnits, doneUnits, failedUnits, buildingUnits, sameIdUnits = countSurfaceUnits(job, surfaceData)
+    local surfaceRegistered = job and job.unitsBySurface and job.unitsBySurface[surfaceData] == true
+    local primaryRegistered = job and job.primaryUnitsBySurface and job.primaryUnitsBySurface[surfaceData] == true
+    local seededPrimary = job and job.seededPrimaryBySurface and job.seededPrimaryBySurface[surfaceData] == true
+    local visibleSet = face._magicAlignWorldGridVisibleNeighborSet
+    local visibleSelf = not visibleSet or visibleSet[surfaceData] == true
+
+    print(("Magic Align: World BSP grid debug: surface=%s group=%s groupSurfaces=%d neighbors=%d globalGrid=%s overlays=%d[%s] step=%.6f fullGrid=%s."):format(
+        debugSurfaceId(surfaceData),
+        tostring(group and group.index or "nil"),
+        group and istable(group.surfaces) and #group.surfaces or 0,
+        face.globalGridNeighbors and #face.globalGridNeighbors or 0,
+        debugBool(face.globalGrid),
+        face.globalGridOverlays and #face.globalGridOverlays or 0,
+        debugOverlayList(face),
+        tonumber(face.globalGridStep) or 0,
+        debugBool(face.worldBspFullGrid ~= false)
+    ))
+
+    if not job then
+        print("Magic Align: World BSP grid job: nil.")
+        return
+    end
+
+    print(("Magic Align: World BSP grid job: seeded=%s active=%s jobKey=%s faceKey=%s lastSurface=%s currentSurface=%s done=%d total=%d failed=%d cursor=%d priority=%d readyNeighbors=%d focus=%s error=%s."):format(
+        debugBool(job.seeded),
+        debugBool(job._magicAlignQueueActive),
+        tostring(job.key or "nil"),
+        tostring(face._magicAlignWorldGridRequestKey or "nil"),
+        debugSurfaceId(job.lastRequestedSurface),
+        debugSurfaceId(job.currentSurface),
+        tonumber(job.doneUnits) or 0,
+        tonumber(job.totalUnits) or 0,
+        tonumber(job.failedUnits) or 0,
+        tonumber(job.cursor) or 0,
+        tonumber(job.priorityUnitCount) or 0,
+        tonumber(job.readyNeighborBatchCount) or 0,
+        debugBool(client.worldGridRender.renderQueue and client.worldGridRender.renderQueue.focusJob == job),
+        tostring(job.lastError or "nil")
+    ))
+
+    print(("Magic Align: World BSP grid surface: surfaceRegistered=%s primaryRegistered=%s seededMarker=%s primaryReady=%d/%d neighborReady=%d/%d units=%d primaryUnits=%d done=%d failed=%d building=%d sameIdUnits=%d visibleSelf=%s snapReady=%s progress=%d/%d."):format(
+        debugBool(surfaceRegistered),
+        debugBool(primaryRegistered),
+        debugBool(seededPrimary),
+        primaryReady,
+        primaryDrawable,
+        neighborReady,
+        neighborDrawable,
+        units,
+        primaryUnits,
+        doneUnits,
+        failedUnits,
+        buildingUnits,
+        sameIdUnits,
+        debugBool(visibleSelf),
+        debugBool(face._magicAlignWorldGridSnapReady),
+        tonumber(face._magicAlignWorldGridProgressDone) or 0,
+        tonumber(face._magicAlignWorldGridProgressTotal) or 0
+    ))
+
+    groupGapSummary(job, face)
+end
+
+if concommand and isfunction(concommand.Add) then
+    if isfunction(concommand.Remove) then
+        concommand.Remove("magic_align_world_bsp_debug_grid")
+    end
+
+    concommand.Add("magic_align_world_bsp_debug_grid", function()
+        client.worldGridRender.debugWorldBspGlobalGrid()
+    end)
+end
+end)()
 
 local function queueShapeCacheWarmup(tool, qualityIndex)
     local settings = qualityIndex ~= nil and ringRenderSettingsForIndex(qualityIndex)
@@ -1829,6 +2633,11 @@ local function queueShapeCacheWarmup(tool, qualityIndex)
 end
 
 local function selectionColor(state)
+    if state and state.preview and state.preview.transformMode == M.TRANSFORM_MODE_MIRROR then
+        local mirror = colors.mirror or Color(176, 112, 235)
+        return cachedColor(mirror.r, mirror.g, mirror.b, 255)
+    end
+
     return cachedColor(colors.source.r, colors.source.g, colors.source.b, 255)
 end
 
@@ -1932,12 +2741,13 @@ local function previewOccludedPickerColor(tool)
     )
 end
 
-local function scaledOccludedPreviewColor(tool, holoAlpha)
+local function scaledOccludedPreviewColor(tool, holoAlpha, stripeColorOverride)
     local picker = previewOccludedPickerColor(tool)
     local alpha = math.Clamp(math.floor((picker.a / 255) * clampColorByte(holoAlpha, 0) + 0.5), 0, 255)
     if alpha <= 0 then return end
 
-    return cachedColor(picker.r, picker.g, picker.b, alpha)
+    local source = stripeColorOverride or picker
+    return cachedColor(source.r, source.g, source.b, alpha)
 end
 
 local function stencilAvailable()
@@ -2080,12 +2890,12 @@ local function drawScreenStripePattern(color, tileSize, centerX, centerY)
     return true
 end
 
-local function drawPreviewOccludedGhost(tool, ghost, baseAlpha)
+local function drawPreviewOccludedGhost(tool, ghost, baseAlpha, stripeColorOverride)
     if not IsValid(ghost) or (ghost.GetNoDraw and ghost:GetNoDraw()) then return end
     if not stencilAvailable() then return end
 
     local ghostColor = ghost:GetColor()
-    local overlayColor = scaledOccludedPreviewColor(tool, baseAlpha or ghostColor.a or 255)
+    local overlayColor = scaledOccludedPreviewColor(tool, baseAlpha or ghostColor.a or 255, stripeColorOverride)
     if not overlayColor then return end
 
     render.ClearStencil()
@@ -2119,21 +2929,21 @@ local function drawPreviewOccludedGhost(tool, ghost, baseAlpha)
     render.SetStencilEnable(false)
 end
 
-local function drawPreviewOccludedCompatEntry(tool, entry)
+local function drawPreviewOccludedCompatEntry(tool, entry, stripeColorOverride)
     if not istable(entry) or not IsValid(entry.ghost) then return end
 
     local color = entry.color or entry.ghost:GetColor()
-    drawPreviewOccludedGhost(tool, entry.ghost, color and color.a or nil)
+    drawPreviewOccludedGhost(tool, entry.ghost, color and color.a or nil, stripeColorOverride)
 end
 
-local function drawPreviewOccludedCompatGhosts(tool, state)
+local function drawPreviewOccludedCompatGhosts(tool, state, stripeColorOverride)
     local ghosts = state and state.compatGhosts
     if not istable(ghosts) then return end
 
-    drawPreviewOccludedCompatEntry(tool, ghosts.main)
+    drawPreviewOccludedCompatEntry(tool, ghosts.main, stripeColorOverride)
 
     for _, entry in pairs(ghosts.linked or {}) do
-        drawPreviewOccludedCompatEntry(tool, entry)
+        drawPreviewOccludedCompatEntry(tool, entry, stripeColorOverride)
     end
 end
 
@@ -2180,7 +2990,11 @@ local function beginBillboard(worldPos, viewerPos)
     end
 
     local ang = toViewer:Angle()
-    ang = M.RotateAngleAroundAxisPrecise(ang, M.AngleRightPrecise(ang), -90)
+    if isangle(ang) and isfunction(ang.RotateAroundAxis) and isfunction(ang.Right) then
+        ang:RotateAroundAxis(ang:Right(), -90)
+    else
+        ang = M.RotateAngleAroundAxisPrecise(ang, M.AngleRightPrecise(ang), -90)
+    end
     local pos = setVecComponents(
         reusableBillboardPos,
         wx + toViewer.x * RENDER_CONFIG.billboardPush,
@@ -2263,113 +3077,6 @@ local function drawRingSprite(worldPos, radius, thickness, color, settings, view
     cam.End3D2D()
 end
 
-local function normalizeDegrees(angle)
-    angle = tonumber(angle) or 0
-    angle = angle % 360
-    if angle < 0 then
-        angle = angle + 360
-    end
-
-    return angle
-end
-
-local function snapRotationDisplayAngle(angle, step)
-    step = tonumber(step) or 0
-    if step <= 1e-8 then
-        return normalizeDegrees(angle)
-    end
-
-    return normalizeDegrees(math.Round(normalizeDegrees(angle) / step) * step)
-end
-
-local function isAngleMultiple(angle, interval)
-    local remainder = normalizeDegrees(angle) % interval
-    return remainder <= 1e-4 or math.abs(remainder - interval) <= 1e-4
-end
-
-local function isMajorTick(angle)
-    if client.isMajorRotationTick(angle) then
-        return true
-    end
-
-    return isAngleMultiple(angle, 30) or isAngleMultiple(angle, 45)
-end
-
-local function isFortyFiveTick(angle)
-    return isAngleMultiple(angle, 45)
-end
-
-local function rotationTickDistanceLess(a, b)
-    if math.abs(a.dist - b.dist) <= 1e-4 then
-        return a.angle < b.angle
-    end
-
-    return a.dist < b.dist
-end
-
-local function rotationTickAngleLess(a, b)
-    return a.angle < b.angle
-end
-
-local function visibleRotationTicks(divisions, step, cursorAngle, settings)
-    local cachedRotationTicks = shapeMetricCache.rotationTicks
-    if not cachedRotationTicks then
-        cachedRotationTicks = {}
-        shapeMetricCache.rotationTicks = cachedRotationTicks
-    end
-
-    local tickLimit = rotationRingTickLimit(settings, divisions)
-    if cachedRotationTicks.ticks
-        and cachedRotationTicks.divisions == divisions
-        and math.abs((cachedRotationTicks.step or 0) - step) <= 1e-8
-        and math.abs((cachedRotationTicks.cursorAngle or 0) - cursorAngle) <= 1e-8
-        and cachedRotationTicks.tickLimit == tickLimit then
-        return cachedRotationTicks.ticks
-    end
-
-    local ticks = cachedRotationTicks.allTicks or {}
-    cachedRotationTicks.allTicks = ticks
-    local tickCount = 0
-    for index = 0, math.max(divisions - 1, 0) do
-        tickCount = tickCount + 1
-        local angle = index * step
-        local tick = ticks[tickCount]
-        if not tick then
-            tick = {}
-            ticks[tickCount] = tick
-        end
-
-        tick.angle = angle
-        tick.dist = math.abs(math.AngleDifference(angle, cursorAngle))
-        tick.major = isMajorTick(angle)
-    end
-    for i = tickCount + 1, #ticks do
-        ticks[i] = nil
-    end
-
-    table.sort(ticks, rotationTickDistanceLess)
-
-    local selected = cachedRotationTicks.selectedTicks or {}
-    cachedRotationTicks.selectedTicks = selected
-    local selectedCount = math.min(tickLimit, #ticks)
-    for i = 1, selectedCount do
-        selected[i] = ticks[i]
-    end
-    for i = selectedCount + 1, #selected do
-        selected[i] = nil
-    end
-
-    table.sort(selected, rotationTickAngleLess)
-
-    cachedRotationTicks.cursorAngle = cursorAngle
-    cachedRotationTicks.divisions = divisions
-    cachedRotationTicks.step = step
-    cachedRotationTicks.tickLimit = tickLimit
-    cachedRotationTicks.ticks = selected
-
-    return selected
-end
-
 local function drawRotationRingTicks(origin, a, b, radius, size, ticks, color)
     if not istable(ticks) or #ticks == 0 then return end
 
@@ -2381,195 +3088,9 @@ local function drawRotationRingTicks(origin, a, b, radius, size, ticks, color)
         local tick = ticks[i]
         local angle = math.rad(tick.angle)
         local direction = a * math.cos(angle) + b * math.sin(angle)
-        local inner = isFortyFiveTick(tick.angle) and major45Inner or tick.major and majorInner or minorInner
+        local inner = client.RotationRender.isFortyFiveTick(tick.angle) and major45Inner or tick.major and majorInner or minorInner
 
         drawLine(origin + direction * (radius - inner), origin + direction * radius, color, true)
-    end
-end
-
-local function formatPercentLabel(percent)
-    if percent == nil or percent <= 0.05 or percent >= 99.95 then return end
-
-    local rounded = math.Round(percent, math.abs(percent - math.Round(percent)) < 0.05 and 0 or 1)
-    if math.abs(rounded - math.Round(rounded)) < 0.05 then
-        return ("%d%%"):format(math.Round(rounded))
-    end
-
-    return ("%.1f%%"):format(rounded)
-end
-
-local function gcd(a, b)
-    a = math.abs(math.floor(tonumber(a) or 0))
-    b = math.abs(math.floor(tonumber(b) or 0))
-
-    while b ~= 0 do
-        a, b = b, a % b
-    end
-
-    return math.max(a, 1)
-end
-
-local function lcm(a, b)
-    a = math.max(math.floor(tonumber(a) or 0), 1)
-    b = math.max(math.floor(tonumber(b) or 0), 1)
-
-    return math.floor((a / gcd(a, b)) * b)
-end
-
-local function gridAxisDivisions(grid, axisKey)
-    if not grid then return 0 end
-
-    return math.max(math.Round(axisKey == "u" and (grid.divU or 0) or (grid.divV or 0)), 0)
-end
-
-local function commonGridDivisions(face, axisKey)
-    local common = 1
-    local found = false
-    local gridSets = {}
-    local seen = {}
-
-    local function addGrid(grid)
-        if not grid or seen[grid] then return end
-        seen[grid] = true
-        gridSets[#gridSets + 1] = grid
-    end
-
-    addGrid(face and face.gridA)
-    addGrid(face and face.gridB)
-    addGrid(face and face.snapGridU)
-    addGrid(face and face.snapGridV)
-
-    for _, grid in ipairs(gridSets) do
-        local divisions = gridAxisDivisions(grid, axisKey)
-        if divisions > 0 then
-            common = lcm(common, divisions)
-            found = true
-        end
-    end
-
-    return found and common or 0
-end
-
-local function formatFractionLabel(index, divisions, commonDivisions, reduce)
-    index = math.Round(tonumber(index) or 0)
-    divisions = math.max(math.Round(tonumber(divisions) or 0), 0)
-    commonDivisions = math.max(math.Round(tonumber(commonDivisions) or divisions), divisions)
-
-    if divisions <= 0 or index <= 0 or index >= divisions then return end
-
-    local numerator = index
-    local denominator = divisions
-
-    if reduce ~= false then
-        numerator = math.Round(index * commonDivisions / divisions)
-        denominator = commonDivisions
-        local divisor = gcd(numerator, denominator)
-
-        numerator = math.floor(numerator / divisor)
-        denominator = math.floor(denominator / divisor)
-    end
-
-    if denominator <= 1 then return tostring(numerator) end
-
-    return ("%d/%d"):format(numerator, denominator)
-end
-
-local function shouldUsePercentGridLabels()
-    local cvar = GetConVar(RENDER_CONFIG.gridLabelPercentCvar)
-
-    return cvar and cvar:GetBool() or false
-end
-
-local function shouldReduceFractionGridLabels()
-    local cvar = GetConVar(RENDER_CONFIG.gridLabelReduceFractionCvar)
-
-    return cvar == nil or cvar:GetBool()
-end
-
-local function currentGridLineAlpha(isPrimary)
-    local fallback = isPrimary and GRID_CONFIG.alphaPrimary or GRID_CONFIG.alphaSecondary
-    return readClampedConVarInt(RENDER_CONFIG.gridAlphaCvar, fallback, 0, 255)
-end
-
-local function formatGridLineLabel(face, axisKey)
-    if shouldUsePercentGridLabels() then
-        return formatPercentLabel(axisKey == "u" and face.snapPercentU or face.snapPercentV)
-    end
-
-    local grid = axisKey == "u" and face.snapGridU or face.snapGridV
-    local index = axisKey == "u" and face.snapIndexU or face.snapIndexV
-    local divisions = gridAxisDivisions(grid, axisKey)
-
-    return formatFractionLabel(index, divisions, commonGridDivisions(face, axisKey), shouldReduceFractionGridLabels())
-end
-
-local function insetLineEnds(a, b, inset)
-    local dir = b - a
-    local length = dir:Length()
-    if length <= 1e-6 then
-        return a, b
-    end
-
-    dir:Normalize()
-    local padding = math.min(inset, length * 0.25)
-
-    return a + dir * padding, b - dir * padding
-end
-
-local function faceLineLocalPoints(face, grid, axisKey, value)
-    if axisKey == "u" then
-        if face.axis == 1 then
-            return VectorP(face.fixed, value, grid.vMin), VectorP(face.fixed, value, grid.vMax)
-        elseif face.axis == 2 then
-            return VectorP(value, face.fixed, grid.vMin), VectorP(value, face.fixed, grid.vMax)
-        end
-
-        return VectorP(value, grid.vMin, face.fixed), VectorP(value, grid.vMax, face.fixed)
-    end
-
-    if face.axis == 1 then
-        return VectorP(face.fixed, grid.uMin, value), VectorP(face.fixed, grid.uMax, value)
-    elseif face.axis == 2 then
-        return VectorP(grid.uMin, face.fixed, value), VectorP(grid.uMax, face.fixed, value)
-    end
-
-    return VectorP(grid.uMin, value, face.fixed), VectorP(grid.uMax, value, face.fixed)
-end
-
-local function faceLineWorldPoints(ent, face, grid, axisKey, value)
-    if face and face.worldBSP and isfunction(face.lineWorldPoints) then
-        local a, b = face.lineWorldPoints(face, grid, axisKey, value)
-        if isvector(a) and isvector(b) and isvector(face.normal) then
-            local push = face.normal * GRID_CONFIG.bspSurfacePush
-            return a + push, b + push
-        end
-
-        return a, b
-    end
-
-    local a, b = faceLineLocalPoints(face, grid, axisKey, value)
-    if not a or not b then return end
-    if not IsValid(ent) then return end
-
-    local pos = ent:GetPos()
-    local ang = ent:GetAngles()
-
-    return LocalToWorldPosPrecise(a, pos, ang), LocalToWorldPosPrecise(b, pos, ang)
-end
-
-local function drawSnapLineLabels2D(a, b, label, color)
-    if not label then return end
-
-    local startPos, endPos = insetLineEnds(a, b, GRID_CONFIG.snapLabelInset)
-    local startScreen = startPos:ToScreen()
-    local endScreen = endPos:ToScreen()
-
-    if startScreen.visible then
-        draw.SimpleTextOutlined(label, "DermaDefaultBold", startScreen.x, startScreen.y, color, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER, 1, color_black)
-    end
-
-    if endScreen.visible then
-        draw.SimpleTextOutlined(label, "DermaDefaultBold", endScreen.x, endScreen.y, color, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER, 1, color_black)
     end
 end
 
@@ -2994,6 +3515,7 @@ local function drawTranslationSnapOverlay(tool, state, g, spriteSettings, viewer
 end
 
 local reusablePointWorldPositions = {}
+local reusablePointLocalPositions = {}
 local reusablePointAnchorLocalPositions = {}
 local reusablePointAnchorWorldPositions = {}
 
@@ -3493,7 +4015,49 @@ local function anchorPointInto(out, points, id, options)
     end
 end
 
-local function drawPointSet(ent, points, color, posOverride, angOverride, stripePhase, triangleColor, anchorConfig, spriteSettings, viewerPos)
+local function normalizedEntityMirrorAxis(axis)
+    axis = math.floor(tonumber(axis) or M.ENTITY_MIRROR_NONE)
+    if axis <= M.ENTITY_MIRROR_NONE or axis > M.ENTITY_MIRROR_Z then
+        return M.ENTITY_MIRROR_NONE
+    end
+
+    return axis
+end
+
+local function mirrorLocalPointInto(out, point, axis)
+    if not isvector(point) then return end
+
+    axis = normalizedEntityMirrorAxis(axis)
+    if axis ~= M.ENTITY_MIRROR_NONE
+        and M.EntityMirror
+        and M.EntityMirror.ApplyAxisToVector then
+        out = M.EntityMirror.ApplyAxisToVector(out, point, axis)
+    else
+        out = setVec(out, point)
+    end
+
+    return out
+end
+
+local function renderLocalPoints(points, axis)
+    axis = normalizedEntityMirrorAxis(axis)
+    if axis == M.ENTITY_MIRROR_NONE then return points end
+
+    local out = reusablePointLocalPositions
+    for i = 1, #points do
+        out[i] = mirrorLocalPointInto(out[i], points[i], axis)
+    end
+    for i = #points + 1, #out do
+        out[i] = nil
+    end
+
+    return out
+end
+
+local pointWorldPosition
+local anchorWorldPosition
+
+local function drawPointSet(ent, points, color, posOverride, angOverride, stripePhase, triangleColor, anchorConfig, spriteSettings, viewerPos, localMirrorAxis, pointCache)
     if #points < 1 then return end
 
     local basePos, baseAng
@@ -3507,11 +4071,19 @@ local function drawPointSet(ent, points, color, posOverride, angOverride, stripe
         return
     end
 
+    local localPoints = renderLocalPoints(points, localMirrorAxis)
     local worldPoints = reusablePointWorldPositions
-    for i = 1, #points do
-        worldPoints[i] = localToWorldPosInto(worldPoints[i], points[i], basePos, baseAng)
+    for i = 1, #localPoints do
+        local resolved = M.ResolvePointWorldPositionCached and pointCache
+            and M.ResolvePointWorldPositionCached(pointCache, localPoints[i], ent)
+            or (M.ResolvePointWorldPosition and M.ResolvePointWorldPosition(localPoints[i], ent) or nil)
+        if isvector(resolved) then
+            worldPoints[i] = setVec(worldPoints[i], resolved)
+        else
+            worldPoints[i] = localToWorldPosInto(worldPoints[i], localPoints[i], basePos, baseAng)
+        end
     end
-    for i = #points + 1, #worldPoints do
+    for i = #localPoints + 1, #worldPoints do
         worldPoints[i] = nil
     end
 
@@ -3519,20 +4091,10 @@ local function drawPointSet(ent, points, color, posOverride, angOverride, stripe
         drawStripedTriangle(worldPoints[1], worldPoints[2], worldPoints[3], triangleColor or color, stripePhase, viewerPos)
     end
 
-    local mainRadius = 1.35
+    local mainRadius = 1.75
     local midRadius = mainRadius * 0.5
     local function anchorWorldPos(id)
-        local localScratch = reusablePointAnchorLocalPositions[id]
-        local localPos = anchorPointInto(localScratch, points, id, anchorConfig)
-        if not isvector(localPos) then return end
-        if localPos ~= points[1] and localPos ~= points[2] and localPos ~= points[3] then
-            reusablePointAnchorLocalPositions[id] = localPos
-        end
-
-        local scratch = reusablePointAnchorWorldPositions[id]
-        scratch = localToWorldPosInto(scratch, localPos, basePos, baseAng)
-        reusablePointAnchorWorldPositions[id] = scratch
-        return scratch
+        return anchorWorldPosition(localPoints, id, anchorConfig, ent, basePos, baseAng, pointCache, worldPoints)
     end
 
     local mid12World = anchorWorldPos("mid12")
@@ -3570,253 +4132,301 @@ local function drawPointSet(ent, points, color, posOverride, angOverride, stripe
     end
 end
 
-local function drawPoints(ent, points, color, anchorId, anchorConfig)
+function pointWorldPosition(point, ent, basePos, baseAng, pointCache)
+    if not isvector(point) then return end
+
+    local world = M.ResolvePointWorldPositionCached and pointCache
+        and M.ResolvePointWorldPositionCached(pointCache, point, ent)
+        or (M.ResolvePointWorldPosition and M.ResolvePointWorldPosition(point, ent) or nil)
+    if not world and isvector(basePos) and isangle(baseAng) then
+        world = LocalToWorldPosPrecise(point, basePos, baseAng)
+    end
+
+    return world
+end
+
+function anchorWorldPosition(points, id, options, ent, basePos, baseAng, pointCache, worldPoints)
+    local p1 = worldPoints and worldPoints[1] or pointWorldPosition(points[1], ent, basePos, baseAng, pointCache)
+    local p2 = worldPoints and worldPoints[2] or pointWorldPosition(points[2], ent, basePos, baseAng, pointCache)
+    local p3 = worldPoints and worldPoints[3] or pointWorldPosition(points[3], ent, basePos, baseAng, pointCache)
+
+    if id == "p1" then return p1 end
+    if id == "p2" then return p2 end
+    if id == "p3" then return p3 end
+    if id == "mid12" and p1 and p2 then return lerpPointFast(p1, p2, anchorPercent(options, "mid12")) end
+    if id == "mid23" and p2 and p3 then return lerpPointFast(p2, p3, anchorPercent(options, "mid23")) end
+    if id == "mid13" and p1 and p3 then return lerpPointFast(p1, p3, anchorPercent(options, "mid13")) end
+
+    if id == M.ANCHOR_CENTER_ID and p1 and p2 and p3 then
+        local m12 = lerpPointFast(p1, p2, anchorPercent(options, "mid12"))
+        local m23 = lerpPointFast(p2, p3, anchorPercent(options, "mid23"))
+        local m13 = lerpPointFast(p1, p3, anchorPercent(options, "mid13"))
+
+        return VectorP(
+            (m12.x + m23.x + m13.x) / 3,
+            (m12.y + m23.y + m13.y) / 3,
+            (m12.z + m23.z + m13.z) / 3
+        )
+    end
+
+    local anchor = anchorPointFast(points, id, options)
+    if not anchor then return end
+    return LocalToWorldPosPrecise(anchor, basePos, baseAng)
+end
+
+local function drawPoints(ent, points, color, anchorId, anchorConfig, labelPrefix, pointCache)
     local basePos, baseAng
     if M.IsWorldTarget and M.IsWorldTarget(ent) then
         basePos, baseAng = ZERO_VEC, ZERO_ANG
     elseif IsValid(ent) then
         basePos, baseAng = ent:GetPos(), ent:GetAngles()
+    elseif M.ResolvePointWorldPosition then
+        basePos, baseAng = ZERO_VEC, ZERO_ANG
     else
         return
     end
 
     for i = 1, #points do
-        local world = LocalToWorldPosPrecise(points[i], basePos, baseAng)
-        local screen = world:ToScreen()
-        if screen.visible then
-            draw.SimpleTextOutlined("P" .. i, "DermaDefault", screen.x + 8, screen.y - 8, color, TEXT_ALIGN_LEFT, TEXT_ALIGN_BOTTOM, 1, color_black)
+        local world = M.ResolvePointWorldPositionCached and pointCache
+            and M.ResolvePointWorldPositionCached(pointCache, points[i], ent)
+            or (M.ResolvePointWorldPosition and M.ResolvePointWorldPosition(points[i], ent) or nil)
+        if not world and isvector(basePos) and isangle(baseAng) then
+            world = LocalToWorldPosPrecise(points[i], basePos, baseAng)
+        end
+        local screen = world and world:ToScreen() or nil
+        if screen and screen.visible then
+            draw.SimpleTextOutlined((labelPrefix or "P") .. i, "DermaDefault", screen.x + 8, screen.y - 8, color, TEXT_ALIGN_LEFT, TEXT_ALIGN_BOTTOM, 1, color_black)
         end
     end
 
     if not anchorId then return end
 
-    local anchor = anchorPointFast(points, anchorId, anchorConfig)
-    if not anchor then return end
+    local world = anchorWorldPosition(points, anchorId, anchorConfig, ent, basePos, baseAng, pointCache)
+    if not world then return end
 
-    local world = LocalToWorldPosPrecise(anchor, basePos, baseAng)
     local screen = world:ToScreen()
     if screen.visible then
         draw.SimpleTextOutlined("A", "DermaDefault", screen.x, screen.y, color_white, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER, 1, color_black)
     end
 end
 
-local function isDrawingPickPress(state)
-    local press = state and state.press
-    if not press then return false end
+client.MirrorRender = client.MirrorRender or {}
+client.MirrorRender.planeGradientAlphaScale = 0.05
+client.MirrorRender.planeOutlineScale = 0.35
 
-    if press.drawActive ~= true then
-        return false
-    end
-
-    return press.kind == "pick"
-        or press.kind == "select_source_pick"
-        or press.kind == "select_target_pick"
+function client.MirrorRender.referenceExtent(reference, viewerPos)
+    local point = reference and reference.point
+    local distance = isvector(point) and isvector(viewerPos) and point:Distance(viewerPos) or 256
+    return math.Clamp(distance * 0.9, 128, 4096)
 end
 
-local function hasDrawableFace(candidate)
-    if not candidate or not candidate.face then return false end
-    if IsValid(candidate.ent) then return true end
+function client.MirrorRender.queuePlaneMaterialRebuild(cache)
+    if not cache or cache.rebuildQueued then return end
 
-    return M.IsWorldTarget and M.IsWorldTarget(candidate.ent) and candidate.face.worldBSP == true
-end
-
-local function shouldRenderHoverGrid(state, hoverCandidate)
-    if not hasDrawableFace(hoverCandidate) then return false end
-
-    local settings = state and state.hover and state.hover.settings
-    if isDrawingPickPress(state) then return false end
-
-    if settings and settings.shift then return false end
-
-    return true
-end
-
-local function shouldRenderHoverFace(state, hoverCandidate)
-    if not hasDrawableFace(hoverCandidate) then return false end
-    if isDrawingPickPress(state) then return false end
-
-    return true
-end
-
-local function sideAccentColor(side)
-    if side == "source" then
-        return colors.source
-    elseif side == "target" then
-        return colors.target
-    end
-
-    return colors.pending
-end
-
-local function activePickAccentColor(state)
-    local press = state and state.press
-    if not press or not isDrawingPickPress(state) then
-        return colors.pending
-    end
-
-    return sideAccentColor(press.side)
-end
-
-local function drawWorldBspBlockerMarker(blocker)
-    if not istable(blocker) then return end
-
-    local color = cachedColor(255, 166, 64, 215)
-    local ent = blocker.ent
-    if IsValid(ent)
-        and render.DrawWireframeBox
-        and isfunction(ent.GetPos)
-        and isfunction(ent.GetAngles)
-        and isfunction(ent.OBBMins)
-        and isfunction(ent.OBBMaxs) then
-        render.DrawWireframeBox(ent:GetPos(), ent:GetAngles(), ent:OBBMins(), ent:OBBMaxs(), color, true)
-    end
-
-    local hitPos = blocker.hitPos
-    if isvector(hitPos) then
-        local size = 6
-        drawLine(hitPos - VectorP(size, 0, 0), hitPos + VectorP(size, 0, 0), color, true)
-        drawLine(hitPos - VectorP(0, size, 0), hitPos + VectorP(0, size, 0), color, true)
-        drawLine(hitPos - VectorP(0, 0, size), hitPos + VectorP(0, 0, size), color, true)
-    end
-end
-
-local function drawWorldBspBlockers(tool, state)
-    if not tool or not tool.GetClientNumber or tool:GetClientNumber("world_bsp_show_blockers", 0) ~= 1 then return end
-
-    local blockers = state and state.hover and state.hover.worldBspBlockers
-    if not istable(blockers) or #blockers == 0 then return end
-
-    render.SetColorMaterial()
-    for i = 1, #blockers do
-        drawWorldBspBlockerMarker(blockers[i])
-    end
-end
-
-local hoverRender = {}
-
-function hoverRender.drawGridLabels(state, candidate)
-    if not shouldRenderHoverGrid(state, candidate) then return end
-    if candidate.face and candidate.face.worldBSP and candidate.face.globalGrid then return end
-
-    local face = candidate.face
-    local labelColor = cachedColor(255, 255, 255, GRID_CONFIG.snapLabelAlpha)
-
-    if face.snapGridU and face.uSnap then
-        local a, b = faceLineWorldPoints(candidate.ent, face, face.snapGridU, "u", face.uSnap)
-        if a and b then
-            drawSnapLineLabels2D(a, b, formatGridLineLabel(face, "u"), labelColor)
+    cache.rebuildQueued = true
+    hook.Add("PostRender", "magic_align_mirror_plane_rebuild", function()
+        local materialCache = client.MirrorRender.planeMaterialCache
+        if not materialCache then
+            hook.Remove("PostRender", "magic_align_mirror_plane_rebuild")
+            return
         end
-    end
 
-    if face.snapGridV and face.vSnap then
-        local a, b = faceLineWorldPoints(candidate.ent, face, face.snapGridV, "v", face.vSnap)
-        if a and b then
-            drawSnapLineLabels2D(a, b, formatGridLineLabel(face, "v"), labelColor)
+        materialCache.rebuildQueued = false
+        if materialCache.ready then
+            hook.Remove("PostRender", "magic_align_mirror_plane_rebuild")
+            return
         end
-    end
-end
 
-function hoverRender.drawFaceOutline(state, candidate)
-    if not shouldRenderHoverFace(state, candidate) then return end
+        local size = materialCache.size or 512
+        local center = size * 0.5
+        local radius = (center - 1) * 0.6
+        local steps = 28
+        local points = circlePointsForSegments(64)
+        local alphaScale = math.Clamp(tonumber(materialCache.gradientAlphaScale or client.MirrorRender.planeGradientAlphaScale) or 0.25, 0, 1)
 
-    local face = candidate.face
-    if face.worldBSP and istable(face.worldCorners) then
-        local renderData = client.worldGridRender.ensureWorldBspRenderData(face.surface)
-        local corners = renderData and renderData.vertices or face.worldCorners
-        local count = renderData and renderData.vertexCount or #corners
-        if count < 2 then return end
-
-        local color = cachedColor(255, 255, 255, 70)
-        for i = 1, count do
-            local a = corners[i]
-            local b = corners[i % count + 1]
-            if isvector(a) and isvector(b) then
-                drawLine(a, b, color, false)
+        render.PushRenderTarget(materialCache.texture)
+        render.Clear(0, 0, 0, 0, true, true)
+        cam.Start2D()
+            draw.NoTexture()
+            for i = steps, 1, -1 do
+                local t = i / steps
+                local alpha = math.floor(255 * alphaScale * (1 - t) * (1 - t) + 0.5)
+                drawCircle2DAt(center, center, radius * t, cachedColor(255, 255, 255, alpha), points)
             end
-        end
-        return
-    end
+        cam.End2D()
+        render.PopRenderTarget()
 
-    local ent = candidate.ent
-    local corners = face.corners
-    local entPos = ent:GetPos()
-    local entAng = ent:GetAngles()
+        materialCache.ready = true
+        hook.Remove("PostRender", "magic_align_mirror_plane_rebuild")
+    end)
+end
 
-    for i = 1, 4 do
-        drawLine(
-            LocalToWorldPosPrecise(corners[i], entPos, entAng),
-            LocalToWorldPosPrecise(corners[i % 4 + 1], entPos, entAng),
-            cachedColor(255, 255, 255, 70),
-            true
+function client.MirrorRender.ensurePlaneMaterial()
+    local cache = client.MirrorRender.planeMaterialCache
+    if not cache then
+        local size = 512
+        local texture = GetRenderTargetEx(
+            "magic_align_mirror_plane_rt",
+            size,
+            size,
+            RT_SIZE_NO_CHANGE,
+            MATERIAL_RT_DEPTH_NONE,
+            0,
+            0,
+            IMAGE_FORMAT_RGBA8888
         )
+        local material = CreateMaterial("magic_align_mirror_plane_mat", "UnlitGeneric", {
+            ["$basetexture"] = texture:GetName(),
+            ["$translucent"] = "1",
+            ["$additive"] = "1",
+            ["$vertexalpha"] = "1",
+            ["$vertexcolor"] = "1",
+            ["$nocull"] = "1",
+            ["$model"] = "1"
+        })
+
+        cache = {
+            size = size,
+            texture = texture,
+            material = material,
+            gradientAlphaScale = client.MirrorRender.planeGradientAlphaScale,
+            ready = false
+        }
+        client.MirrorRender.planeMaterialCache = cache
     end
-end
 
-function hoverRender.drawGrid(state, candidate)
-    if not shouldRenderHoverGrid(state, candidate) then return end
+    local desiredAlphaScale = math.Clamp(tonumber(client.MirrorRender.planeGradientAlphaScale) or 0.25, 0, 1)
+    if cache.gradientAlphaScale ~= desiredAlphaScale then
+        cache.gradientAlphaScale = desiredAlphaScale
+        cache.ready = false
+    end
 
-    local face = candidate.face
-    local ent = candidate.ent
-    if face.worldBSP and face.globalGrid then
-        client.worldGridRender.drawWorldBspGlobalGrid(face)
+    cache.material:SetTexture("$basetexture", cache.texture)
+    local materialFlags = cache.material:GetInt("$flags") or 0
+    local requiredFlags = bit.bor(materialFlags, SHAPE_CONFIG.materialFlags)
+    if materialFlags ~= requiredFlags then
+        cache.material:SetInt("$flags", requiredFlags)
+    end
+
+    if not cache.ready then
+        client.MirrorRender.queuePlaneMaterialRebuild(cache)
         return
     end
 
-    local renderPerf = shapeMetricCache.renderPerf
-    local gridSets = renderPerf.reusableGridSets or {}
-    local seen = renderPerf.reusableGridSeen or {}
-    renderPerf.reusableGridSets = gridSets
-    renderPerf.reusableGridSeen = seen
-    for i = 1, #gridSets do
-        gridSets[i] = nil
-    end
-    for grid in pairs(seen) do
-        seen[grid] = nil
-    end
+    return cache.material
+end
 
-    local function addGrid(grid)
-        if not grid or seen[grid] then return end
-        seen[grid] = true
-        gridSets[#gridSets + 1] = grid
+function client.MirrorRender.drawPlaneSquare(mirrorState, fill, outline)
+    local corners = mirrorState and mirrorState.planeCorners
+    if not istable(corners) or not isvector(corners[1]) or not isvector(corners[2]) or not isvector(corners[3]) or not isvector(corners[4]) then return end
+
+    local material = client.MirrorRender.ensurePlaneMaterial()
+    if material then
+        drawTexturedWorldQuad(corners[1], corners[2], corners[3], corners[4], fill, material, true)
+    else
+        drawFilledQuad(corners[1], corners[2], corners[3], corners[4], cappedAlpha(fill, 50))
     end
 
-    addGrid(face.gridA)
-    addGrid(face.gridB)
-    addGrid(face.snapGridU)
-    addGrid(face.snapGridV)
+    local outlineScale = tonumber(client.MirrorRender.planeOutlineScale) or 1
+    if outlineScale ~= 1 then
+        local scratch = client.MirrorRender.planeOutlineScratch or {}
+        client.MirrorRender.planeOutlineScratch = scratch
 
-    for _, grid in ipairs(gridSets) do
-        local lineAlpha = currentGridLineAlpha(grid == face.gridA)
-
-        for uIndex = 0, math.max(grid.divU or 0, 0) do
-            local u = uIndex == (grid.divU or 0) and grid.uMax or (grid.uMin + grid.stepU * uIndex)
-            local a, b = faceLineWorldPoints(ent, face, grid, "u", u)
-            if a and b then
-                drawLine(a, b, cachedColor(255, 255, 255, lineAlpha), false)
-            end
+        local centerX = (corners[1].x + corners[3].x) * 0.5
+        local centerY = (corners[1].y + corners[3].y) * 0.5
+        local centerZ = (corners[1].z + corners[3].z) * 0.5
+        for i = 1, 4 do
+            local corner = corners[i]
+            scratch[i] = setVecComponents(
+                scratch[i],
+                centerX + (corner.x - centerX) * outlineScale,
+                centerY + (corner.y - centerY) * outlineScale,
+                centerZ + (corner.z - centerZ) * outlineScale
+            )
         end
 
-        for vIndex = 0, math.max(grid.divV or 0, 0) do
-            local v = vIndex == (grid.divV or 0) and grid.vMax or (grid.vMin + grid.stepV * vIndex)
-            local a, b = faceLineWorldPoints(ent, face, grid, "v", v)
-            if a and b then
-                drawLine(a, b, cachedColor(255, 255, 255, lineAlpha), false)
-            end
+        corners = scratch
+    end
+
+    drawLine(corners[1], corners[2], outline, true)
+    drawLine(corners[2], corners[3], outline, true)
+    drawLine(corners[3], corners[4], outline, true)
+    drawLine(corners[4], corners[1], outline, true)
+end
+
+function client.MirrorRender.drawAxis(reference, viewerPos, color)
+    if not (reference and isvector(reference.point) and isvector(reference.axis)) then return end
+
+    local extent = client.MirrorRender.referenceExtent(reference, viewerPos)
+    local scratch = client.MirrorRender.axisScratch or {}
+    client.MirrorRender.axisScratch = scratch
+
+    local px, py, pz = reference.point.x, reference.point.y, reference.point.z
+    local ax, ay, az = reference.axis.x, reference.axis.y, reference.axis.z
+    scratch.outerA = setVecComponents(scratch.outerA, px - ax * extent, py - ay * extent, pz - az * extent)
+    scratch.outerB = setVecComponents(scratch.outerB, px + ax * extent, py + ay * extent, pz + az * extent)
+    scratch.innerA = setVecComponents(scratch.innerA, px - ax * extent * 0.42, py - ay * extent * 0.42, pz - az * extent * 0.42)
+    scratch.innerB = setVecComponents(scratch.innerB, px + ax * extent * 0.42, py + ay * extent * 0.42, pz + az * extent * 0.42)
+
+    drawLine(scratch.outerA, scratch.outerB, colorAlpha(color, 120), true)
+    drawLine(scratch.innerA, scratch.innerB, colorAlpha(color, 210), true)
+end
+
+function client.MirrorRender.state(state)
+    if not (state and M.IsMirrorMode and M.IsMirrorMode(state)) then return end
+
+    if client.Mirror and client.Mirror.resolve then
+        return client.Mirror.resolve(state)
+    end
+
+    return M.ResolveMirrorState
+        and M.ResolveMirrorState(state.mirror, M.GetMirrorStateCache and M.GetMirrorStateCache(state) or nil, {
+            activeSpace = state.activeSpace
+        })
+        or nil
+end
+
+function client.MirrorRender.drawPointLabels(state, color)
+    local mirrorState = client.MirrorRender.state(state)
+    if not mirrorState then return end
+
+    local worldPoints = mirrorState.worldPoints or {}
+    local count = tonumber(mirrorState.pointCount) or 0
+    for i = 1, count do
+        local world = worldPoints[i]
+        local screen = isvector(world) and world:ToScreen() or nil
+        if screen and screen.visible then
+            draw.SimpleTextOutlined("M" .. i, "DermaDefault", screen.x + 8, screen.y - 8, color, TEXT_ALIGN_LEFT, TEXT_ALIGN_BOTTOM, 1, color_black)
+        end
+    end
+end
+
+function client.MirrorRender.drawReference(state, spriteSettings, viewerPos)
+    local mirrorState = client.MirrorRender.state(state)
+    if not mirrorState then return end
+
+    local color = colors.mirror or Color(176, 112, 235)
+    local worldPoints = mirrorState.worldPoints or {}
+    local count = tonumber(mirrorState.pointCount) or 0
+    for i = 1, count do
+        local world = worldPoints[i]
+        if isvector(world) then
+            drawCircleSprite(world, 1.75, colorAlpha(color, 190), spriteSettings, viewerPos)
         end
     end
 
-    if face.snapGridU and face.uSnap then
-        local a, b = faceLineWorldPoints(ent, face, face.snapGridU, "u", face.uSnap)
-        if a and b then
-            drawLine(a, b, prop2BlueColor(GRID_CONFIG.snapLineAlpha), false)
-        end
+    local reference = mirrorState.reference
+    if not reference then return end
+
+    local point = reference.point
+    if isvector(point) then
+        drawCircleSprite(point, 1.75, colorAlpha(color, 235), spriteSettings, viewerPos)
     end
 
-    if face.snapGridV and face.vSnap then
-        local a, b = faceLineWorldPoints(ent, face, face.snapGridV, "v", face.vSnap)
-        if a and b then
-            drawLine(a, b, prop2BlueColor(GRID_CONFIG.snapLineAlpha), false)
-        end
+    if reference.kind == M.MIRROR_AXIS and isvector(reference.point) and isvector(reference.axis) then
+        client.MirrorRender.drawAxis(reference, viewerPos, color)
+    elseif reference.kind == M.MIRROR_PLANE and mirrorState.planeHalfSize then
+        client.MirrorRender.drawPlaneSquare(mirrorState, colorAlpha(color, 145), colorAlpha(color, 155))
     end
 end
 
@@ -3862,39 +4472,171 @@ local function reusableHoverGizmoForRender(state)
     return hover.gizmo
 end
 
-function TOOL:DrawHUD()
-    local tool, state = client.activeTool()
-    if tool ~= self then return end
-    if not client.validateState(self, state) then return end
+local function drawGizmoOverlay(tool, state, spriteSettings, viewerPos)
+    if not (istable(state) and state.preview and state.preview.solve) then return end
 
-    local hoverCandidate = state.hover and (state.hover.candidate or state.hover.overlay)
-    local sourceAnchorOptions = anchorOptions(tool, "from")
-    local targetAnchorOptions = anchorOptions(tool, "to")
+    local g = reusableHoverGizmoForRender(state) or client.gizmo(tool, state)
+    if not g then return end
 
-    drawPoints(state.prop1, state.source, colors.source, state.preview and state.preview.solve and state.preview.solve.sourceAnchorId, sourceAnchorOptions)
-    drawPoints(state.prop2, state.target, colors.target, state.preview and state.preview.solve and state.preview.solve.targetAnchorId, targetAnchorOptions)
-    hoverRender.drawGridLabels(state, hoverCandidate)
-end
+    local showRotation = g.disableRotation ~= true
+    local axisHandleRadius = g.size * 0.09
+    local traceSnapLength = tool and tool.GetClientInfo and tonumber(tool:GetClientInfo("trace_snap_length")) or 0
+    local traceMarkerHalfSize = math.Clamp(math.min(g.size * 0.028, traceSnapLength * 0.14), 0.24, 0.95)
+    local press = state.press
+    local activeHandle = press and press.kind == "gizmo" and press.space == g.space and press.gizmo or nil
+    local basisForward, basisRight, basisUp = g.basisForward, g.basisRight, g.basisUp
+    if not (isvector(basisForward) and isvector(basisRight) and isvector(basisUp)) then
+        basisForward, basisRight, basisUp = M.AngleAxesPrecise(g.basis)
+    end
+    local xMove = g.handles and g.handles[1] or nil
+    local yMove = g.handles and g.handles[2] or nil
+    local zMove = g.handles and g.handles[3] or nil
+    local xyPlane = g.handles and g.handles[4] or nil
+    local xzPlane = g.handles and g.handles[5] or nil
+    local yzPlane = g.handles and g.handles[6] or nil
+    local xHandle = xMove and xMove.b or M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisForward, g.size))
+    local yHandle = yMove and yMove.b or M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisRight, g.size))
+    local zHandle = zMove and zMove.b or M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisUp, g.size))
 
-hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawingDepth, bDrawingSkybox)
-    if bDrawingDepth or bDrawingSkybox then return end
+    if shouldDrawGizmoHandle(activeHandle, "move", "x") then
+        drawLine(g.origin, M.SubtractVectorsPrecise(xHandle, M.ScaleVectorPrecise(basisForward, axisHandleRadius)), colors.x, true)
+        drawCircleSprite(xHandle, axisHandleRadius, colors.x, spriteSettings, viewerPos)
+    end
+    if shouldDrawGizmoHandle(activeHandle, "move", "y") then
+        drawLine(g.origin, M.SubtractVectorsPrecise(yHandle, M.ScaleVectorPrecise(basisRight, axisHandleRadius)), colors.y, true)
+        drawCircleSprite(yHandle, axisHandleRadius, colors.y, spriteSettings, viewerPos)
+    end
+    if shouldDrawGizmoHandle(activeHandle, "move", "z") then
+        drawLine(g.origin, M.SubtractVectorsPrecise(zHandle, M.ScaleVectorPrecise(basisUp, axisHandleRadius)), colors.z, true)
+        drawCircleSprite(zHandle, axisHandleRadius, colors.z, spriteSettings, viewerPos)
+    end
 
-    local tool, state = client.activeTool()
-    if not tool then
-        if M.ClientState and IsValid(M.ClientState.ghost) then
-            M.ClientState.ghost:SetNoDraw(true)
+    if shouldDrawGizmoHandle(activeHandle, "plane", "xy") then
+        drawPlaneSquare(xyPlane and xyPlane.center or M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisForward, g.planeOffset)), M.ScaleVectorPrecise(basisRight, g.planeOffset)), basisForward, basisRight, g.size * 0.11, colors.xy)
+    end
+    if shouldDrawGizmoHandle(activeHandle, "plane", "xz") then
+        drawPlaneSquare(xzPlane and xzPlane.center or M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisForward, g.planeOffset)), M.ScaleVectorPrecise(basisUp, g.planeOffset)), basisForward, basisUp, g.size * 0.11, colors.xz, nil, true, true)
+    end
+    if shouldDrawGizmoHandle(activeHandle, "plane", "yz") then
+        drawPlaneSquare(yzPlane and yzPlane.center or M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisRight, g.planeOffset)), M.ScaleVectorPrecise(basisUp, g.planeOffset)), basisRight, basisUp, g.size * 0.11, colors.yz)
+    end
+
+    if traceSnapLength > 0 then
+        local xTraceDir, xTrace = activeTraceMarkerDirection(state, g, "x")
+        local yTraceDir, yTrace = activeTraceMarkerDirection(state, g, "y")
+        local zTraceDir, zTrace = activeTraceMarkerDirection(state, g, "z")
+
+        if xTraceDir then
+            drawTraceSnapAxisMarker(g.origin, xTraceDir, basisRight, basisUp, traceSnapLength, traceMarkerHalfSize, colors.x, xTrace)
         end
-        if M.ClientState and istable(M.ClientState.linkedGhosts) then
-            for _, ghost in pairs(M.ClientState.linkedGhosts) do
-                if IsValid(ghost) then
-                    ghost:SetNoDraw(true)
+        if yTraceDir then
+            drawTraceSnapAxisMarker(g.origin, yTraceDir, basisForward, basisUp, traceSnapLength, traceMarkerHalfSize, colors.y, yTrace)
+        end
+        if zTraceDir then
+            drawTraceSnapAxisMarker(g.origin, zTraceDir, basisForward, basisRight, traceSnapLength, traceMarkerHalfSize, colors.z, zTrace)
+        end
+    end
+
+    drawTranslationSnapOverlay(tool, state, g, spriteSettings, viewerPos)
+
+    local ringRenderSettings = showRotation and spriteSettings or nil
+    if showRotation then
+        local rotationRings = reusableRotationRings
+        local rollRing = rotationRings[1]
+        rollRing.axis, rollRing.a, rollRing.b, rollRing.c = basisForward, basisRight, basisUp, colors.x
+        local pitchRing = rotationRings[2]
+        pitchRing.axis, pitchRing.a, pitchRing.b, pitchRing.c = basisRight, basisForward, basisUp, colors.y
+        local yawRing = rotationRings[3]
+        yawRing.axis, yawRing.a, yawRing.b, yawRing.c = basisUp, basisForward, basisRight, colors.z
+        local rotationSnapEnabled = not (input.IsKeyDown(KEY_LSHIFT) or input.IsKeyDown(KEY_RSHIFT))
+        local activeRotationKey = rotationSnapEnabled and g.hover and g.hover.kind == "rot" and g.hover.key or nil
+        local rotationDivisions = client.rotationSnapDivisions(tool)
+        local rotationStep = client.rotationSnapStep(tool) or (360 / math.max(rotationDivisions, 1))
+
+        for i = 1, #rotationRings do
+            local item = rotationRings[i]
+            if shouldDrawGizmoHandle(activeHandle, "rot", item.key) then
+                drawRotationRingBand(g.origin, item.a, item.b, g.ringRadius, g.ringPadding, item.c, nil, ringRenderSettings)
+
+                if press and press.kind == "gizmo"
+                    and press.gizmo and press.gizmo.kind == "rot"
+                    and press.gizmo.key == item.key
+                    and press.startRingAngle and press.currentRingAngle then
+                    local sectorStartAngle = math.deg(press.startRingAngle)
+                    local sectorCurrentAngle = press.currentRingAngle
+                    if rotationSnapEnabled then
+                        sectorStartAngle = client.RotationRender.snapDisplayAngle(sectorStartAngle, rotationStep)
+                        sectorCurrentAngle = client.RotationRender.snapDisplayAngle(sectorCurrentAngle, rotationStep)
+                    end
+
+                    drawRotationDeltaSector(
+                        g.origin,
+                        item.a,
+                        item.b,
+                        g.ringRadius,
+                        g.ringPadding,
+                        sectorStartAngle,
+                        sectorCurrentAngle,
+                        item.c,
+                        ringRenderSettings
+                    )
+                end
+
+                if activeRotationKey == item.key and rotationDivisions > 0 then
+                    local fallbackAngle = press and press.kind == "gizmo"
+                        and press.gizmo and press.gizmo.kind == "rot"
+                        and press.gizmo.key == item.key
+                        and math.deg(press.startRingAngle)
+                        or 0
+                    local cursorAngle = press and press.kind == "gizmo"
+                        and press.gizmo and press.gizmo.kind == "rot"
+                        and press.gizmo.key == item.key
+                        and press.currentRingAngle
+                        or g.hover and g.hover.kind == "rot"
+                        and g.hover.key == item.key
+                        and g.hover.cursorAngle
+                        or fallbackAngle
+                    cursorAngle = client.RotationRender.normalizeDegrees(cursorAngle)
+                    local ticks = client.RotationRender.visibleTicks(
+                        rotationDivisions,
+                        rotationStep,
+                        cursorAngle,
+                        rotationRingTickLimit(ringRenderSettings, rotationDivisions)
+                    )
+                    drawRotationRingTicks(g.origin, item.a, item.b, g.ringRadius - g.ringPadding * 0.5, g.size, ticks, colorAlpha(color_white, 220))
                 end
             end
-        end
-        return
-    end
-    if not client.validateState(tool, state) then return end
 
+        end
+
+    end
+
+    if g.hover and shouldDrawGizmoHandle(activeHandle, g.hover.kind, g.hover.key) then
+        if g.hover.kind == "move" then
+            local axisDir = g.hover.key == "x" and basisForward
+                or g.hover.key == "y" and basisRight
+                or basisUp
+            drawLine(g.hover.a, g.hover.b - axisDir * axisHandleRadius, color_white, true)
+            drawRingSprite(g.hover.b, g.size * 0.09, g.size * 0.022, color_white, ringRenderSettings, viewerPos, true)
+        elseif g.hover.kind == "plane" then
+            if g.hover.key == "xy" then
+                drawPlaneSquare(g.hover.center, basisForward, basisRight, g.size * 0.135, g.hover.color or colors.xy, color_white)
+            elseif g.hover.key == "xz" then
+                drawPlaneSquare(g.hover.center, basisForward, basisUp, g.size * 0.135, g.hover.color or colors.xz, color_white, true, true)
+            else
+                drawPlaneSquare(g.hover.center, basisRight, basisUp, g.size * 0.135, g.hover.color or colors.yz, color_white)
+            end
+        elseif g.hover.key == "roll" then
+            drawRotationRingBand(g.origin, basisRight, basisUp, g.ringRadius, g.ringPadding, color_white, nil, ringRenderSettings)
+        elseif g.hover.key == "pitch" then
+            drawRotationRingBand(g.origin, basisForward, basisUp, g.ringRadius, g.ringPadding, color_white, nil, ringRenderSettings)
+        else
+            drawRotationRingBand(g.origin, basisForward, basisRight, g.ringRadius, g.ringPadding, color_white, nil, ringRenderSettings)
+        end
+    end
+end
+
+local function drawOverlayWireMarkers(state)
     local markerColor = selectionColor(state)
     local wireMarkers = shapeMetricCache.renderPerf.reusableWireMarkers or {}
     shapeMetricCache.renderPerf.reusableWireMarkers = wireMarkers
@@ -3912,6 +4654,22 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
     targetMarker.color = colors.target
     targetMarker.alpha = 72
 
+    local targetReferenceMarkers = {}
+    for i = 1, #(state.target or {}) do
+        local ref = M.ResolvePointReference and M.ResolvePointReference(state.target[i], state.prop2) or nil
+        if IsValid(ref)
+            and ref ~= state.prop1
+            and ref ~= state.prop2
+            and not targetReferenceMarkers[ref] then
+            targetReferenceMarkers[ref] = true
+            wireMarkerCount = wireMarkerCount + 1
+            local refMarker = reusableEntry(wireMarkers, wireMarkerCount)
+            refMarker.ent = ref
+            refMarker.color = colors.target
+            refMarker.alpha = 44
+        end
+    end
+
     for i = 1, #(state.linked or {}) do
         wireMarkerCount = wireMarkerCount + 1
         local linkedMarker = reusableEntry(wireMarkers, wireMarkerCount)
@@ -3921,64 +4679,38 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
     end
     clearReusableEntries(wireMarkers, wireMarkerCount)
     shapeMetricCache.renderPerf.drawWireMarkerBatch(wireMarkers, true)
+end
 
-    local ghostEntries = shapeMetricCache.renderPerf.reusableGhostEntries or {}
-    shapeMetricCache.renderPerf.reusableGhostEntries = ghostEntries
-    ghostEntries._magicAlignCount = 0
-    shapeMetricCache.renderPerf.addGhostRenderEntry(ghostEntries, state.ghost, 0.08, 0.65)
-    if istable(state.linkedGhosts) then
-        for _, ghost in pairs(state.linkedGhosts) do
-            shapeMetricCache.renderPerf.addGhostRenderEntry(ghostEntries, ghost, 0.05, 0.38)
-        end
-    end
-    clearReusableEntries(ghostEntries, ghostEntries._magicAlignCount)
+local function drawInteractionOverlay(tool, state)
+    if not istable(state) then return end
 
-    if previewOccludedEnabled(tool) then
-        for i = 1, #ghostEntries do
-            local entry = ghostEntries[i]
-            drawPreviewOccludedGhost(tool, entry.ghost, entry.alpha)
-        end
-        drawPreviewOccludedCompatGhosts(tool, state)
-    end
-
-    shapeMetricCache.renderPerf.drawGhostRenderEntries(ghostEntries)
+    drawOverlayWireMarkers(state)
 
     local hoverCandidate = state.hover and (state.hover.candidate or state.hover.overlay)
+    local mirrorActive = M.IsMirrorMode and M.IsMirrorMode(state)
     local sourceAnchorOptions = anchorOptions(tool, "from")
-    local targetAnchorOptions = anchorOptions(tool, "to")
+    local targetAnchorOptions = not mirrorActive and anchorOptions(tool, "to") or nil
     local spriteSettings = ringRenderSettingsForTool(tool)
     local viewerPos = setVec(shapeMetricCache.renderPerf.viewerPos, IsValid(LocalPlayer()) and LocalPlayer():GetShootPos() or EyePos())
     shapeMetricCache.renderPerf.viewerPos = viewerPos
-
-    local drawFaceOutlineWithIgnoreZ = hoverCandidate
-        and hoverCandidate.face
-        and hoverCandidate.face.worldBSP
-
-    if not drawFaceOutlineWithIgnoreZ then
-        hoverRender.drawFaceOutline(state, hoverCandidate)
-    end
-
-    local drawGridWithIgnoreZ = true
-    if hoverCandidate
-        and hoverCandidate.face
-        and hoverCandidate.face.worldBSP
-        and hoverCandidate.face.globalGrid then
-        hoverRender.drawGrid(state, hoverCandidate)
-        drawGridWithIgnoreZ = false
-    end
+    local pointCache = state._magicAlignPointWorldCache or {}
+    state._magicAlignPointWorldCache = pointCache
 
     cam.IgnoreZ(true)
-    if drawFaceOutlineWithIgnoreZ then
-        hoverRender.drawFaceOutline(state, hoverCandidate)
-    end
-    drawWorldBspBlockers(tool, state)
-    if drawGridWithIgnoreZ then
-        hoverRender.drawGrid(state, hoverCandidate)
-    end
+    client.HoverRender.drawFaceOutline(state, hoverCandidate)
+    client.HoverRender.drawWorldBspBlockers(tool, state)
+    client.HoverRender.drawGrid(state, hoverCandidate)
 
-    drawPointSet(state.prop1, state.source, colors.source, nil, nil, 0, nil, sourceAnchorOptions, spriteSettings, viewerPos)
-    drawPointSet(state.prop2, state.target, colors.target, nil, nil, 0.5, nil, targetAnchorOptions, spriteSettings, viewerPos)
+    drawPointSet(state.prop1, state.source, colors.source, nil, nil, 0, nil, sourceAnchorOptions, spriteSettings, viewerPos, nil, pointCache)
+    if not mirrorActive then
+        drawPointSet(state.prop2, state.target, colors.target, nil, nil, 0.5, nil, targetAnchorOptions, spriteSettings, viewerPos, nil, pointCache)
+    end
+    client.MirrorRender.drawReference(state, spriteSettings, viewerPos)
+
     if state.preview and state.preview.pos and state.preview.ang and #state.source > 0 then
+        local previewPointAxis = state.preview.transformMode == M.TRANSFORM_MODE_MIRROR
+            and (state.preview.entityMirrorPreviewAxis or state.preview.entityMirrorAxis)
+            or M.ENTITY_MIRROR_NONE
         drawPointSet(
             nil,
             state.source,
@@ -3989,13 +4721,15 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
             cachedColor(120, 255, 150, 128),
             sourceAnchorOptions,
             spriteSettings,
-            viewerPos
+            viewerPos,
+            previewPointAxis,
+            pointCache
         )
     end
 
-    if state.press and isDrawingPickPress(state) and state.press.samples then
+    if state.press and client.HoverRender.isDrawingPickPress(state) and state.press.samples then
         local samples = state.press.samples
-        local pathColor = activePickAccentColor(state)
+        local pathColor = client.HoverRender.activePickAccentColor(state)
         for i = 2, #samples do
             local a = client.sampleWorldPos(state.press.ent, samples[i - 1]) or samples[i - 1].pos
             local b = client.sampleWorldPos(state.press.ent, samples[i]) or samples[i].pos
@@ -4017,16 +4751,18 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
         end
     end
 
-    if hoverCandidate and not isDrawingPickPress(state) then
-            drawCircleSprite(hoverCandidate.worldPos, 1.2, colorAlpha(colors.preview, 210), spriteSettings, viewerPos)
+    if hoverCandidate and not client.HoverRender.isDrawingPickPress(state) then
+        local hoverColor = client.HoverRender.cursorAccentColor(state, hoverCandidate, 210)
+            or colorAlpha(colors.preview, 210)
+        drawCircleSprite(hoverCandidate.worldPos, 1.2, hoverColor, spriteSettings, viewerPos)
     end
 
     if state.hover and state.hover.point then
         drawRingSprite(state.hover.point.worldPos, 1.7, 0.55, color_white, spriteSettings, viewerPos, true)
     end
 
-    if state.corner and isDrawingPickPress(state) then
-        local cornerColor = activePickAccentColor(state)
+    if state.corner and client.HoverRender.isDrawingPickPress(state) then
+        local cornerColor = client.HoverRender.activePickAccentColor(state)
         drawCircleSprite(state.corner.worldPos, 1.05, colorAlpha(cornerColor, 215), spriteSettings, viewerPos)
         if isvector(state.corner.axisWorldDir) then
             local axisHalfLength = math.Clamp(IsValid(state.corner.ent) and state.corner.ent:BoundingRadius() * 0.18 or 12, 8, 28)
@@ -4041,163 +4777,154 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw", function(bDrawing
     end
 
     if state.pending then
-        drawFrame(LocalToWorldPosPrecise(state.pending.solve.sourceAnchorLocal, state.pending.pos, state.pending.ang), state.pending.ang, 10, 120)
+        local pendingSolve = state.pending.solve
+        local pendingAnchor = pendingSolve
+            and (isvector(pendingSolve.sourceAnchorWorld)
+                and pendingSolve.sourceAnchorWorld
+                or LocalToWorldPosPrecise(pendingSolve.sourceAnchorLocal, state.pending.pos, state.pending.ang))
+        if pendingAnchor then
+            drawFrame(pendingAnchor, state.pending.ang, 10, 120)
+        end
     end
 
     if state.preview and state.preview.solve then
         local solve = state.preview.solve
-        local baseAnchor = LocalToWorldPosPrecise(solve.sourceAnchorLocal, solve.pos, solve.ang)
-        local liveAnchor = LocalToWorldPosPrecise(solve.sourceAnchorLocal, state.preview.pos, state.preview.ang)
-        local liveContext = LocalToWorldPosPrecise(solve.sourceContextLocal and solve.sourceContextLocal.pos or solve.sourceAnchorLocal, state.preview.pos, state.preview.ang)
+        local sourceAnchorWorld = isvector(solve.sourceAnchorWorld) and solve.sourceAnchorWorld or nil
+        local sourceContextWorld = isvector(solve.sourceContextWorld) and solve.sourceContextWorld or nil
+        local baseAnchor = sourceAnchorWorld or LocalToWorldPosPrecise(solve.sourceAnchorLocal, solve.pos, solve.ang)
+        local liveAnchor = sourceAnchorWorld or LocalToWorldPosPrecise(solve.sourceAnchorLocal, state.preview.pos, state.preview.ang)
+        local liveContext = sourceContextWorld or LocalToWorldPosPrecise(solve.sourceContextLocal and solve.sourceContextLocal.pos or solve.sourceAnchorLocal, state.preview.pos, state.preview.ang)
 
         drawFrame(baseAnchor, solve.ang, 12, 80)
         drawFrame(liveAnchor, state.preview.ang, 16, 220)
         drawFrame(liveContext, solve.axisAng, 8, 110)
+    end
 
-        local g = reusableHoverGizmoForRender(state) or client.gizmo(tool, state)
-        if g then
-            local showRotation = g.disableRotation ~= true
-            local axisHandleRadius = g.size * 0.09
-            local traceSnapLength = tool and tool.GetClientInfo and tonumber(tool:GetClientInfo("trace_snap_length")) or 0
-            local traceMarkerHalfSize = math.Clamp(math.min(g.size * 0.028, traceSnapLength * 0.14), 0.24, 0.95)
-            local press = state.press
-            local activeHandle = press and press.kind == "gizmo" and press.space == g.space and press.gizmo or nil
-            local basisForward, basisRight, basisUp = M.AngleAxesPrecise(g.basis)
-            local xHandle = M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisForward, g.size))
-            local yHandle = M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisRight, g.size))
-            local zHandle = M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisUp, g.size))
+    drawGizmoOverlay(tool, state, spriteSettings, viewerPos)
 
-            if shouldDrawGizmoHandle(activeHandle, "move", "x") then
-                drawLine(g.origin, M.SubtractVectorsPrecise(xHandle, M.ScaleVectorPrecise(basisForward, axisHandleRadius)), colors.x, true)
-                drawCircleSprite(xHandle, axisHandleRadius, colors.x, spriteSettings, viewerPos)
-            end
-            if shouldDrawGizmoHandle(activeHandle, "move", "y") then
-                drawLine(g.origin, M.SubtractVectorsPrecise(yHandle, M.ScaleVectorPrecise(basisRight, axisHandleRadius)), colors.y, true)
-                drawCircleSprite(yHandle, axisHandleRadius, colors.y, spriteSettings, viewerPos)
-            end
-            if shouldDrawGizmoHandle(activeHandle, "move", "z") then
-                drawLine(g.origin, M.SubtractVectorsPrecise(zHandle, M.ScaleVectorPrecise(basisUp, axisHandleRadius)), colors.z, true)
-                drawCircleSprite(zHandle, axisHandleRadius, colors.z, spriteSettings, viewerPos)
-            end
+    cam.IgnoreZ(false)
+end
 
-            if shouldDrawGizmoHandle(activeHandle, "plane", "xy") then
-                drawPlaneSquare(M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisForward, g.planeOffset)), M.ScaleVectorPrecise(basisRight, g.planeOffset)), basisForward, basisRight, g.size * 0.11, colors.xy)
-            end
-            if shouldDrawGizmoHandle(activeHandle, "plane", "xz") then
-                drawPlaneSquare(M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisForward, g.planeOffset)), M.ScaleVectorPrecise(basisUp, g.planeOffset)), basisForward, basisUp, g.size * 0.11, colors.xz, nil, true, true)
-            end
-            if shouldDrawGizmoHandle(activeHandle, "plane", "yz") then
-                drawPlaneSquare(M.AddVectorsPrecise(M.AddVectorsPrecise(g.origin, M.ScaleVectorPrecise(basisRight, g.planeOffset)), M.ScaleVectorPrecise(basisUp, g.planeOffset)), basisRight, basisUp, g.size * 0.11, colors.yz)
-            end
+function TOOL:DrawHUD()
+    local tool, state = client.activeTool()
+    if tool ~= self then return end
+    if not client.validateState(self, state) then return end
 
-            if traceSnapLength > 0 then
-                local xTraceDir, xTrace = activeTraceMarkerDirection(state, g, "x")
-                local yTraceDir, yTrace = activeTraceMarkerDirection(state, g, "y")
-                local zTraceDir, zTrace = activeTraceMarkerDirection(state, g, "z")
+    local hoverCandidate = state.hover and (state.hover.candidate or state.hover.overlay)
+    local mirrorActive = M.IsMirrorMode and M.IsMirrorMode(state)
+    local sourceAnchorOptions = anchorOptions(tool, "from")
+    local targetAnchorOptions = not mirrorActive and anchorOptions(tool, "to") or nil
+    local pointCache = state._magicAlignPointWorldCache or {}
+    state._magicAlignPointWorldCache = pointCache
 
-                if xTraceDir then
-                    drawTraceSnapAxisMarker(g.origin, xTraceDir, basisRight, basisUp, traceSnapLength, traceMarkerHalfSize, colors.x, xTrace)
-                end
-                if yTraceDir then
-                    drawTraceSnapAxisMarker(g.origin, yTraceDir, basisForward, basisUp, traceSnapLength, traceMarkerHalfSize, colors.y, yTrace)
-                end
-                if zTraceDir then
-                    drawTraceSnapAxisMarker(g.origin, zTraceDir, basisForward, basisRight, traceSnapLength, traceMarkerHalfSize, colors.z, zTrace)
-                end
+    drawPoints(state.prop1, state.source, colors.source, state.preview and state.preview.solve and state.preview.solve.sourceAnchorId, sourceAnchorOptions, nil, pointCache)
+    if not mirrorActive then
+        drawPoints(state.prop2, state.target, colors.target, state.preview and state.preview.solve and state.preview.solve.targetAnchorId, targetAnchorOptions, nil, pointCache)
+    end
+    client.MirrorRender.drawPointLabels(state, colors.mirror)
+    client.HoverRender.drawGridLabels(state, hoverCandidate)
+end
+
+hook.Remove("PreDrawViewModel", "magic_align_draw_before_viewmodel")
+hook.Remove("PreDrawTranslucentRenderables", "magic_align_draw")
+hook.Remove("PostDrawTranslucentRenderables", "magic_align_draw")
+hook.Remove("PostDrawTranslucentRenderables", "magic_align_draw_gizmo")
+hook.Remove("PostDrawTranslucentRenderables", "magic_align_draw_overlay")
+
+local lastOpaqueGhostFrame
+local function shouldDrawOpaqueGhostPass()
+    if render.GetRenderTarget and render.GetRenderTarget() ~= nil then
+        return false
+    end
+
+    if isfunction(FrameNumber) then
+        local frame = FrameNumber()
+        if frame ~= nil then
+            if lastOpaqueGhostFrame == frame then
+                return false
             end
 
-            drawTranslationSnapOverlay(tool, state, g, spriteSettings, viewerPos)
-
-            local ringRenderSettings = showRotation and spriteSettings or nil
-            if showRotation then
-                local rotationRings = reusableRotationRings
-                local rollRing = rotationRings[1]
-                rollRing.axis, rollRing.a, rollRing.b, rollRing.c = basisForward, basisRight, basisUp, colors.x
-                local pitchRing = rotationRings[2]
-                pitchRing.axis, pitchRing.a, pitchRing.b, pitchRing.c = basisRight, basisForward, basisUp, colors.y
-                local yawRing = rotationRings[3]
-                yawRing.axis, yawRing.a, yawRing.b, yawRing.c = basisUp, basisForward, basisRight, colors.z
-                local rotationSnapEnabled = not (input.IsKeyDown(KEY_LSHIFT) or input.IsKeyDown(KEY_RSHIFT))
-                local activeRotationKey = rotationSnapEnabled and g.hover and g.hover.kind == "rot" and g.hover.key or nil
-                local rotationDivisions = client.rotationSnapDivisions(tool)
-                local rotationStep = client.rotationSnapStep(tool) or (360 / math.max(rotationDivisions, 1))
-
-                for i = 1, #rotationRings do
-                    local item = rotationRings[i]
-                    if shouldDrawGizmoHandle(activeHandle, "rot", item.key) then
-                        drawRotationRingBand(g.origin, item.a, item.b, g.ringRadius, g.ringPadding, item.c, nil, ringRenderSettings)
-
-                        if press and press.kind == "gizmo"
-                            and press.gizmo and press.gizmo.kind == "rot"
-                            and press.gizmo.key == item.key
-                            and press.startRingAngle and press.currentRingAngle then
-                            local sectorStartAngle = math.deg(press.startRingAngle)
-                            local sectorCurrentAngle = press.currentRingAngle
-                            if rotationSnapEnabled then
-                                sectorStartAngle = snapRotationDisplayAngle(sectorStartAngle, rotationStep)
-                                sectorCurrentAngle = snapRotationDisplayAngle(sectorCurrentAngle, rotationStep)
-                            end
-
-                            drawRotationDeltaSector(
-                                g.origin,
-                                item.a,
-                                item.b,
-                                g.ringRadius,
-                                g.ringPadding,
-                                sectorStartAngle,
-                                sectorCurrentAngle,
-                                item.c,
-                                ringRenderSettings
-                            )
-                        end
-
-                        if activeRotationKey == item.key and rotationDivisions > 0 then
-                            local fallbackAngle = press and press.kind == "gizmo"
-                                and press.gizmo and press.gizmo.kind == "rot"
-                                and press.gizmo.key == item.key
-                                and math.deg(press.startRingAngle)
-                                or 0
-                            local cursorAngle = press and press.kind == "gizmo"
-                                and press.gizmo and press.gizmo.kind == "rot"
-                                and press.gizmo.key == item.key
-                                and press.currentRingAngle
-                                or g.hover and g.hover.kind == "rot"
-                                and g.hover.key == item.key
-                                and g.hover.cursorAngle
-                                or fallbackAngle
-                            cursorAngle = normalizeDegrees(cursorAngle)
-                            local ticks = visibleRotationTicks(rotationDivisions, rotationStep, cursorAngle, ringRenderSettings)
-                            drawRotationRingTicks(g.origin, item.a, item.b, g.ringRadius - g.ringPadding * 0.5, g.size, ticks, colorAlpha(color_white, 220))
-                        end
-                    end
-                end
-            end
-
-            if g.hover and shouldDrawGizmoHandle(activeHandle, g.hover.kind, g.hover.key) then
-                if g.hover.kind == "move" then
-                    local axisDir = g.hover.key == "x" and basisForward
-                        or g.hover.key == "y" and basisRight
-                        or basisUp
-                    drawLine(g.hover.a, g.hover.b - axisDir * axisHandleRadius, color_white, true)
-                    drawRingSprite(g.hover.b, g.size * 0.09, g.size * 0.022, color_white, ringRenderSettings, viewerPos, true)
-                elseif g.hover.kind == "plane" then
-                    if g.hover.key == "xy" then
-                        drawPlaneSquare(g.hover.center, basisForward, basisRight, g.size * 0.135, g.hover.color or colors.xy, color_white)
-                    elseif g.hover.key == "xz" then
-                        drawPlaneSquare(g.hover.center, basisForward, basisUp, g.size * 0.135, g.hover.color or colors.xz, color_white, true, true)
-                    else
-                        drawPlaneSquare(g.hover.center, basisRight, basisUp, g.size * 0.135, g.hover.color or colors.yz, color_white)
-                    end
-                elseif g.hover.key == "roll" then
-                    drawRotationRingBand(g.origin, basisRight, basisUp, g.ringRadius, g.ringPadding, color_white, nil, ringRenderSettings)
-                elseif g.hover.key == "pitch" then
-                    drawRotationRingBand(g.origin, basisForward, basisUp, g.ringRadius, g.ringPadding, color_white, nil, ringRenderSettings)
-                else
-                    drawRotationRingBand(g.origin, basisForward, basisRight, g.ringRadius, g.ringPadding, color_white, nil, ringRenderSettings)
-                end
-            end
+            lastOpaqueGhostFrame = frame
         end
     end
 
-    cam.IgnoreZ(false)
+    return true
+end
+
+hook.Add("PostDrawOpaqueRenderables", "magic_align_draw", function(bDrawingDepth, bDrawingSkybox)
+    if bDrawingDepth or bDrawingSkybox then return end
+    if not shouldDrawOpaqueGhostPass() then return end
+
+    local tool, state = client.activeTool()
+    if not tool then
+        if M.ClientState and IsValid(M.ClientState.ghost) then
+            M.ClientState.ghost:SetNoDraw(true)
+        end
+        if M.ClientState and istable(M.ClientState.linkedGhosts) then
+            for _, ghost in pairs(M.ClientState.linkedGhosts) do
+                if IsValid(ghost) then
+                    ghost:SetNoDraw(true)
+                end
+            end
+        end
+        return
+    end
+    if not client.validateState(tool, state) then return end
+
+    local ghostEntries = shapeMetricCache.renderPerf.reusableGhostEntries or {}
+    shapeMetricCache.renderPerf.reusableGhostEntries = ghostEntries
+    ghostEntries._magicAlignCount = 0
+    shapeMetricCache.renderPerf.addGhostRenderEntry(ghostEntries, state.ghost, 0.08, 0.65)
+    if istable(state.linkedGhosts) then
+        for _, ghost in pairs(state.linkedGhosts) do
+            shapeMetricCache.renderPerf.addGhostRenderEntry(ghostEntries, ghost, 0.05, 0.38)
+        end
+    end
+    clearReusableEntries(ghostEntries, ghostEntries._magicAlignCount)
+
+    if previewOccludedEnabled(tool) then
+        local stripeColorOverride = state.preview
+            and state.preview.transformMode == M.TRANSFORM_MODE_MIRROR
+            and (colors.mirror or Color(176, 112, 235))
+            or nil
+        for i = 1, #ghostEntries do
+            local entry = ghostEntries[i]
+            drawPreviewOccludedGhost(tool, entry.ghost, entry.alpha, stripeColorOverride)
+        end
+        drawPreviewOccludedCompatGhosts(tool, state, stripeColorOverride)
+    end
+
+    shapeMetricCache.renderPerf.drawGhostRenderEntries(ghostEntries)
+end)
+
+local lastTranslucentOverlayFrame
+local function shouldDrawTranslucentOverlayPass()
+    if render.GetRenderTarget and render.GetRenderTarget() ~= nil then
+        return false
+    end
+
+    if isfunction(FrameNumber) then
+        local frame = FrameNumber()
+        if frame ~= nil then
+            if lastTranslucentOverlayFrame == frame then
+                return false
+            end
+
+            lastTranslucentOverlayFrame = frame
+        end
+    end
+
+    return true
+end
+
+-- Preview ghosts are translucent clientsidemodels, so draw controls after that pass.
+hook.Add("PostDrawTranslucentRenderables", "magic_align_draw_overlay", function(bDrawingDepth, bDrawingSkybox)
+    if bDrawingDepth or bDrawingSkybox then return end
+    if not shouldDrawTranslucentOverlayPass() then return end
+
+    local tool, state = client.activeTool()
+    if not tool then return end
+    if not client.validateState(tool, state) then return end
+
+    drawInteractionOverlay(tool, state)
 end)

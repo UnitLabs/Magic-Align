@@ -136,7 +136,7 @@ function geometry.worldNormalFromLocal(ent, localPos, localNormal)
     return normalizedVec(worldTip - worldPos)
 end
 
-function geometry.pointFromCandidate(candidate)
+function geometry.pointFromCandidate(candidate, keepReference)
     if not istable(candidate) or not isvector(candidate.localPos) then return end
 
     local point = VectorP(candidate.localPos.x, candidate.localPos.y, candidate.localPos.z)
@@ -153,6 +153,10 @@ function geometry.pointFromCandidate(candidate)
 
     if geometry.isWorldTarget(candidate.ent) then
         point.world = true
+    end
+
+    if keepReference and M.SetPointReference then
+        M.SetPointReference(point, candidate.ent)
     end
 
     return point

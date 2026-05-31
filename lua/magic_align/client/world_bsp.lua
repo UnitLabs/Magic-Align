@@ -21,7 +21,7 @@ local normalizedVec = M.NormalizeVectorPrecise
 local dot = M.DotVectorsPrecise
 local cross = M.CrossVectorsPrecise
 
-local CACHE_VERSION = 13
+local CACHE_VERSION = 15
 
 local WORLD_AXIS_KEYS = { "x", "y", "z" }
 local WORLD_GRID = {
@@ -30,7 +30,7 @@ local WORLD_GRID = {
     maxStep = 512,
     familyEpsilonSqr = 1e-10,
     pairDetEpsilon = 1e-8,
-    extraLineAlphaScale = 0.35,
+    extraLineAlphaScale = 0.62,
     verticalNormalZMax = 0.35,
     horizontalNormalZMin = 0.85
 }
@@ -137,17 +137,30 @@ local function resetCache(status)
     cache.surfaces = {}
     cache.index = {}
     cache.planeBuckets = {}
+    cache.faceDescriptors = {}
+    cache.gridDescriptors = {}
     cache.edgeIndex = {}
     cache.vertexIndex = {}
     cache.largeSurfaces = {}
     cache.sources = {}
     cache.total = 0
+    cache.brushTotal = 0
+    cache.brushProcessed = 0
     cache.cached = 0
     cache.skipped = 0
     cache.displacements = 0
+    cache.displacementTotal = 0
+    cache.displacementProcessed = 0
     cache.displacementSurfaces = 0
     cache.displacementSkipped = 0
     cache.displacementError = nil
+    cache.neighborTotal = 0
+    cache.neighborProcessed = 0
+    cache.stage = status == cache.STATUS.BUILDING and "starting" or nil
+    cache.stageTotal = 0
+    cache.stageProcessed = 0
+    cache.stageStartedAt = nil
+    cache.lastProgressHintAt = nil
     cache.startedAt = nil
     cache.readyAt = nil
     cache.worker = nil
@@ -394,8 +407,44 @@ local function surfaceUvFromComponents(surfaceData, x, y, z)
         dx * vAxis.x + dy * vAxis.y + dz * vAxis.z
 end
 
+local function setVectorComponents(out, x, y, z)
+    if isvector(out) then
+        out.x, out.y, out.z = x, y, z
+        return out
+    end
+
+    return VectorP(x, y, z)
+end
+
+local function worldFromUvInto(surfaceData, u, v, out)
+    local origin = surfaceData.origin
+    local uAxis = surfaceData.uAxis
+    local vAxis = surfaceData.vAxis
+
+    return setVectorComponents(
+        out,
+        origin.x + uAxis.x * u + vAxis.x * v,
+        origin.y + uAxis.y * u + vAxis.y * v,
+        origin.z + uAxis.z * u + vAxis.z * v
+    )
+end
+
 local function worldFromUv(surfaceData, u, v)
-    return surfaceData.origin + surfaceData.uAxis * u + surfaceData.vAxis * v
+    return worldFromUvInto(surfaceData, u, v)
+end
+
+local function worldAxisFromUv(surfaceData, u, v, axisKey)
+    local origin = surfaceData.origin
+    local uAxis = surfaceData.uAxis
+    local vAxis = surfaceData.vAxis
+
+    if axisKey == "x" then
+        return origin.x + uAxis.x * u + vAxis.x * v
+    elseif axisKey == "y" then
+        return origin.y + uAxis.y * u + vAxis.y * v
+    end
+
+    return origin.z + uAxis.z * u + vAxis.z * v
 end
 
 local function boundsDistanceSqr(surfaceData, x, y, z, tolerance)
@@ -429,6 +478,17 @@ end
 local function usesGlobalGrid(settings)
     local mode = string.lower(tostring(settings and settings.worldBspGridMode or "global"))
     return mode == "global" or mode == "global_units"
+end
+
+function worldBSP.usesGlobalGrid(settings)
+    return usesGlobalGrid(settings)
+end
+
+function worldBSP.shouldBuildCache(settings)
+    return settings
+        and settings.worldTarget ~= false
+        and settings.worldBspSnap == true
+        and usesGlobalGrid(settings)
 end
 
 local function buildGlobalFamilies(surfaceData)
@@ -737,57 +797,88 @@ local function buildSurfaceEdges(vertices)
     return edges
 end
 
-local function addLineIntersection(values, value, eps)
-    for i = 1, #values do
-        if math.abs(values[i] - value) <= eps then
-            return
-        end
+local function addClippedRangeValue(minValue, maxValue, uniqueCount, value, eps)
+    if not minValue then
+        return value, value, 1
     end
 
-    values[#values + 1] = value
+    if math.abs(value - minValue) <= eps or math.abs(value - maxValue) <= eps then
+        return minValue, maxValue, uniqueCount
+    end
+
+    if value < minValue then
+        minValue = value
+    elseif value > maxValue then
+        maxValue = value
+    end
+
+    return minValue, maxValue, uniqueCount + 1
 end
 
 local function clippedLineRange(face, axisKey, value)
     local polygon = face and face.polygon
     if not istable(polygon) or #polygon < 3 then return end
 
-    local values = {}
     local eps = CONFIG.polygonTolerance
-    local key = axisKey == "u" and "u" or "v"
-    local other = axisKey == "u" and "v" or "u"
+    local minOther, maxOther, uniqueCount
     local previous = polygon[#polygon]
 
-    for i = 1, #polygon do
-        local current = polygon[i]
-        local a = previous[key]
-        local b = current[key]
-        local oa = previous[other]
-        local ob = current[other]
+    if axisKey == "u" then
+        for i = 1, #polygon do
+            local current = polygon[i]
+            local a = previous.u
+            local b = current.u
+            local oa = previous.v
+            local ob = current.v
 
-        if math.abs(a - value) <= eps and math.abs(b - value) <= eps then
-            addLineIntersection(values, oa, eps)
-            addLineIntersection(values, ob, eps)
-        elseif math.abs(a - b) > eps and value >= math.min(a, b) - eps and value <= math.max(a, b) + eps then
-            local t = (value - a) / (b - a)
-            if t >= -eps and t <= 1 + eps then
-                addLineIntersection(values, oa + (ob - oa) * math.Clamp(t, 0, 1), eps)
+            if math.abs(a - value) <= eps and math.abs(b - value) <= eps then
+                minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, oa, eps)
+                minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, ob, eps)
+            elseif math.abs(a - b) > eps and value >= (a < b and a or b) - eps and value <= (a > b and a or b) + eps then
+                local t = (value - a) / (b - a)
+                if t >= -eps and t <= 1 + eps then
+                    minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, oa + (ob - oa) * math.Clamp(t, 0, 1), eps)
+                end
+            elseif math.abs(a - value) <= eps then
+                minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, oa, eps)
+            elseif math.abs(b - value) <= eps then
+                minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, ob, eps)
             end
-        elseif math.abs(a - value) <= eps then
-            addLineIntersection(values, oa, eps)
-        elseif math.abs(b - value) <= eps then
-            addLineIntersection(values, ob, eps)
-        end
 
-        previous = current
+            previous = current
+        end
+    else
+        for i = 1, #polygon do
+            local current = polygon[i]
+            local a = previous.v
+            local b = current.v
+            local oa = previous.u
+            local ob = current.u
+
+            if math.abs(a - value) <= eps and math.abs(b - value) <= eps then
+                minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, oa, eps)
+                minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, ob, eps)
+            elseif math.abs(a - b) > eps and value >= (a < b and a or b) - eps and value <= (a > b and a or b) + eps then
+                local t = (value - a) / (b - a)
+                if t >= -eps and t <= 1 + eps then
+                    minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, oa + (ob - oa) * math.Clamp(t, 0, 1), eps)
+                end
+            elseif math.abs(a - value) <= eps then
+                minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, oa, eps)
+            elseif math.abs(b - value) <= eps then
+                minOther, maxOther, uniqueCount = addClippedRangeValue(minOther, maxOther, uniqueCount, ob, eps)
+            end
+
+            previous = current
+        end
     end
 
-    if #values < 2 then return end
+    if (uniqueCount or 0) < 2 then return end
 
-    table.sort(values)
-    return values[1], values[#values]
+    return minOther, maxOther
 end
 
-function worldBSP.faceLineWorldPoints(face, _, axisKey, value)
+function worldBSP.faceLineWorldPoints(face, _, axisKey, value, outA, outB)
     local surfaceData = face and face.surface
     if not surfaceData then return end
 
@@ -795,10 +886,10 @@ function worldBSP.faceLineWorldPoints(face, _, axisKey, value)
     if not minOther or not maxOther then return end
 
     if axisKey == "u" then
-        return worldFromUv(surfaceData, value, minOther), worldFromUv(surfaceData, value, maxOther)
+        return worldFromUvInto(surfaceData, value, minOther, outA), worldFromUvInto(surfaceData, value, maxOther, outB)
     end
 
-    return worldFromUv(surfaceData, minOther, value), worldFromUv(surfaceData, maxOther, value)
+    return worldFromUvInto(surfaceData, minOther, value, outA), worldFromUvInto(surfaceData, maxOther, value, outB)
 end
 
 local function surfaceMaterialName(surfaceInfo)
@@ -900,6 +991,7 @@ local function buildSurfaceData(surfaceInfo, index, source, sourceSurfaceIndex)
         id = index,
         source = source,
         sourceEnt = source and source.ent or nil,
+        sourceIdentity = source and source.identity or nil,
         sourceEntityIndex = source and source.entityIndex or nil,
         sourceClass = source and source.class or nil,
         sourceModel = source and source.model or nil,
@@ -930,6 +1022,13 @@ local function buildSurfaceData(surfaceInfo, index, source, sourceSurfaceIndex)
     end
 
     return surfaceData
+end
+
+function worldBSP.markCachedSurface(surfaceData)
+    if not surfaceData then return end
+
+    surfaceData._magicAlignWorldBspCacheVersion = CACHE_VERSION
+    surfaceData._magicAlignWorldBspCacheMap = cache.map
 end
 
 local function cellCoord(value)
@@ -1113,6 +1212,125 @@ local function addSurfaceNeighbor(surfaceData, neighbor)
     neighbors[#neighbors + 1] = neighbor
 end
 
+function worldBSP.setBuildStage(stage, total, processed)
+    cache.stage = stage
+    cache.stageTotal = math.max(tonumber(total) or 0, 0)
+    cache.stageProcessed = math.Clamp(tonumber(processed) or 0, 0, cache.stageTotal)
+    cache.stageStartedAt = now()
+end
+
+function worldBSP.updateBuildStage(processed, total)
+    if total ~= nil then
+        cache.stageTotal = math.max(tonumber(total) or 0, 0)
+    end
+
+    local stageTotal = tonumber(cache.stageTotal) or 0
+    cache.stageProcessed = stageTotal > 0
+        and math.Clamp(tonumber(processed) or 0, 0, stageTotal)
+        or math.max(tonumber(processed) or 0, 0)
+end
+
+function worldBSP.cacheOverallProgress()
+    if cache.status == cache.STATUS.READY then
+        return 1, 1
+    end
+
+    local done = 0
+    local total = 0
+
+    local brushTotal = tonumber(cache.brushTotal) or tonumber(cache.total) or 0
+    if brushTotal > 0 then
+        total = total + brushTotal
+        done = done + math.Clamp(tonumber(cache.brushProcessed) or 0, 0, brushTotal)
+    end
+
+    local displacementTotal = tonumber(cache.displacementTotal) or 0
+    local displacementProcessed = tonumber(cache.displacementProcessed) or 0
+    if displacementTotal > 0 or displacementProcessed > 0 then
+        displacementTotal = math.max(displacementTotal, displacementProcessed)
+        total = total + displacementTotal
+        done = done + math.Clamp(displacementProcessed, 0, displacementTotal)
+    end
+
+    local neighborTotal = tonumber(cache.neighborTotal) or 0
+    local neighborProcessed = tonumber(cache.neighborProcessed) or 0
+    if neighborTotal > 0 or neighborProcessed > 0 then
+        neighborTotal = math.max(neighborTotal, neighborProcessed)
+        total = total + neighborTotal
+        done = done + math.Clamp(neighborProcessed, 0, neighborTotal)
+    end
+
+    if total <= 0 then
+        local stageTotal = tonumber(cache.stageTotal) or 0
+        if stageTotal <= 0 then return nil, nil end
+        return math.Clamp(tonumber(cache.stageProcessed) or 0, 0, stageTotal), stageTotal
+    end
+
+    return done, total
+end
+
+function worldBSP.cacheProgress()
+    local currentStatus = cache.status or cache.STATUS.IDLE
+    local currentTime = now()
+    local startedAt = tonumber(cache.startedAt)
+    local readyAt = tonumber(cache.readyAt)
+    local elapsed = startedAt and math.max((readyAt or currentTime) - startedAt, 0) or 0
+    local done, total = worldBSP.cacheOverallProgress()
+    local fraction = done and total and total > 0 and math.Clamp(done / total, 0, 1) or nil
+    local eta
+
+    if currentStatus == cache.STATUS.BUILDING and fraction and fraction > 0 and fraction < 1 then
+        eta = elapsed * (1 - fraction) / fraction
+    elseif currentStatus == cache.STATUS.READY then
+        fraction = 1
+        eta = 0
+    end
+
+    local stageTotal = tonumber(cache.stageTotal) or 0
+    local stageProcessed = tonumber(cache.stageProcessed) or 0
+    local stageFraction = stageTotal > 0 and math.Clamp(stageProcessed / stageTotal, 0, 1) or nil
+    local stageElapsed = cache.stageStartedAt and math.max(currentTime - cache.stageStartedAt, 0) or 0
+    local stageEta
+    if currentStatus == cache.STATUS.BUILDING and stageFraction and stageFraction > 0 and stageFraction < 1 then
+        stageEta = stageElapsed * (1 - stageFraction) / stageFraction
+    end
+
+    return {
+        status = currentStatus,
+        stage = cache.stage,
+        percent = fraction and fraction * 100 or nil,
+        fraction = fraction,
+        eta = eta,
+        elapsed = elapsed,
+        done = done,
+        total = total,
+        stagePercent = stageFraction and stageFraction * 100 or nil,
+        stageFraction = stageFraction,
+        stageEta = stageEta,
+        stageElapsed = stageElapsed,
+        stageDone = stageProcessed,
+        stageTotal = stageTotal
+    }
+end
+
+function worldBSP.formatProgressPercent(value)
+    if value == nil then return "n/a" end
+    return ("%.1f%%"):format(math.Clamp(tonumber(value) or 0, 0, 100))
+end
+
+function worldBSP.formatProgressSeconds(seconds)
+    seconds = tonumber(seconds)
+    if not seconds or seconds < 0 or seconds == math.huge or seconds ~= seconds then
+        return "n/a"
+    end
+
+    if seconds >= 60 then
+        return ("%dm%02ds"):format(math.floor(seconds / 60), math.floor(seconds % 60))
+    end
+
+    return ("%.1fs"):format(seconds)
+end
+
 local function edgeIntervalsOverlap(edgeA, edgeB)
     local a0 = dot(edgeA.a, edgeA.dir)
     local a1 = dot(edgeA.b, edgeA.dir)
@@ -1150,6 +1368,9 @@ end
 local function buildDirectNeighborCache()
     cache.edgeIndex = {}
     cache.vertexIndex = {}
+    cache.neighborTotal = math.max(#(cache.surfaces or {}) * 2, 0)
+    cache.neighborProcessed = 0
+    worldBSP.setBuildStage("neighbor_index", #(cache.surfaces or {}), 0)
 
     for i = 1, #(cache.surfaces or {}) do
         local surfaceData = cache.surfaces[i]
@@ -1157,10 +1378,13 @@ local function buildDirectNeighborCache()
         surfaceData.neighborSeen = {}
         indexSurfaceEdges(surfaceData)
         indexSurfaceVertices(surfaceData)
+        cache.neighborProcessed = i
+        worldBSP.updateBuildStage(i)
         maybeYield()
     end
 
     local tested = {}
+    worldBSP.setBuildStage("neighbor_links", #(cache.surfaces or {}), 0)
     for i = 1, #(cache.surfaces or {}) do
         local surfaceData = cache.surfaces[i]
         for edgeIndex = 1, #(surfaceData.edges or {}) do
@@ -1230,6 +1454,9 @@ local function buildDirectNeighborCache()
 
             maybeYield()
         end
+
+        cache.neighborProcessed = #(cache.surfaces or {}) + i
+        worldBSP.updateBuildStage(i)
     end
 
     for i = 1, #(cache.surfaces or {}) do
@@ -1241,6 +1468,8 @@ local function finishBuild()
     cache.status = cache.STATUS.READY
     cache.readyAt = now()
     cache.worker = nil
+    cache.stage = "ready"
+    cache.stageProcessed = cache.stageTotal
 
     local seconds = math.max(cache.readyAt - (cache.startedAt or cache.readyAt), 0)
     local displacementInfo = ""
@@ -1298,6 +1527,18 @@ local function isWorldBrushEntity(ent)
     return entityIndex(ent) == 0
 end
 
+local function entityIdentity(ent)
+    if isWorldBrushEntity(ent) then
+        return "world:0"
+    end
+
+    return ("%s:%s:%s"):format(
+        tostring(entityIndex(ent) or "nil"),
+        tostring(entityClass(ent) or ""),
+        tostring(entityModel(ent) or "")
+    )
+end
+
 local function readWorldBrushSurfaceSources()
     local candidates = {}
     local count = 0
@@ -1341,6 +1582,7 @@ local function readWorldBrushSurfaceSources()
                 local sourceIndex = #sources + 1
                 sources[sourceIndex] = {
                     ent = ent,
+                    identity = entityIdentity(ent),
                     entityIndex = entityIndex(ent),
                     class = entityClass(ent),
                     model = entityModel(ent),
@@ -1777,6 +2019,7 @@ local function addDisplacementTriangleSurface(source, group, materialName, verti
     surfaceData.displacementHalf = half
     surfaceData.displacementDiagonal = diagonal
     surfaceData.materialName = materialName or surfaceData.materialName or "**displacement**"
+    worldBSP.markCachedSurface(surfaceData)
     group.surfaces[#group.surfaces + 1] = surfaceData
 
     cache.cached = cache.cached + 1
@@ -1858,6 +2101,7 @@ local function appendDisplacementSurfacesForInfo(data, header, info, surfaceId)
     local materialName = readBspTextureName(data, header, face and face.texInfo) or "**displacement**"
     local source = {
         ent = game and isfunction(game.GetWorld) and game.GetWorld() or nil,
+        identity = "world:0",
         entityIndex = 0,
         class = "worldspawn",
         model = nil,
@@ -1929,6 +2173,10 @@ local function appendBspDisplacementSurfaces(surfaceId)
     local dispInfoCount = bspLumpCount(header, BSP.lumpDispInfo, BSP.dispInfoSize)
     if dispInfoCount <= 0 then return surfaceId end
 
+    cache.displacementTotal = dispInfoCount
+    cache.displacementProcessed = 0
+    worldBSP.setBuildStage("displacements", dispInfoCount, 0)
+
     for i = 0, dispInfoCount - 1 do
         local info = readBspDispInfo(data, header, i)
         if info then
@@ -1941,6 +2189,8 @@ local function appendBspDisplacementSurfaces(surfaceId)
             cache.displacementSkipped = cache.displacementSkipped + 1
         end
 
+        cache.displacementProcessed = i + 1
+        worldBSP.updateBuildStage(i + 1)
         maybeYield()
     end
 
@@ -1963,6 +2213,9 @@ local function buildWorker()
     for i = 1, #sources do
         cache.total = cache.total + (tonumber(sources[i].surfaceCount) or 0)
     end
+    cache.brushTotal = cache.total
+    cache.brushProcessed = 0
+    cache.neighborTotal = cache.total * 2
     if cache.total <= 0 then
         cache.status = cache.STATUS.UNAVAILABLE
         cache.worker = nil
@@ -1970,6 +2223,8 @@ local function buildWorker()
         print("Magic Align: World BSP snapping unavailable; the world brush surface list was empty.")
         return
     end
+
+    worldBSP.setBuildStage("brush_surfaces", cache.total, 0)
 
     local surfaceId = 0
     for sourceIndex = 1, #sources do
@@ -1979,6 +2234,7 @@ local function buildWorker()
             surfaceId = surfaceId + 1
             local surfaceData = buildSurfaceData(surfaces[i], surfaceId, source, i)
             if surfaceData then
+                worldBSP.markCachedSurface(surfaceData)
                 cache.cached = cache.cached + 1
                 cache.surfaces[cache.cached] = surfaceData
                 indexSurface(surfaceData)
@@ -1987,6 +2243,8 @@ local function buildWorker()
                 cache.skipped = cache.skipped + 1
             end
 
+            cache.brushProcessed = cache.brushProcessed + 1
+            worldBSP.updateBuildStage(cache.brushProcessed)
             maybeYield()
         end
 
@@ -2002,7 +2260,9 @@ local function startBuild()
     resetCache(cache.STATUS.BUILDING)
     cache.startedAt = now()
     cache.worker = coroutine.create(buildWorker)
-    cache.hintedSlow = true
+    cache.hintedSlow = false
+    cache.lastProgressHintAt = cache.startedAt
+    worldBSP.setBuildStage("starting", 0, 0)
 
     print("Magic Align: World BSP snapping cache is building...")
     if notification and notification.AddLegacy then
@@ -2011,18 +2271,46 @@ local function startBuild()
 end
 
 local function maybeSlowHint()
-    if cache.hintedSlow or cache.status ~= cache.STATUS.BUILDING then return end
-    if now() - (cache.startedAt or now()) < CONFIG.hintAfterSeconds then return end
+    if cache.status ~= cache.STATUS.BUILDING then return end
+
+    local currentTime = now()
+    local lastHintAt = tonumber(cache.lastProgressHintAt) or tonumber(cache.startedAt) or currentTime
+    if currentTime - lastHintAt < CONFIG.hintAfterSeconds then return end
 
     cache.hintedSlow = true
-    print("Magic Align: World BSP snapping is still building...")
+    cache.lastProgressHintAt = currentTime
+
+    local progress = worldBSP.cacheProgress()
+    local message = ("Magic Align: World BSP snapping is still building (%s, stage=%s %s, ETA %s)."):format(
+        worldBSP.formatProgressPercent(progress.percent),
+        tostring(progress.stage or "unknown"),
+        worldBSP.formatProgressPercent(progress.stagePercent),
+        worldBSP.formatProgressSeconds(progress.eta or progress.stageEta)
+    )
+
+    print(message)
     if notification and notification.AddLegacy then
-        notification.AddLegacy("Magic Align world snapping is still building...", NOTIFY_HINT, 4)
+        notification.AddLegacy(
+            ("Magic Align BSP cache: %s, ETA %s."):format(
+                worldBSP.formatProgressPercent(progress.percent),
+                worldBSP.formatProgressSeconds(progress.eta or progress.stageEta)
+            ),
+            NOTIFY_HINT,
+            4
+        )
     end
 end
 
 function worldBSP.update(settings)
-    if not settings or not settings.worldBspSnap then return end
+    if not worldBSP.shouldBuildCache(settings) then
+        if cache.status == cache.STATUS.BUILDING then
+            print("Magic Align: World BSP snapping cache build cancelled; global units grid is not active.")
+            resetCache(cache.STATUS.IDLE)
+        elseif cache.status == cache.STATUS.READY then
+            resetCache(cache.STATUS.IDLE)
+        end
+        return
+    end
 
     if cache.version ~= CACHE_VERSION or cache.map ~= currentMap() or cache.status == cache.STATUS.IDLE then
         startBuild()
@@ -2538,9 +2826,8 @@ local function keepGlobalSnapCandidate(best, candidate, rawU, rawV)
 end
 
 local function globalPairSnapCandidate(face, surfaceData, pair, rawU, rawV, step)
-    local rawWorld = worldFromUv(surfaceData, rawU, rawV)
-    local baseU = math.Round(axisComponent(rawWorld, pair.axisU) / step)
-    local baseV = math.Round(axisComponent(rawWorld, pair.axisV) / step)
+    local baseU = math.Round(worldAxisFromUv(surfaceData, rawU, rawV, pair.axisU) / step)
+    local baseV = math.Round(worldAxisFromUv(surfaceData, rawU, rawV, pair.axisV) / step)
     local best
 
     for du = -1, 1 do
@@ -2575,8 +2862,7 @@ end
 local function globalLineSnapCandidate(face, surfaceData, family, rawU, rawV, step)
     if not family then return end
 
-    local rawWorld = worldFromUv(surfaceData, rawU, rawV)
-    local value = math.Round(axisComponent(rawWorld, family.axis) / step) * step
+    local value = math.Round(worldAxisFromUv(surfaceData, rawU, rawV, family.axis) / step) * step
     local rhs = value - family.origin
     local denom = family.uCoeff * family.uCoeff + family.vCoeff * family.vCoeff
     if denom <= WORLD_GRID.familyEpsilonSqr then return end
@@ -3345,14 +3631,115 @@ local function buildRenderNeighborFaces(surfaceData, settings)
     return out
 end
 
-local function buildFace(surfaceData, normal, rawU, rawV, settings)
-    local face = {
+-- Surface descriptor invalidation is intentionally tied to the owning cache:
+-- the global BSP cache is rebuilt on map/CACHE_VERSION changes, while
+-- per-surface trace entries are rebuilt when the map changes or the brush
+-- entity identity/object is no longer current. Grid settings are part of the
+-- grid descriptor key, so setting changes select a new descriptor without
+-- mutating existing hover state.
+worldBSP.HOVER_FACE_META = worldBSP.HOVER_FACE_META or {}
+worldBSP.HOVER_FACE_META.__index = function(face, key)
+    local gridDescriptor = rawget(face, "gridDescriptor")
+    local gridValue = gridDescriptor and gridDescriptor[key]
+    if gridValue ~= nil then return gridValue end
+
+    local faceDescriptor = rawget(face, "faceDescriptor")
+    return faceDescriptor and faceDescriptor[key] or nil
+end
+
+function worldBSP.surfaceSourceIdentity(surfaceData)
+    if not surfaceData then return "unknown" end
+    if surfaceData.sourceIsWorld == true then return "world:0" end
+
+    local sourceEnt = surfaceData.sourceEnt
+    if IsValid(sourceEnt) then
+        return entityIdentity(sourceEnt)
+    end
+
+    return surfaceData.sourceIdentity or ("%s:%s:%s"):format(
+        tostring(surfaceData.sourceEntityIndex or "nil"),
+        tostring(surfaceData.sourceClass or ""),
+        tostring(surfaceData.sourceModel or "")
+    )
+end
+
+function worldBSP.surfaceDescriptorBaseKey(surfaceData)
+    return ("%s:%s:%s"):format(
+        tostring(currentMap()),
+        worldBSP.surfaceSourceIdentity(surfaceData),
+        tostring(surfaceData and surfaceData.id or "nil")
+    )
+end
+
+function worldBSP.surfaceGridSettingsKey(settings)
+    if usesGlobalGrid(settings) then
+        return ("global:%.6f:%d"):format(
+            worldGridStep(settings),
+            settings and settings.worldBspFullGrid == false and 0 or 1
+        )
+    end
+
+    if settings and settings.shift then
+        return "surface:free"
+    end
+
+    return ("surface:%d:%d:%d:%d:%d:%d"):format(
+        math.Round(tonumber(settings and settings.gridA) or 0),
+        math.Round(tonumber(settings and settings.gridAMin) or 0),
+        settings and settings.gridBEnabled and 1 or 0,
+        math.Round(tonumber(settings and settings.gridB) or 0),
+        math.Round(tonumber(settings and settings.gridBMin) or 0),
+        math.Round(tonumber(settings and settings.minLength) or 0)
+    )
+end
+
+function worldBSP.globalSurfaceDescriptorIsCurrent(surfaceData)
+    return surfaceData
+        and surfaceData._magicAlignWorldBspCacheVersion == CACHE_VERSION
+        and surfaceData._magicAlignWorldBspCacheMap == cache.map
+end
+
+function worldBSP.surfaceDescriptorStores(surfaceData)
+    local entry = surfaceData and surfaceData._magicAlignSurfaceTraceEntry
+    if entry and worldBSP.surfaceTraceCachedSurfaceIsCurrent(surfaceData) then
+        entry.faceDescriptors = entry.faceDescriptors or {}
+        entry.gridDescriptors = entry.gridDescriptors or {}
+        return entry.faceDescriptors, entry.gridDescriptors
+    end
+
+    if worldBSP.globalSurfaceDescriptorIsCurrent(surfaceData) then
+        cache.faceDescriptors = cache.faceDescriptors or {}
+        cache.gridDescriptors = cache.gridDescriptors or {}
+        return cache.faceDescriptors, cache.gridDescriptors
+    end
+
+    surfaceData._magicAlignDescriptorFallback = surfaceData._magicAlignDescriptorFallback or {
+        faceDescriptors = {},
+        gridDescriptors = {}
+    }
+
+    return surfaceData._magicAlignDescriptorFallback.faceDescriptors,
+        surfaceData._magicAlignDescriptorFallback.gridDescriptors
+end
+
+function worldBSP.buildSurfaceFaceDescriptor(surfaceData, key)
+    return {
+        kind = "SurfaceFaceDescriptor",
+        key = key,
+        map = currentMap(),
+        entityIdentity = worldBSP.surfaceSourceIdentity(surfaceData),
+        surfaceId = surfaceData and surfaceData.id or nil,
+        sourceSurfaceIndex = surfaceData and surfaceData.sourceSurfaceIndex or nil,
         worldBSP = true,
         surface = surfaceData,
         lineWorldPoints = worldBSP.faceLineWorldPoints,
         polygon = surfaceData.polygon,
         worldCorners = surfaceData.vertices,
-        normal = normal,
+        worldMins = surfaceData.worldMins,
+        worldMaxs = surfaceData.worldMaxs,
+        surfaceNormal = surfaceData.normal,
+        uAxis = surfaceData.uAxis,
+        vAxis = surfaceData.vAxis,
         origin = surfaceData.center,
         center = surfaceData.center,
         uMin = surfaceData.uMin,
@@ -3360,18 +3747,130 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
         vMin = surfaceData.vMin,
         vMax = surfaceData.vMax
     }
+end
 
-    local globalGrid = usesGlobalGrid(settings)
-    if globalGrid then
-        configureGlobalFace(face, surfaceData, settings)
-        face.globalGridNeighbors = buildRenderNeighborFaces(surfaceData, settings)
+function worldBSP.surfaceFaceDescriptor(surfaceData)
+    if not surfaceData then return end
+
+    local faceStore = worldBSP.surfaceDescriptorStores(surfaceData)
+    if not faceStore then return end
+
+    local key = worldBSP.surfaceDescriptorBaseKey(surfaceData)
+    local descriptor = faceStore[key]
+    if descriptor then return descriptor end
+
+    descriptor = worldBSP.buildSurfaceFaceDescriptor(surfaceData, key)
+    faceStore[key] = descriptor
+    return descriptor
+end
+
+function worldBSP.buildSurfaceGridDescriptor(surfaceData, faceDescriptor, settings, key, settingsKey)
+    local descriptor = {
+        kind = "SurfaceGridDescriptor",
+        key = key,
+        settingsKey = settingsKey,
+        map = currentMap(),
+        entityIdentity = worldBSP.surfaceSourceIdentity(surfaceData),
+        surfaceId = surfaceData and surfaceData.id or nil,
+        faceDescriptor = faceDescriptor
+    }
+
+    if usesGlobalGrid(settings) then
+        local step = worldGridStep(settings)
+        descriptor.globalGrid = true
+        descriptor.globalGridStep = step
+        descriptor.activeGridStep = step
+        descriptor.worldBspFullGrid = not (settings and settings.worldBspFullGrid == false)
+        descriptor.globalGridOverlays = globalProjectionPairs(surfaceData)
+        descriptor.globalGridNeighbors = buildRenderNeighborFaces(surfaceData, settings)
+        return descriptor
     end
 
+    if settings and settings.shift then
+        descriptor.freeFace = true
+        return descriptor
+    end
+
+    local buildDescriptor = client.buildSnapFaceGridDescriptor
+    if isfunction(buildDescriptor) then
+        buildDescriptor(settings or {}, faceDescriptor, descriptor)
+        descriptor.activeGridStep = activeStepFromSnapped({
+            gridA = descriptor.gridA,
+            gridB = descriptor.gridB
+        })
+    end
+
+    return descriptor
+end
+
+function worldBSP.surfaceGridDescriptor(surfaceData, faceDescriptor, settings)
+    if not surfaceData or not faceDescriptor then return end
+
+    local _, gridStore = worldBSP.surfaceDescriptorStores(surfaceData)
+    if not gridStore then return end
+
+    local settingsKey = worldBSP.surfaceGridSettingsKey(settings)
+    local key = ("%s:%s"):format(faceDescriptor.key, settingsKey)
+    local descriptor = gridStore[key]
+    if descriptor then return descriptor end
+
+    descriptor = worldBSP.buildSurfaceGridDescriptor(surfaceData, faceDescriptor, settings, key, settingsKey)
+    gridStore[key] = descriptor
+    return descriptor
+end
+
+function worldBSP.newHoverCandidateState(faceDescriptor, gridDescriptor, normal, rawU, rawV)
+    local face = setmetatable({}, worldBSP.HOVER_FACE_META)
+
+    face.kind = "HoverCandidateState"
+    face.faceDescriptor = faceDescriptor
+    face.gridDescriptor = gridDescriptor
+    face.descriptorKey = faceDescriptor and faceDescriptor.key or nil
+    face.gridDescriptorKey = gridDescriptor and gridDescriptor.key or nil
+
+    face.worldBSP = true
+    face.surface = faceDescriptor.surface
+    face.lineWorldPoints = faceDescriptor.lineWorldPoints
+    face.polygon = faceDescriptor.polygon
+    face.worldCorners = faceDescriptor.worldCorners
+    face.origin = faceDescriptor.origin
+    face.center = faceDescriptor.center
+    face.uMin = faceDescriptor.uMin
+    face.uMax = faceDescriptor.uMax
+    face.vMin = faceDescriptor.vMin
+    face.vMax = faceDescriptor.vMax
+
+    face.rawU = rawU
+    face.rawV = rawV
+    face.normal = normal
+    face.normalSign = dot(normal, face.surface.normal) < 0 and -1 or 1
+
+    face.gridA = gridDescriptor and gridDescriptor.gridA or nil
+    face.gridB = gridDescriptor and gridDescriptor.gridB or nil
+    face.globalGrid = gridDescriptor and gridDescriptor.globalGrid or nil
+    face.globalGridStep = gridDescriptor and gridDescriptor.globalGridStep or nil
+    face.activeGridStep = gridDescriptor and gridDescriptor.activeGridStep or nil
+    face.worldBspFullGrid = gridDescriptor and gridDescriptor.worldBspFullGrid or nil
+    face.globalGridOverlays = gridDescriptor and gridDescriptor.globalGridOverlays or nil
+    face.globalGridNeighbors = gridDescriptor and gridDescriptor.globalGridNeighbors or nil
+
+    return face
+end
+
+function worldBSP.buildFace(surfaceData, normal, rawU, rawV, settings)
+    local faceDescriptor = worldBSP.surfaceFaceDescriptor(surfaceData)
+    if not faceDescriptor then return end
+
+    local gridDescriptor = worldBSP.surfaceGridDescriptor(surfaceData, faceDescriptor, settings)
+    local face = worldBSP.newHoverCandidateState(faceDescriptor, gridDescriptor, normal, rawU, rawV)
+    local globalGrid = gridDescriptor and gridDescriptor.globalGrid == true
+
     local snapFaceCoordinates = client.snapFaceCoordinates
+    snapScratch.buildFaceSnapped = snapScratch.buildFaceSnapped or {}
     local snapped = globalGrid
         and snapGlobalFaceCoordinates(settings or {}, face, surfaceData, rawU, rawV)
         or isfunction(snapFaceCoordinates)
-        and snapFaceCoordinates(settings or {}, face, rawU, rawV)
+        and snapFaceCoordinates(settings or {}, face, rawU, rawV, gridDescriptor, snapScratch.buildFaceSnapped)
         or {
             u = math.Clamp(rawU, face.uMin, face.uMax),
             v = math.Clamp(rawV, face.vMin, face.vMax)
@@ -3419,13 +3918,38 @@ local function buildFace(surfaceData, normal, rawU, rawV, settings)
     face.snapGlobalAxisV = snapped.globalAxisV
     face.snapMode = snapMode
 
-    return face, worldFromUv(surfaceData, u, v)
+    local worldPos = worldFromUv(surfaceData, u, v)
+    face.worldPos = worldPos
+
+    return face, worldPos
 end
 
-local function sameSurfaceFastMatchFromTrace(tr)
-    local surfaceData = worldBSP.lastTraceSurface
-    if cache.status ~= cache.STATUS.READY
-        or not surfaceData
+function worldBSP.traceSurfaceDataCanFastMatch(surfaceData)
+    return surfaceData
+        and isvector(surfaceData.origin)
+        and isvector(surfaceData.normal)
+        and isvector(surfaceData.worldMins)
+        and isvector(surfaceData.worldMaxs)
+        and istable(surfaceData.polygon)
+        and #surfaceData.polygon >= 3
+        and tonumber(surfaceData.uMin)
+        and tonumber(surfaceData.uMax)
+        and tonumber(surfaceData.vMin)
+        and tonumber(surfaceData.vMax)
+end
+
+function worldBSP.traceTolerancesForSameSurface(surfaceData, displacementTrace)
+    local boundsTolerance = tonumber(traceBoundsTolerance(surfaceData, displacementTrace))
+    local pickTolerance = tonumber(traceSurfacePickTolerance(surfaceData, displacementTrace))
+    local normalDotMin = tonumber(traceNormalDotMin(surfaceData, displacementTrace))
+    local edgeTolerance = tonumber(CONFIG.sameSurfaceFastPathEdgeTolerance)
+
+    if not boundsTolerance or not pickTolerance or not normalDotMin or not edgeTolerance then return end
+    return boundsTolerance, pickTolerance, normalDotMin, edgeTolerance
+end
+
+function worldBSP.sameSurfaceFastMatchForSurface(tr, surfaceData)
+    if not worldBSP.traceSurfaceDataCanFastMatch(surfaceData)
         or not tr
         or not isvector(tr.HitPos)
         or not isvector(tr.HitNormal) then
@@ -3434,17 +3958,19 @@ local function sameSurfaceFastMatchFromTrace(tr)
 
     local hitPos = tr.HitPos
     local displacementTrace = traceHitsDisplacement(tr)
-    local boundsTolerance = traceBoundsTolerance(surfaceData, displacementTrace)
+    local boundsTolerance, pickTolerance, normalDotMin, edgeTolerance = worldBSP.traceTolerancesForSameSurface(surfaceData, displacementTrace)
+    if not boundsTolerance then return end
+
     if not pointInsideWorldBounds(surfaceData, hitPos, boundsTolerance) then return end
 
     local hitNormal = normalizedVec(tr.HitNormal, M.PICKING_VECTOR_EPSILON_SQR)
     if not hitNormal then return end
 
     local signedPlaneDist = signedPlaneDistance(surfaceData, hitPos.x, hitPos.y, hitPos.z)
-    if math.abs(signedPlaneDist) > traceSurfacePickTolerance(surfaceData, displacementTrace) then return end
+    if math.abs(signedPlaneDist) > pickTolerance then return end
 
     local normalDot = dot(surfaceData.normal, hitNormal)
-    if math.abs(normalDot) < traceNormalDotMin(surfaceData, displacementTrace) then return end
+    if math.abs(normalDot) < normalDotMin then return end
 
     local normal = surfaceData.normal
     local u, v = surfaceUvFromComponents(
@@ -3461,7 +3987,7 @@ local function sameSurfaceFastMatchFromTrace(tr)
         return
     end
     if not pointInPolygon2D(surfaceData.polygon, u, v, CONFIG.polygonTolerance) then return end
-    if polygonEdgeDistance(surfaceData.polygon, u, v) <= CONFIG.sameSurfaceFastPathEdgeTolerance then return end
+    if polygonEdgeDistance(surfaceData.polygon, u, v) <= edgeTolerance then return end
 
     traceScratch.sameSurfaceMatch = traceScratch.sameSurfaceMatch or {}
     return writeTraceMatch(
@@ -3474,15 +4000,501 @@ local function sameSurfaceFastMatchFromTrace(tr)
     )
 end
 
+function worldBSP.globalCachedSurfaceIsCurrent(surfaceData)
+    return surfaceData
+        and surfaceData._magicAlignWorldBspCacheVersion == CACHE_VERSION
+        and surfaceData._magicAlignWorldBspCacheMap == cache.map
+end
+
+local function sameSurfaceFastMatchFromTrace(tr)
+    if cache.status ~= cache.STATUS.READY then return end
+
+    local surfaceData = worldBSP.lastTraceSurface
+    if not worldBSP.globalCachedSurfaceIsCurrent(surfaceData) then return end
+
+    return worldBSP.sameSurfaceFastMatchForSurface(tr, surfaceData)
+end
+
+worldBSP.surfaceTraceCache = worldBSP.surfaceTraceCache or {}
+
+function worldBSP.surfaceTraceCacheToken(surfaceTraceCache)
+    return ("%s:%d:%d"):format(
+        tostring(surfaceTraceCache and surfaceTraceCache.map or ""),
+        tonumber(surfaceTraceCache and surfaceTraceCache.version) or 0,
+        tonumber(surfaceTraceCache and surfaceTraceCache.revision) or 0
+    )
+end
+
+function worldBSP.refreshSurfaceTraceCacheToken(surfaceTraceCache)
+    if not istable(surfaceTraceCache) then return end
+
+    surfaceTraceCache.statusToken = worldBSP.surfaceTraceCacheToken(surfaceTraceCache)
+    return surfaceTraceCache.statusToken
+end
+
+function worldBSP.bumpSurfaceTraceCacheRevision(surfaceTraceCache)
+    surfaceTraceCache = surfaceTraceCache or worldBSP.surfaceTraceCache
+    if not istable(surfaceTraceCache) then return end
+
+    surfaceTraceCache.revision = (tonumber(surfaceTraceCache.revision) or 0) + 1
+    return worldBSP.refreshSurfaceTraceCacheToken(surfaceTraceCache)
+end
+
+function worldBSP.surfaceTraceEntryIsCurrent(entry, ent)
+    if not istable(entry) or not ent then return false end
+
+    local source = entry.source
+    if source and source.isWorld == true then
+        return isWorldBrushEntity(ent) and entry.identity == "world:0"
+    end
+
+    if entry.ent ~= ent or not IsValid(ent) then return false end
+    return entry.identity == entityIdentity(ent)
+end
+
+function worldBSP.surfaceTraceCacheStatusToken()
+    worldBSP.resetSurfaceTraceCacheIfNeeded()
+
+    local surfaceTraceCache = worldBSP.surfaceTraceCache
+    if not istable(surfaceTraceCache)
+        or surfaceTraceCache.version ~= CACHE_VERSION
+        or surfaceTraceCache.map ~= currentMap() then
+        return
+    end
+
+    return surfaceTraceCache.statusToken or worldBSP.refreshSurfaceTraceCacheToken(surfaceTraceCache)
+end
+
+function worldBSP.candidateCacheStatusToken(settings)
+    if not settings or settings.worldBspSnap ~= true then return end
+
+    if usesGlobalGrid(settings) then
+        if cache.status ~= cache.STATUS.READY then return end
+        return cache.readyAt or true
+    end
+
+    return worldBSP.surfaceTraceCacheStatusToken()
+end
+
+function worldBSP.markSurfaceTraceCachedSurface(surfaceData, entry, surfaceTraceCache)
+    if not surfaceData then return end
+
+    surfaceTraceCache = surfaceTraceCache or worldBSP.surfaceTraceCache
+    if not istable(surfaceTraceCache) then return end
+
+    surfaceData._magicAlignSurfaceTraceCacheVersion = CACHE_VERSION
+    surfaceData._magicAlignSurfaceTraceCacheMap = surfaceTraceCache.map
+    surfaceData._magicAlignSurfaceTraceCacheRevision = entry and entry.revision or surfaceTraceCache.revision
+    surfaceData._magicAlignSurfaceTraceEntry = entry
+end
+
+function worldBSP.surfaceTraceCachedSurfaceIsCurrent(surfaceData)
+    local surfaceTraceCache = worldBSP.surfaceTraceCache
+    local entry = surfaceData and surfaceData._magicAlignSurfaceTraceEntry
+    local entries = surfaceTraceCache and surfaceTraceCache.entries
+
+    return surfaceData
+        and istable(surfaceTraceCache)
+        and istable(entry)
+        and istable(entries)
+        and entries[entry.cacheKey] == entry
+        and surfaceData._magicAlignSurfaceTraceCacheVersion == CACHE_VERSION
+        and surfaceData._magicAlignSurfaceTraceCacheMap == surfaceTraceCache.map
+        and surfaceData._magicAlignSurfaceTraceCacheRevision == entry.revision
+        and entry.identity == worldBSP.surfaceSourceIdentity(surfaceData)
+        and worldBSP.surfaceTraceEntryIsCurrent(entry, surfaceData.sourceEnt)
+end
+
+function worldBSP.traceMatchesSurfaceSource(tr, surfaceData)
+    if not tr or not surfaceData then return false end
+
+    if surfaceData.sourceIsWorld == true then
+        return tr.HitWorld == true or isWorldBrushEntity(tr.Entity)
+    end
+
+    local sourceEnt = surfaceData.sourceEnt
+    if not IsValid(sourceEnt) then return false end
+    if tr.Entity == sourceEnt then return true end
+
+    local sourceIndex = surfaceData.sourceEntityIndex
+    return sourceIndex ~= nil and entityIndex(tr.Entity) == sourceIndex
+end
+
+function worldBSP.perSurfaceSameSurfaceFastMatchFromTrace(tr)
+    worldBSP.resetSurfaceTraceCacheIfNeeded()
+
+    local surfaceData = worldBSP.lastTraceSurface
+    if not worldBSP.surfaceTraceCachedSurfaceIsCurrent(surfaceData)
+        or not worldBSP.traceMatchesSurfaceSource(tr, surfaceData) then
+        return
+    end
+
+    return worldBSP.sameSurfaceFastMatchForSurface(tr, surfaceData)
+end
+
+function worldBSP.indexSurfaceEntry(entry, surfaceData)
+    if not entry or not surfaceData then return end
+
+    local normal = surfaceData.normal
+    local planeBuckets = entry.planeBuckets
+    if isvector(normal) and istable(planeBuckets) then
+        local key = planeBucketKey(
+            planeNormalCoord(normal.x),
+            planeNormalCoord(normal.y),
+            planeNormalCoord(normal.z),
+            planeDistanceCoord(surfaceData.planeDistance)
+        )
+        local bucket = planeBuckets[key]
+        if not bucket then
+            bucket = {}
+            planeBuckets[key] = bucket
+        end
+
+        bucket[#bucket + 1] = surfaceData
+    end
+
+    local mins = surfaceData.worldMins
+    local maxs = surfaceData.worldMaxs
+    if not isvector(mins) or not isvector(maxs) then return end
+
+    local minX = cellCoord(mins.x - CONFIG.boundsTolerance)
+    local minY = cellCoord(mins.y - CONFIG.boundsTolerance)
+    local minZ = cellCoord(mins.z - CONFIG.boundsTolerance)
+    local maxX = cellCoord(maxs.x + CONFIG.boundsTolerance)
+    local maxY = cellCoord(maxs.y + CONFIG.boundsTolerance)
+    local maxZ = cellCoord(maxs.z + CONFIG.boundsTolerance)
+    local cellCount = (maxX - minX + 1) * (maxY - minY + 1) * (maxZ - minZ + 1)
+
+    if cellCount > CONFIG.maxIndexedCellsPerSurface then
+        entry.largeSurfaces[#entry.largeSurfaces + 1] = surfaceData
+        return
+    end
+
+    local index = entry.index
+    for x = minX, maxX do
+        for y = minY, maxY do
+            for z = minZ, maxZ do
+                local key = cellKey(x, y, z)
+                local cell = index[key]
+                if not cell then
+                    cell = {}
+                    index[key] = cell
+                end
+
+                cell[#cell + 1] = surfaceData
+            end
+        end
+    end
+end
+
+function worldBSP.querySurfaceEntry(entry, worldPos, out, seenOut, planeSet)
+    if not entry or not isvector(worldPos) then return end
+
+    local surfaces = out or {}
+    local count = 0
+    local seen = seenOut or {}
+    local index = entry.index
+    local x = cellCoord(worldPos.x)
+    local y = cellCoord(worldPos.y)
+    local z = cellCoord(worldPos.z)
+
+    if istable(index) then
+        for cx = x - CONFIG.queryCellRadius, x + CONFIG.queryCellRadius do
+            for cy = y - CONFIG.queryCellRadius, y + CONFIG.queryCellRadius do
+                for cz = z - CONFIG.queryCellRadius, z + CONFIG.queryCellRadius do
+                    local cell = index[cellKey(cx, cy, cz)]
+                    if cell then
+                        for i = 1, #cell do
+                            count = addQueriedSurface(surfaces, count, seen, planeSet, cell[i])
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local largeSurfaces = entry.largeSurfaces
+    for i = 1, istable(largeSurfaces) and #largeSurfaces or 0 do
+        count = addQueriedSurface(surfaces, count, seen, planeSet, largeSurfaces[i])
+    end
+
+    for i = count + 1, #surfaces do
+        surfaces[i] = nil
+    end
+    for surfaceData in pairs(seen) do
+        seen[surfaceData] = nil
+    end
+
+    return surfaces, count
+end
+
+function worldBSP.collectSurfaceEntryPlaneSet(entry, hitPos, hitNormal, out)
+    if not entry or not isvector(hitPos) or not isvector(hitNormal) or not istable(entry.planeBuckets) then return end
+
+    out = out or {}
+    for surfaceData in pairs(out) do
+        out[surfaceData] = nil
+    end
+
+    local count = 0
+    local normalRadius = math.max(math.floor(CONFIG.planeBucketNormalRadius or 0), 0)
+    local distanceRadius = math.max(math.floor(CONFIG.planeBucketDistanceRadius or 0), 0)
+
+    local function collectForNormal(normal)
+        local baseX = planeNormalCoord(normal.x)
+        local baseY = planeNormalCoord(normal.y)
+        local baseZ = planeNormalCoord(normal.z)
+        local baseDistance = planeDistanceCoord(dot(normal, hitPos))
+
+        for nx = baseX - normalRadius, baseX + normalRadius do
+            for ny = baseY - normalRadius, baseY + normalRadius do
+                for nz = baseZ - normalRadius, baseZ + normalRadius do
+                    for distance = baseDistance - distanceRadius, baseDistance + distanceRadius do
+                        local bucket = entry.planeBuckets[planeBucketKey(nx, ny, nz, distance)]
+                        if bucket then
+                            for i = 1, #bucket do
+                                local surfaceData = bucket[i]
+                                if not out[surfaceData] then
+                                    out[surfaceData] = true
+                                    count = count + 1
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    collectForNormal(hitNormal)
+    collectForNormal(-hitNormal)
+
+    if count <= 0 then return end
+    return out, count
+end
+
+function worldBSP.perSurfaceCandidateFromMatch(match, settings)
+    if not match then return end
+
+    local surfaceData = match.surface
+    local normal = match.normalSign < 0 and -surfaceData.normal or surfaceData.normal
+    local face, worldPos = worldBSP.buildFace(surfaceData, normal, match.u, match.v, settings)
+    if not face or not isvector(worldPos) then return end
+
+    worldBSP.lastTraceSurface = surfaceData
+
+    local lastDebug = worldBSP.lastDebug or {}
+    worldBSP.lastDebug = lastDebug
+    lastDebug.match = match.match
+    lastDebug.surfaceId = surfaceData.id
+    lastDebug.rawU = match.u
+    lastDebug.rawV = match.v
+    lastDebug.snapU = face.uSnap
+    lastDebug.snapV = face.vSnap
+    lastDebug.snapGridUId = face.snapGridUId
+    lastDebug.snapGridVId = face.snapGridVId
+    lastDebug.snapIndexU = face.snapIndexU
+    lastDebug.snapIndexV = face.snapIndexV
+    lastDebug.snapMode = face.snapMode
+    lastDebug.normal = surfaceData.normal
+    lastDebug.worldPos = worldPos
+    lastDebug.surfaceDescriptorKey = face.descriptorKey
+    lastDebug.gridDescriptorKey = face.gridDescriptorKey
+    lastDebug.uncachedSurfaceGrid = false
+
+    return {
+        ent = M.WORLD_TARGET,
+        localPos = worldPos,
+        worldPos = worldPos,
+        localNormal = normal,
+        normal = normal,
+        face = face,
+        mode = settings and settings.shift and "world_surface_free_face" or "world_surface_grid"
+    }
+end
+
+function worldBSP.resetSurfaceTraceCacheIfNeeded()
+    local surfaceTraceCache = worldBSP.surfaceTraceCache
+    local map = currentMap()
+    if surfaceTraceCache.version == CACHE_VERSION
+        and surfaceTraceCache.map == map
+        and surfaceTraceCache.revision ~= nil then
+        if surfaceTraceCache.statusToken == nil then
+            worldBSP.refreshSurfaceTraceCacheToken(surfaceTraceCache)
+        end
+        return false
+    end
+
+    local revision = (tonumber(surfaceTraceCache.revision) or 0) + 1
+    for key in pairs(surfaceTraceCache) do
+        surfaceTraceCache[key] = nil
+    end
+    surfaceTraceCache.version = CACHE_VERSION
+    surfaceTraceCache.map = map
+    surfaceTraceCache.revision = revision
+    surfaceTraceCache.entries = {}
+    worldBSP.refreshSurfaceTraceCacheToken(surfaceTraceCache)
+    worldBSP.lastTraceSurface = nil
+    return true
+end
+
+function worldBSP.traceBrushEntity(tr)
+    local ent = tr and tr.Entity
+    if IsValid(ent) and isfunction(ent.GetBrushSurfaces) then
+        return ent
+    end
+
+    if tr and tr.HitWorld == true then
+        if game and isfunction(game.GetWorld) then
+            ent = game.GetWorld()
+            if ent and isfunction(ent.GetBrushSurfaces) then return ent end
+        end
+        if isfunction(Entity) then
+            ent = Entity(0)
+            if ent and isfunction(ent.GetBrushSurfaces) then return ent end
+        end
+    end
+end
+
+function worldBSP.traceBrushSurfaceEntry(tr)
+    worldBSP.resetSurfaceTraceCacheIfNeeded()
+
+    local ent = worldBSP.traceBrushEntity(tr)
+    if not ent then return end
+
+    local surfaceTraceCache = worldBSP.surfaceTraceCache
+    local identity = entityIdentity(ent)
+    local key = identity
+    local entries = surfaceTraceCache.entries
+    if not istable(entries) then
+        entries = {}
+        surfaceTraceCache.entries = entries
+    end
+
+    local entry = entries[key]
+    if entry then
+        if worldBSP.surfaceTraceEntryIsCurrent(entry, ent) then
+            return entry
+        end
+
+        entries[key] = nil
+        worldBSP.bumpSurfaceTraceCacheRevision(surfaceTraceCache)
+    end
+
+    local getBrushSurfaces = ent.GetBrushSurfaces
+    if not isfunction(getBrushSurfaces) then return end
+
+    local ok, surfaces = pcall(getBrushSurfaces, ent)
+    if not ok or not istable(surfaces) or #surfaces <= 0 then return end
+
+    worldBSP.bumpSurfaceTraceCacheRevision(surfaceTraceCache)
+
+    local source = {
+        ent = ent,
+        identity = identity,
+        entityIndex = entityIndex(ent),
+        class = entityClass(ent),
+        model = entityModel(ent),
+        isWorld = isWorldBrushEntity(ent),
+        surfaceCount = #surfaces
+    }
+
+    entry = {
+        ent = ent,
+        identity = identity,
+        cacheKey = key,
+        revision = surfaceTraceCache.revision,
+        source = source,
+        surfaces = {},
+        index = {},
+        largeSurfaces = {},
+        planeBuckets = {},
+        faceDescriptors = {},
+        gridDescriptors = {},
+        count = 0,
+        skipped = 0,
+        builtAt = now()
+    }
+
+    for i = 1, #surfaces do
+        local surfaceData = buildSurfaceData(surfaces[i], i, source, i)
+        if surfaceData then
+            entry.count = entry.count + 1
+            entry.surfaces[entry.count] = surfaceData
+            worldBSP.markSurfaceTraceCachedSurface(surfaceData, entry, surfaceTraceCache)
+            worldBSP.indexSurfaceEntry(entry, surfaceData)
+        else
+            entry.skipped = entry.skipped + 1
+        end
+    end
+
+    entries[key] = entry
+    return entry
+end
+
+function worldBSP.perSurfaceCandidateFromTrace(tr, settings)
+    if not tr or not isvector(tr.HitPos) or not isvector(tr.HitNormal) then return end
+
+    local fastMatch = worldBSP.perSurfaceSameSurfaceFastMatchFromTrace(tr)
+    if fastMatch then
+        local fastCandidate = worldBSP.perSurfaceCandidateFromMatch(fastMatch, settings)
+        if fastCandidate then return fastCandidate end
+    end
+
+    local entry = worldBSP.traceBrushSurfaceEntry(tr)
+    if not entry or (entry.count or 0) <= 0 then return end
+
+    local hitNormal = normalizedVec(tr.HitNormal, M.PICKING_VECTOR_EPSILON_SQR)
+    if not hitNormal then return end
+
+    traceScratch.perSurfaceQuerySurfaces = traceScratch.perSurfaceQuerySurfaces or {}
+    traceScratch.perSurfaceQuerySeen = traceScratch.perSurfaceQuerySeen or {}
+    traceScratch.perSurfacePlaneSeen = traceScratch.perSurfacePlaneSeen or {}
+
+    local planeSeen, planeCount = worldBSP.collectSurfaceEntryPlaneSet(entry, tr.HitPos, hitNormal, traceScratch.perSurfacePlaneSeen)
+    if planeSeen and planeCount and planeCount > 0 then
+        local surfaces, surfaceCount = worldBSP.querySurfaceEntry(
+            entry,
+            tr.HitPos,
+            traceScratch.perSurfaceQuerySurfaces,
+            traceScratch.perSurfaceQuerySeen,
+            planeSeen
+        )
+        surfaceCount = surfaceCount or 0
+        if surfaceCount > 0 then
+            local match = selectSurfaceForTrace(tr, surfaces, surfaceCount, tr.HitPos, hitNormal, planeSeen)
+            if match and (match.match == "strict" or traceMatchIsDisplacement(match)) then
+                local candidate = worldBSP.perSurfaceCandidateFromMatch(match, settings)
+                if candidate then return candidate end
+            end
+        end
+    end
+
+    local surfaces, surfaceCount = worldBSP.querySurfaceEntry(entry, tr.HitPos, traceScratch.perSurfaceQuerySurfaces, traceScratch.perSurfaceQuerySeen)
+    surfaceCount = surfaceCount or 0
+    if surfaceCount <= 0 then return end
+
+    local match = selectSurfaceForTrace(tr, surfaces, surfaceCount, tr.HitPos, hitNormal)
+    if not match then return end
+
+    return worldBSP.perSurfaceCandidateFromMatch(match, settings)
+end
+
 function worldBSP.candidateFromTrace(tr, settings)
-    if not settings or not settings.worldBspSnap or cache.status ~= cache.STATUS.READY then return end
+    if not settings or not settings.worldBspSnap then return end
+
+    if not usesGlobalGrid(settings) then
+        return worldBSP.perSurfaceCandidateFromTrace(tr, settings)
+    end
+
+    if cache.status ~= cache.STATUS.READY then return end
 
     local match = sameSurfaceFastMatchFromTrace(tr) or findSurfaceForTrace(tr)
     if not match then return end
 
     local surfaceData = match.surface
     local normal = match.normalSign < 0 and -surfaceData.normal or surfaceData.normal
-    local face, worldPos = buildFace(surfaceData, normal, match.u, match.v, settings)
+    local face, worldPos = worldBSP.buildFace(surfaceData, normal, match.u, match.v, settings)
     if not face or not isvector(worldPos) then return end
     worldBSP.lastTraceSurface = surfaceData
 
@@ -3501,6 +4513,8 @@ function worldBSP.candidateFromTrace(tr, settings)
     lastDebug.snapMode = face.snapMode
     lastDebug.normal = surfaceData.normal
     lastDebug.worldPos = worldPos
+    lastDebug.surfaceDescriptorKey = face.descriptorKey
+    lastDebug.gridDescriptorKey = face.gridDescriptorKey
 
     return {
         ent = M.WORLD_TARGET,
@@ -3513,17 +4527,17 @@ function worldBSP.candidateFromTrace(tr, settings)
     }
 end
 
-local function formatVec(value)
+function worldBSP.formatVec(value)
     if not isvector(value) then return "nil" end
 
     return ("%.2f %.2f %.2f"):format(value.x, value.y, value.z)
 end
 
-local function boolLabel(value)
+function worldBSP.boolLabel(value)
     return value and "yes" or "no"
 end
 
-local function surfaceSourceLabel(surfaceData)
+function worldBSP.surfaceSourceLabel(surfaceData)
     if not surfaceData then return "unknown" end
     if surfaceData.sourceIsDisplacement then
         return ("world_displacement#%s"):format(tostring(surfaceData.displacementIndex or "?"))
@@ -3541,13 +4555,13 @@ local function surfaceSourceLabel(surfaceData)
     return class
 end
 
-local function surfaceDisplacementDiagonalLabel(surfaceData)
+function worldBSP.surfaceDisplacementDiagonalLabel(surfaceData)
     if not surfaceData or not surfaceData.sourceIsDisplacement then return "-" end
 
     return tostring(surfaceData.displacementDiagonal or "?")
 end
 
-local function traceRejectReason(info)
+function worldBSP.traceRejectReason(info)
     if not info.inBounds then return "bounds" end
     if info.planeDist > (info.planeTolerance or CONFIG.planeTolerance) then return "plane" end
     if info.absNormalDot < (info.normalDotMin or CONFIG.normalDotMin) then return "normal" end
@@ -3567,7 +4581,7 @@ local function traceRejectReason(info)
     return "polygon"
 end
 
-local function traceDebugInfo(surfaceData, hitPos, hitNormal, displacementTrace)
+function worldBSP.traceDebugInfo(surfaceData, hitPos, hitNormal, displacementTrace)
     if not surfaceData or not isvector(hitPos) or not isvector(hitNormal) then return end
 
     local boundsTolerance = traceBoundsTolerance(surfaceData, displacementTrace)
@@ -3607,7 +4621,7 @@ local function traceDebugInfo(surfaceData, hitPos, hitNormal, displacementTrace)
         edgeProjectionTolerance = traceEdgeProjectionTolerance(surfaceData, displacementTrace)
     }
 
-    info.reason = traceRejectReason(info)
+    info.reason = worldBSP.traceRejectReason(info)
     info.score = planeDist
         + info.boundsDist * 0.5
         + math.max(0, (info.normalDotMin or CONFIG.normalDotMin) - info.absNormalDot) * 20
@@ -3615,7 +4629,7 @@ local function traceDebugInfo(surfaceData, hitPos, hitNormal, displacementTrace)
     return info
 end
 
-local function insertTraceDebugCandidate(best, info, maxCount)
+function worldBSP.insertTraceDebugCandidate(best, info, maxCount)
     if not info then return end
 
     local count = #best
@@ -3634,14 +4648,14 @@ local function insertTraceDebugCandidate(best, info, maxCount)
     end
 end
 
-local function printTraceDebugCandidates(surfaces, surfaceCount, hitPos, hitNormal, displacementTrace)
+function worldBSP.printTraceDebugCandidates(surfaces, surfaceCount, hitPos, hitNormal, displacementTrace)
     surfaceCount = tonumber(surfaceCount) or 0
     if not surfaces or surfaceCount <= 0 then return end
 
     local best = {}
     local maxCount = 5
     for i = 1, surfaceCount do
-        insertTraceDebugCandidate(best, traceDebugInfo(surfaces[i], hitPos, hitNormal, displacementTrace), maxCount)
+        worldBSP.insertTraceDebugCandidate(best, worldBSP.traceDebugInfo(surfaces[i], hitPos, hitNormal, displacementTrace), maxCount)
     end
 
     for i = 1, #best do
@@ -3653,16 +4667,16 @@ local function printTraceDebugCandidates(surfaces, surfaceCount, hitPos, hitNorm
             tostring(info.reason or "?"),
             tonumber(info.planeDist) or 0,
             tonumber(info.normalDot) or 0,
-            boolLabel(info.inBounds),
+            worldBSP.boolLabel(info.inBounds),
             tonumber(info.boundsDist) or 0,
             tonumber(info.u) or 0,
             tonumber(info.v) or 0,
-            boolLabel(info.uvInBounds),
-            boolLabel(info.inside),
+            worldBSP.boolLabel(info.uvInBounds),
+            worldBSP.boolLabel(info.inside),
             tonumber(info.edgeDistance) or 0,
-            surfaceSourceLabel(surfaceData),
+            worldBSP.surfaceSourceLabel(surfaceData),
             tostring(surfaceData and surfaceData.sourceSurfaceIndex or "?"),
-            surfaceDisplacementDiagonalLabel(surfaceData),
+            worldBSP.surfaceDisplacementDiagonalLabel(surfaceData),
             tostring(surfaceData and surfaceData.materialName or "?")
         ))
     end
@@ -3681,10 +4695,10 @@ function worldBSP.debugTrace(tr)
         print(("Magic Align: World BSP debug: no match (status=%s, candidates=%d, hit=%s, normal=%s)."):format(
             tostring(cache.status),
             #surfaces,
-            formatVec(tr.HitPos),
-            formatVec(tr.HitNormal)
+            worldBSP.formatVec(tr.HitPos),
+            worldBSP.formatVec(tr.HitNormal)
         ))
-        printTraceDebugCandidates(
+        worldBSP.printTraceDebugCandidates(
             surfaces,
             #surfaces,
             tr.HitPos,
@@ -3712,16 +4726,22 @@ function worldBSP.debugTrace(tr)
         tonumber(match.u) or 0,
         tonumber(match.v) or 0,
         snapDetails,
-        formatVec(tr.HitPos),
-        formatVec(tr.HitNormal),
-        formatVec(match.surface and match.surface.normal),
-        surfaceDisplacementDiagonalLabel(match.surface)
+        worldBSP.formatVec(tr.HitPos),
+        worldBSP.formatVec(tr.HitNormal),
+        worldBSP.formatVec(match.surface and match.surface.normal),
+        worldBSP.surfaceDisplacementDiagonalLabel(match.surface)
     ))
 end
 
 function worldBSP.debugCache()
-    print(("Magic Align: World BSP cache: status=%s cached=%d skipped=%d displacements=%d displacementSurfaces=%d displacementSkipped=%d error=%s."):format(
+    local progress = worldBSP.cacheProgress()
+    print(("Magic Align: World BSP cache: status=%s stage=%s progress=%s eta=%s stageProgress=%s stageEta=%s cached=%d skipped=%d displacements=%d displacementSurfaces=%d displacementSkipped=%d error=%s."):format(
         tostring(cache.status),
+        tostring(progress.stage or "nil"),
+        worldBSP.formatProgressPercent(progress.percent),
+        worldBSP.formatProgressSeconds(progress.eta),
+        worldBSP.formatProgressPercent(progress.stagePercent),
+        worldBSP.formatProgressSeconds(progress.stageEta),
         tonumber(cache.cached) or 0,
         tonumber(cache.skipped) or 0,
         tonumber(cache.displacements) or 0,

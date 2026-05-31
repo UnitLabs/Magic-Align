@@ -93,6 +93,9 @@ local function invalidateGhostSyncCache(ghost)
     ghost._magicAlignColorB = nil
     ghost._magicAlignColorA = nil
     ghost._magicAlignRenderMode = nil
+    ghost._magicAlignEntityMirrorPreviewAxis = nil
+    ghost._magicAlignEntityMirrorBaseRenderMins = nil
+    ghost._magicAlignEntityMirrorBaseRenderMaxs = nil
 
     local materials = isfunction(ghost.GetMaterials) and ghost:GetMaterials() or nil
     ghost._magicAlignSubMaterialSlots = materials and #materials or 0
@@ -251,6 +254,9 @@ local function syncGhostEntity(entry)
     local ghost = istable(entry) and entry.ghost or nil
     if not IsValid(src) or not IsValid(ghost) then return false end
     if not isvector(entry.pos) or not isangle(entry.ang) then return false end
+    if istable(ghost.primitive) and type(ghost.primitive.thread) == "thread" then
+        return false
+    end
 
     local needsBoneSetup = ghost._magicAlignNeedsBoneSetup == true
     local now = RealTime()
@@ -270,12 +276,15 @@ local function syncGhostEntity(entry)
                 end
             end
 
+            entry.revision = revision
             if isfunction(ghost.PrimitiveReconstruct) then
                 ghost:PrimitiveReconstruct()
                 invalidateGhostSyncCache(ghost)
+                if istable(ghost.primitive) and type(ghost.primitive.thread) == "thread" then
+                    return false
+                end
             end
 
-            entry.revision = revision
             needsBoneSetup = true
         end
 
@@ -385,6 +394,10 @@ local function syncGhostEntity(entry)
         ghost._magicAlignNeedsBoneSetup = false
     end
 
+    if M.EntityMirror and M.EntityMirror.ApplyVisualPreview then
+        M.EntityMirror.ApplyVisualPreview(ghost, entry.entityMirrorAxis or M.ENTITY_MIRROR_NONE)
+    end
+
     ghost:SetNoDraw(false)
 
     return true
@@ -400,6 +413,22 @@ local function refreshGhostEntry(entry)
 
     ghost:SetNoDraw(true)
     return false
+end
+
+local function previewMirrorAxis(state, ent, linked)
+    local preview = istable(state) and state.preview or nil
+    if not istable(preview) then return M.ENTITY_MIRROR_NONE end
+
+    if linked and istable(preview.linked) then
+        for i = 1, #preview.linked do
+            local entry = preview.linked[i]
+            if istable(entry) and entry.ent == ent then
+                return entry.entityMirrorPreviewAxis or M.ENTITY_MIRROR_NONE
+            end
+        end
+    end
+
+    return preview.entityMirrorPreviewAxis or M.ENTITY_MIRROR_NONE
 end
 
 function Compat.ClearGhost(state, ent)
@@ -441,17 +470,18 @@ function Compat.SetGhost(state, ent, pos, ang, alphaFn, linked)
         entry = { ent = ent }
     end
 
-    local srcColor = ent:GetColor()
-    local alpha = isfunction(alphaFn) and alphaFn(srcColor.a) or tonumber(alphaFn) or 120
+    local entColor = ent:GetColor()
+    local alpha = isfunction(alphaFn) and alphaFn(entColor.a) or tonumber(alphaFn) or 120
 
     entry.ent = ent
     entry.pos = setVec(entry.pos, pos)
     entry.ang = setAng(entry.ang, ang)
     entry.color = entry.color or Color(255, 255, 255, 255)
-    entry.color.r = srcColor.r
-    entry.color.g = srcColor.g
-    entry.color.b = srcColor.b
+    entry.color.r = entColor.r
+    entry.color.g = entColor.g
+    entry.color.b = entColor.b
     entry.color.a = math.Clamp(alpha, 0, 255)
+    entry.entityMirrorAxis = previewMirrorAxis(state, ent, linked)
     entry.failed = nil
 
     if linked then

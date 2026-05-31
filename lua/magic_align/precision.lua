@@ -705,8 +705,8 @@ function M.AngleLeftPrecise(ang)
 end
 
 function M.AngleRightPrecise(ang)
-    local left = M.AngleLeftPrecise(ang)
-    return VectorP(-left.x, -left.y, -left.z)
+    local matrix = angleMatrix(ang)
+    return VectorP(-matrix[1][2], -matrix[2][2], -matrix[3][2])
 end
 
 function M.AngleUpPrecise(ang)
@@ -715,7 +715,37 @@ function M.AngleUpPrecise(ang)
 end
 
 function M.AngleAxesPrecise(ang)
-    return M.AngleForwardPrecise(ang), M.AngleRightPrecise(ang), M.AngleUpPrecise(ang)
+    local matrix = angleMatrix(ang)
+    return VectorP(matrix[1][1], matrix[2][1], matrix[3][1]),
+        VectorP(-matrix[1][2], -matrix[2][2], -matrix[3][2]),
+        VectorP(matrix[1][3], matrix[2][3], matrix[3][3])
+end
+
+function M.AngleAxesPreciseInto(out, ang)
+    out = istable(out) and out or {}
+
+    local matrix = angleMatrix(ang)
+    local forward = out.forward
+    if not isVectorLike(forward) then
+        forward = VectorP(0, 0, 0)
+        out.forward = forward
+    end
+    local right = out.right
+    if not isVectorLike(right) then
+        right = VectorP(0, 0, 0)
+        out.right = right
+    end
+    local up = out.up
+    if not isVectorLike(up) then
+        up = VectorP(0, 0, 0)
+        out.up = up
+    end
+
+    forward.x, forward.y, forward.z = matrix[1][1], matrix[2][1], matrix[3][1]
+    right.x, right.y, right.z = -matrix[1][2], -matrix[2][2], -matrix[3][2]
+    up.x, up.y, up.z = matrix[1][3], matrix[2][3], matrix[3][3]
+
+    return forward, right, up, out
 end
 
 function M.AngleFromForwardUpPrecise(forward, upHint)

@@ -14,6 +14,10 @@ local Manager = {}
 local COOKIE_PREFIX = "magic_align_slider_text_"
 local PENDING_CONVAR_GRACE = 0.35
 local PENDING_CONVAR_STALE_TIMEOUT = 2
+local IDLE_POLL_INTERVAL = 0.15
+local FORMULA_POLL_INTERVAL = 0.10
+local ACTIVE_POLL_INTERVAL = 0.05
+local CHANGE_CALLBACK_PREFIX = "MagicAlignFormulaManager_"
 
 local function nearlyEqual(a, b)
     return math.abs((tonumber(a) or 0) - (tonumber(b) or 0)) <= M.CONVAR_ROUNDTRIP_EPSILON
@@ -94,6 +98,9 @@ function Manager:EnsureEntry(cvarName)
         pendingConVarBaseString = nil,
         pendingConVarBaseValue = nil,
         pendingConVarStartedAt = 0,
+        pollRequested = true,
+        nextPollAt = 0,
+        nextFormulaEvalAt = 0,
         validationState = "ok",
         validationMessage = nil,
         revision = 0,
@@ -109,6 +116,8 @@ end
 function Manager:Touch(entry)
     entry.revision = (tonumber(entry.revision) or 0) + 1
     self.revision = (tonumber(self.revision) or 0) + 1
+    entry.nextFormulaEvalAt = 0
+    entry.nextPollAt = 0
 end
 
 function Manager:GetRevision()
@@ -118,6 +127,70 @@ end
 function Manager:GetEntryRevision(cvarName)
     local entry = self.entries and self.entries[cvarName]
     return entry and (tonumber(entry.revision) or 0) or 0
+end
+
+function Manager:PollIntervalForEntry(entry)
+    if not entry then
+        return IDLE_POLL_INTERVAL
+    end
+
+    if entry.pendingConVarString ~= nil or entry.pollRequested == true then
+        return ACTIVE_POLL_INTERVAL
+    end
+
+    if entry.rawMode == "formula" then
+        return FORMULA_POLL_INTERVAL
+    end
+
+    return IDLE_POLL_INTERVAL
+end
+
+function Manager:ShouldPollEntry(entry, force)
+    if force then
+        return true
+    end
+
+    local nowTime = RealTime()
+    if entry.pendingConVarString ~= nil or entry.pollRequested == true then
+        return true
+    end
+
+    return nowTime >= (tonumber(entry.nextPollAt) or 0)
+end
+
+function Manager:ShouldPollConVar(cvarName, force)
+    local entry = self.entries and self.entries[cvarName]
+    if not entry then
+        return true
+    end
+
+    return self:ShouldPollEntry(entry, force)
+end
+
+function Manager:MarkConVarChanged(cvarName)
+    local entry = self.entries and self.entries[cvarName]
+    if not entry then return end
+
+    entry.pollRequested = true
+    entry.nextPollAt = 0
+end
+
+function Manager:EnsureConVarCallback(cvarName, entry)
+    if not (cvars and cvars.AddChangeCallback) or entry.changeCallbackInstalled then
+        return
+    end
+
+    entry.changeCallbackInstalled = true
+    local callbackId = CHANGE_CALLBACK_PREFIX .. tostring(cvarName)
+    entry.changeCallbackId = callbackId
+
+    if cvars.RemoveChangeCallback then
+        cvars.RemoveChangeCallback(cvarName, callbackId)
+    end
+
+    cvars.AddChangeCallback(cvarName, function()
+        self:MarkConVarChanged(cvarName)
+    end, callbackId)
 end
 
 function Manager:GetCookieKey(cvarName)
@@ -453,6 +526,8 @@ function Manager:PushConVar(entry, value, outputString)
     entry.pendingConVarBaseString = currentObservedString
     entry.pendingConVarBaseValue = tonumber(currentObservedString)
     entry.pendingConVarStartedAt = RealTime()
+    entry.pollRequested = true
+    entry.nextPollAt = 0
 
     RunConsoleCommand(entry.cvar, entry.currentString)
 end
@@ -523,13 +598,21 @@ end
 
 function Manager:PollConVar(cvarName, force)
     local entry = self:EnsureEntry(cvarName)
+    if not self:ShouldPollEntry(entry, force) then
+        return false
+    end
+
+    local nowTime = RealTime()
+    entry.nextPollAt = nowTime + self:PollIntervalForEntry(entry)
+    entry.pollRequested = false
+
     local rawValue, numericValue = self:ReadConVar(entry)
     if rawValue == nil then
         return false
     end
 
     if not force and entry.pendingConVarString ~= nil then
-        local pendingAge = RealTime() - (tonumber(entry.pendingConVarStartedAt) or 0)
+        local pendingAge = nowTime - (tonumber(entry.pendingConVarStartedAt) or 0)
         if nearlyEqual(numericValue, entry.pendingConVarValue) then
             self:ClearPendingState(entry)
         else
@@ -541,7 +624,8 @@ function Manager:PollConVar(cvarName, force)
                 return false
             end
 
-            if RealTime() < (tonumber(entry.pendingConVarUntil) or 0) then
+            if nowTime < (tonumber(entry.pendingConVarUntil) or 0) then
+                entry.nextPollAt = math.min(entry.nextPollAt, nowTime + ACTIVE_POLL_INTERVAL)
                 return false
             end
 
@@ -609,6 +693,7 @@ function Manager:RegisterConVar(cvarName, options)
     if istable(options) and isfunction(options.optionsProvider) then
         entry.optionsProvider = options.optionsProvider
     end
+    self:EnsureConVarCallback(cvarName, entry)
 
     if entry.initialized then
         return entry
@@ -642,12 +727,39 @@ function Manager:Think()
         return
     end
 
+    local nowTime = RealTime()
     for cvarName, entry in pairs(entries) do
         if entry.initialized then
-            self:PollConVar(cvarName, false)
-            self:ReevaluateFormula(cvarName)
+            if self:ShouldPollEntry(entry, false) then
+                self:PollConVar(cvarName, false)
+            end
+            if entry.rawMode == "formula"
+                and nowTime >= (tonumber(entry.nextFormulaEvalAt) or 0) then
+                entry.nextFormulaEvalAt = nowTime + FORMULA_POLL_INTERVAL
+                self:ReevaluateFormula(cvarName)
+            end
         end
     end
+end
+
+function Manager:RefreshAll(force)
+    local entries = self.entries
+    if not istable(entries) then
+        return false
+    end
+
+    local changed = false
+    for cvarName, entry in pairs(entries) do
+        if entry.initialized then
+            changed = self:PollConVar(cvarName, force == true) or changed
+            if force == true or entry.rawMode == "formula" then
+                entry.nextFormulaEvalAt = 0
+                changed = self:ReevaluateFormula(cvarName) or changed
+            end
+        end
+    end
+
+    return changed
 end
 
 function Manager:ReevaluateFormula(cvarName)

@@ -47,6 +47,10 @@ local defaultRotationSnapIndex = client.defaultRotationSnapIndex or 13
 local ringQualityPresets = client.ringQualityPresets
 local defaultRingQualityIndex = client.defaultRingQualityIndex or 2
 local worldGridUnitPresets = { 0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 }
+local toolgunSoundVolumeMin = 0
+local toolgunSoundVolumeMax = 1
+local toolgunSoundVolumeStep = 0.05
+local defaultToolgunSoundVolume = 0.25
 local referencePositionSliderTargetIntervals = 16
 local setStringConVar
 local getStringConVar
@@ -129,6 +133,11 @@ local function clampTraceSnapLength(length)
     return tonumber(length) or 0 --math.Clamp(tonumber(length) or 0, 0, 32) --no clamping TODO Remove also functions using it unnecessarily
 end
 
+local function clampToolgunSoundVolume(volume)
+    volume = math.Clamp(tonumber(volume) or defaultToolgunSoundVolume, toolgunSoundVolumeMin, toolgunSoundVolumeMax)
+    return math.Clamp(math.Round(volume / toolgunSoundVolumeStep) * toolgunSoundVolumeStep, toolgunSoundVolumeMin, toolgunSoundVolumeMax)
+end
+
 local function rotationSnapInfo(index)
     index = clampRotationSnapIndex(index)
 
@@ -161,6 +170,7 @@ local persistedMenuConVars = {
     "magic_align_world_bsp_budget_ms",
     "magic_align_world_bsp_show_blockers",
     "magic_align_world_bsp_full_grid",
+    "magic_align_world_bsp_light_adapt",
     "magic_align_display_rounding",
     "magic_align_preview_occluded",
     "magic_align_preview_occluded_r",
@@ -168,8 +178,10 @@ local persistedMenuConVars = {
     "magic_align_preview_occluded_b",
     "magic_align_preview_occluded_a",
     "magic_align_ring_quality",
+    "magic_align_toolgun_sound_volume",
     "magic_align_highlight_context_menu",
-    "magic_align_disable_smartsnap_active"
+    "magic_align_disable_smartsnap_active",
+    "magic_align_restore_session_on_undo"
 }
 local tabOffsetSuffixes = { "px", "py", "pz", "pitch", "yaw", "roll" }
 local sessionTabCallbacksRegistered = false
@@ -267,6 +279,14 @@ end
 
 local function setTraceSnapLength(length)
     setStringConVar("magic_align_trace_snap_length", M.FormatConVarNumber(clampTraceSnapLength(length)))
+end
+
+local function currentToolgunSoundVolume()
+    return clampToolgunSoundVolume(getStringConVar("magic_align_toolgun_sound_volume", defaultToolgunSoundVolume))
+end
+
+local function setToolgunSoundVolume(volume)
+    setStringConVar("magic_align_toolgun_sound_volume", M.FormatFixedNumber(clampToolgunSoundVolume(volume), 2, true))
 end
 
 local function clampWorldGridSize(size)
@@ -395,8 +415,9 @@ end
 
 local function updateSessionTabTitles()
     local changed = false
-    for i = 1, #(M.SPACES or {}) do
-        changed = updateSessionTabTitle(M.SPACES[i]) or changed
+    local spaces = M.UI_SPACES or M.SPACES or {}
+    for i = 1, #spaces do
+        changed = updateSessionTabTitle(spaces[i]) or changed
     end
 
     if changed then
@@ -511,6 +532,7 @@ local menuAccentColors = {
     source = solidColor(clientColors.source, Color(255, 190, 80)),
     target = solidColor(clientColors.target, Color(80, 220, 255)),
     axis = solidColor(clientColors.axis, Color(92, 220, 148)),
+    mirror = solidColor(clientColors.mirror, Color(176, 112, 235)),
     world = Color(128, 134, 144)
 }
 
@@ -518,7 +540,8 @@ local spaceTabAccent = {
     prop1 = menuAccentColors.source,
     prop2 = menuAccentColors.target,
     points = menuAccentColors.axis,
-    world = menuAccentColors.world
+    world = menuAccentColors.world,
+    mirror = menuAccentColors.mirror
 }
 
 local function wrapLabelText(text, font, maxWidth)
@@ -1108,6 +1131,38 @@ local function addStyledSlider(panel, label, convar, min, max, decimals, options
     stylePanelSlider(slider, options)
     installSliderDisplayRounding(slider, decimals or 0)
     panel:AddItem(slider)
+    return slider
+end
+
+client.createToolgunSoundVolumeSlider = function(panel)
+    local slider = vgui.Create(magicSliderClass, panel)
+    slider:SetText("Toolgun Sound Volume")
+    slider:SetMinMax(toolgunSoundVolumeMin, toolgunSoundVolumeMax)
+    slider:SetDecimals(2)
+    slider:SetConVar("magic_align_toolgun_sound_volume")
+    slider:SetInputDecimals("slider", 2)
+    slider:SetInputSnap("slider", toolgunSoundVolumeStep)
+    slider:SetInputDecimals("label", 2)
+    slider:SetInputSnap("label", toolgunSoundVolumeStep)
+    slider:SetInputDecimals("text", 2)
+    slider:SetInputSnap("text", toolgunSoundVolumeStep)
+    slider.ShouldClampValue = function(_, source)
+        return source == "slider" or source == "label" or source == "api" or source == "text"
+    end
+    slider.FormatDisplayValue = function(_, value)
+        return M.FormatFixedNumber(clampToolgunSoundVolume(value), 2, true)
+    end
+    stylePanelSlider(slider, {
+        labelWide = 132,
+        textWide = 56,
+        tall = 30,
+        textColor = menuColors.text,
+        outlineLabel = true
+    })
+    setToolgunSoundVolume(currentToolgunSoundVolume())
+    slider:SyncFromConVar(true)
+    panel:AddItem(slider, 8)
+
     return slider
 end
 
@@ -1970,7 +2025,7 @@ function TOOL.BuildCPanel(panel)
     M.ClientSheet = sheet
     M.ClientTabs = {}
 
-    for _, space in ipairs(M.SPACES) do
+    for _, space in ipairs(M.UI_SPACES or M.SPACES) do
         local holder = vgui.Create("DPanel", sheet)
         holder.Paint = function(self, w, h)
             draw.RoundedBox(8, 0, 0, w, h, menuColors.panelSoft)
@@ -1980,70 +2035,103 @@ function TOOL.BuildCPanel(panel)
 
         holder.rows = {}
 
-        for _, row in ipairs(panelSliderRows) do
-            local slider = vgui.Create(magicSliderClass, holder)
-            local isRotationRow = row.key == "pitch" or row.key == "yaw" or row.key == "roll"
-            slider:SetText(row.label)
-            slider:SetMinMax(row.min, row.max)
-            slider:SetDecimals(row.decimals)
-            slider:SetConVar("magic_align_" .. space .. "_" .. row.key)
-            slider:SetInputDecimals("slider", row.decimals)
-            slider:SetInputSnap("slider", function()
-                if isRotationRow then
-                    local _, step = currentRotationSnapStep()
-                    return step
-                end
-
-                return referencePositionSliderSnapStep(slider)
-            end)
-            slider:SetInputDecimals("label", 3)
-            slider:SetInputSnap("label", 0.001)
-            slider:SetInputDecimals("text", nil)
-            slider:SetInputSnap("text", nil)
-            if isfunction(slider.SetAccentColor) then
-                slider:SetAccentColor(spaceTabAccent[space])
-            end
-            stylePanelSlider(slider, {
-                labelWide = 46,
-                textWide = 56,
-                tall = 30
+        if space == M.MIRROR_SPACE then
+            local mirrorStack = createStackPanel(holder, {
+                spacing = 8,
+                padX = 12,
+                padY = 12
             })
 
-            holder.rows[#holder.rows + 1] = slider
-        end
+            local classification = vgui.Create("DLabel", mirrorStack)
+            classification:SetText("Point")
+            classification:SetFont("DermaDefaultBold")
+            classification:SetTall(22)
+            styleOutlinedLabel(classification, menuAccentColors.mirror)
+            mirrorStack:AddItem(classification, 2)
 
-        local resetPos = vgui.Create("DButton", holder)
-        styleFlatButton(resetPos, "Reset Pos")
-        resetPos.DoClick = function()
-            setValue(space, "px", 0)
-            setValue(space, "py", 0)
-            setValue(space, "pz", 0)
-        end
+            addStyledCheckBox(mirrorStack, "True Mirror (Experimental)", "magic_align_mirror_entity_mirror")
 
-        local resetRot = vgui.Create("DButton", holder)
-        styleFlatButton(resetRot, "Reset Rot")
-        resetRot.DoClick = function()
-            setValue(space, "pitch", 0)
-            setValue(space, "yaw", 0)
-            setValue(space, "roll", 0)
-        end
+            local hint = createHelpLabel(mirrorStack, "When enabled: Mirrors the prop itself instead of only rotating it into a mirrored position.\nRequires Magic Align for compatibility with props mirrored this way.", menuColors.text, true)
+            mirrorStack:AddItem(hint, 0)
 
-        holder.PerformLayout = function(self, w, h)
-            local pad = 12
-            local y = pad
-            local innerWidth = math.max(w - pad * 2, 0)
-
-            for _, slider in ipairs(self.rows) do
-                slider:SetPos(pad, y)
-                slider:SetSize(innerWidth, 30)
-                y = y + 32
+            classification.Think = function(self)
+                local label = client.mirrorClassificationLabel and client.mirrorClassificationLabel(activeState()) or "Point"
+                if self:GetText() ~= label then
+                    self:SetText(label)
+                    self:InvalidateLayout(true)
+                end
             end
 
-            local buttonWidth = math.floor((innerWidth - 8) * 0.5)
-            resetPos:SetPos(pad, y + 6)
-            resetPos:SetSize(buttonWidth, 24)
-            resetRot:SetPos(pad + buttonWidth + 8, y + 6)
-            resetRot:SetSize(innerWidth - buttonWidth - 8, 24)
+            holder.PerformLayout = function(self, w, h)
+                mirrorStack:SetPos(0, 0)
+                mirrorStack:SetSize(w, h)
+            end
+        else
+            for _, row in ipairs(panelSliderRows) do
+                local slider = vgui.Create(magicSliderClass, holder)
+                local isRotationRow = row.key == "pitch" or row.key == "yaw" or row.key == "roll"
+                slider:SetText(row.label)
+                slider:SetMinMax(row.min, row.max)
+                slider:SetDecimals(row.decimals)
+                slider:SetConVar("magic_align_" .. space .. "_" .. row.key)
+                slider:SetInputDecimals("slider", row.decimals)
+                slider:SetInputSnap("slider", function()
+                    if isRotationRow then
+                        local _, step = currentRotationSnapStep()
+                        return step
+                    end
+
+                    return referencePositionSliderSnapStep(slider)
+                end)
+                slider:SetInputDecimals("label", 3)
+                slider:SetInputSnap("label", 0.001)
+                slider:SetInputDecimals("text", nil)
+                slider:SetInputSnap("text", nil)
+                if isfunction(slider.SetAccentColor) then
+                    slider:SetAccentColor(spaceTabAccent[space])
+                end
+                stylePanelSlider(slider, {
+                    labelWide = 46,
+                    textWide = 56,
+                    tall = 30
+                })
+
+                holder.rows[#holder.rows + 1] = slider
+            end
+
+            local resetPos = vgui.Create("DButton", holder)
+            styleFlatButton(resetPos, "Reset Pos")
+            resetPos.DoClick = function()
+                setValue(space, "px", 0)
+                setValue(space, "py", 0)
+                setValue(space, "pz", 0)
+            end
+
+            local resetRot = vgui.Create("DButton", holder)
+            styleFlatButton(resetRot, "Reset Rot")
+            resetRot.DoClick = function()
+                setValue(space, "pitch", 0)
+                setValue(space, "yaw", 0)
+                setValue(space, "roll", 0)
+            end
+
+            holder.PerformLayout = function(self, w, h)
+                local pad = 12
+                local y = pad
+                local innerWidth = math.max(w - pad * 2, 0)
+
+                for _, slider in ipairs(self.rows) do
+                    slider:SetPos(pad, y)
+                    slider:SetSize(innerWidth, 30)
+                    y = y + 32
+                end
+
+                local buttonWidth = math.floor((innerWidth - 8) * 0.5)
+                resetPos:SetPos(pad, y + 6)
+                resetPos:SetSize(buttonWidth, 24)
+                resetRot:SetPos(pad + buttonWidth + 8, y + 6)
+                resetRot:SetSize(innerWidth - buttonWidth - 8, 24)
+            end
         end
 
         local tab = sheet:AddSheet(spaceLabels[space] or space, holder)
@@ -2054,7 +2142,11 @@ function TOOL.BuildCPanel(panel)
 
         local click = tab.Tab.DoClick
         tab.Tab.DoClick = function(btn, ...)
-            RunConsoleCommand("magic_align_space", space)
+            if client.setActiveSpace then
+                client.setActiveSpace(space, activeState())
+            else
+                RunConsoleCommand("magic_align_space", space)
+            end
             return click(btn, ...)
         end
     end
@@ -2531,11 +2623,15 @@ function TOOL.BuildCPanel(panel)
 
     updateDisplayRoundingUi(currentDisplayRoundingSetting())
 
+    client.createToolgunSoundVolumeSlider(miscCategoryContent)
+
     miscCategoryContent.Think = function()
         updateDisplayRoundingUi(currentDisplayRoundingSetting())
     end
 
     addStyledCheckBox(miscCategoryContent, "Allow World as Target", "magic_align_world_target")
+    addStyledCheckBox(miscCategoryContent, "Restore Session on Undo", "magic_align_restore_session_on_undo")
+    addStyledCheckBox(miscCategoryContent, "World Grid Light Adaptation", "magic_align_world_bsp_light_adapt")
     addStyledCheckBox(miscCategoryContent, "Disable SmartSnap While Active", "magic_align_disable_smartsnap_active")
     addStyledCheckBox(miscCategoryContent, "Highlight Magic Align in Context Menu", "magic_align_highlight_context_menu")
     createPersistedCategory(panel, "misc_settings", "Misc Settings", miscCategoryContent)
