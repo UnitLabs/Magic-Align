@@ -413,7 +413,7 @@ local function patchedDoShootEffect(self, hitPos, hitNormal, entity, physBone, f
 
     if activeMagicAlignToolForWeapon(self) then
         if SERVER and game.SinglePlayer() then return true end
-        return toolgunEffects.DoShootEffect(self, hitPos, hitNormal, entity, physBone, firstTimePredicted, markerFor("click"))
+        return true
     end
 
     local original = self._magicAlignToolgunEffectsOriginalDoShootEffect or toolgunEffects.originalDoShootEffect

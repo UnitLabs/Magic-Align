@@ -2364,6 +2364,7 @@ function client.worldGridRender.drawWorldBspGlobalGrid(face)
     local primary = job.readyPrimaryBySurface and job.readyPrimaryBySurface[surfaceData]
     local primaryCount = primary and primary.count or 0
     local neighborBatches = job.readyNeighborBatches
+    cam.IgnoreZ(false)
     for i = 1, (job.readyNeighborBatchCount or 0) do
         local batch = neighborBatches[i]
         if batch
@@ -2379,6 +2380,7 @@ function client.worldGridRender.drawWorldBspGlobalGrid(face)
         end
     end
 
+    cam.IgnoreZ(true)
     client.worldGridRender.drawWorldGridSnapCross(face)
 end
 
