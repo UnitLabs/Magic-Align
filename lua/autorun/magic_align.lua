@@ -415,13 +415,27 @@ local function modifierScale(data, firstIndex)
 end
 
 local function findSizeHandler(ent)
-    if not IsValid(ent) or not isfunction(ent.GetChildren) then return end
+    if not IsValid(ent) then return end
 
-    local children = ent:GetChildren()
-    for i = 1, #children do
-        local child = children[i]
-        if IsValid(child) and child:GetClass() == "sizehandler" then
-            return child
+    if isfunction(ent.GetChildren) then
+        local children = ent:GetChildren()
+        for i = 1, #children do
+            local child = children[i]
+            if IsValid(child) and child:GetClass() == "sizehandler" then
+                return child
+            end
+        end
+    end
+
+    if ents and isfunction(ents.FindByClass) then
+        local handlers = ents.FindByClass("sizehandler")
+        for i = 1, #handlers do
+            local child = handlers[i]
+            if IsValid(child)
+                and isfunction(child.GetParent)
+                and child:GetParent() == ent then
+                return child
+            end
         end
     end
 end

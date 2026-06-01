@@ -2699,12 +2699,15 @@ function shapeMetricCache.renderPerf.drawGhostRenderEntries(entries)
     for i = 1, #entries do
         local entry = entries[i]
         if IsValid(entry.ghost) and not (entry.ghost.GetNoDraw and entry.ghost:GetNoDraw()) then
+            local color = entry.ghost:GetColor()
+            render.SetColorModulation(color.r / 255, color.g / 255, color.b / 255)
             render.SetBlend(math.Clamp(entry.alpha / 255, entry.minBlend, entry.maxBlend))
             entry.ghost:DrawModel()
         end
     end
 
     render.SetBlend(1)
+    render.SetColorModulation(1, 1, 1)
 end
 
 local function clampColorByte(value, fallback)

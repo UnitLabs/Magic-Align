@@ -1,6 +1,9 @@
 local M = MAGIC_ALIGN
 if not M then return end
 
+local isvector = M.IsVectorLike or isvector
+local isangle = M.IsAngleLike or isangle
+
 M.ENTITY_MIRROR_NONE = 0
 M.ENTITY_MIRROR_X = 1
 M.ENTITY_MIRROR_Y = 2
@@ -174,21 +177,193 @@ local function scaleIsIdentity(scale)
         and math.abs(scale.z - 1) <= epsilon
 end
 
-local function physicsScaleFor(ent, axis, out)
+local function scaleIsZero(scale)
+    if not isvector(scale) then return true end
+
+    local epsilon = tonumber(M.UI_COMPARE_EPSILON) or 0.0001
+    return math.abs(scale.x) <= epsilon
+        and math.abs(scale.y) <= epsilon
+        and math.abs(scale.z) <= epsilon
+end
+
+local function scaleApprox(a, b)
+    if not isvector(a) or not isvector(b) then return false end
+
+    local epsilon = tonumber(M.UI_COMPARE_EPSILON) or 0.0001
+    return math.abs(a.x - b.x) <= epsilon
+        and math.abs(a.y - b.y) <= epsilon
+        and math.abs(a.z - b.z) <= epsilon
+end
+
+local function copyScale(scale, out)
     out = isvector(out) and out or Vector()
 
-    local sx, sy, sz = axisSigns(validAxis(axis))
-    local physical = M.GetAdvResizerScales and M.GetAdvResizerScales(ent) or nil
-    if isvector(physical) then
-        sx = sx * physical.x
-        sy = sy * physical.y
-        sz = sz * physical.z
+    if isvector(scale) and not scaleIsZero(scale) then
+        out.x = scale.x
+        out.y = scale.y
+        out.z = scale.z
+    else
+        out.x = 1
+        out.y = 1
+        out.z = 1
     end
 
-    out.x = sx
-    out.y = sy
-    out.z = sz
     return out
+end
+
+local function stripAxisSign(scale, axis, out)
+    out = copyScale(scale, out)
+
+    axis = validAxis(axis)
+    local epsilon = tonumber(M.UI_COMPARE_EPSILON) or 0.0001
+    if axis == M.ENTITY_MIRROR_X and out.x < -epsilon then
+        out.x = -out.x
+    elseif axis == M.ENTITY_MIRROR_Y and out.y < -epsilon then
+        out.y = -out.y
+    elseif axis == M.ENTITY_MIRROR_Z and out.z < -epsilon then
+        out.z = -out.z
+    end
+
+    return out
+end
+
+local function applyAxisSign(scale, axis, out)
+    out = copyScale(scale, out)
+
+    local sx, sy, sz = axisSigns(validAxis(axis))
+    out.x = out.x * sx
+    out.y = out.y * sy
+    out.z = out.z * sz
+    return out
+end
+
+local function liveSizeHandlerScale(ent, getterName)
+    local handler = M.FindSizeHandler and M.FindSizeHandler(ent) or nil
+    local getter = IsValid(handler) and handler[getterName] or nil
+    if not isfunction(getter) then return end
+
+    local scale = M.ParseScaleVector and M.ParseScaleVector(getter(handler)) or nil
+    if not isvector(scale) or scaleIsZero(scale) then return end
+
+    return scale
+end
+
+local function preferLiveResizeScale(stored, live)
+    if not isvector(live) then return stored end
+    if isvector(stored) and not scaleIsIdentity(stored) and scaleIsIdentity(live) then
+        return stored
+    end
+
+    return live
+end
+
+local function optionResizeScale(options, key)
+    local scale = istable(options) and options[key] or nil
+    if isvector(scale) and not scaleIsZero(scale) then
+        return scale
+    end
+end
+
+local function captureResizeScales(ent, currentAxis, options)
+    local physical = optionResizeScale(options, "resizePhysicalScale")
+    local visual = optionResizeScale(options, "resizeVisualScale")
+
+    if not isvector(physical) or not isvector(visual) then
+        local storedPhysical, storedVisual
+        if M.GetAdvResizerScales then
+            storedPhysical, storedVisual = M.GetAdvResizerScales(ent)
+        end
+
+        if not isvector(physical) then
+            physical = preferLiveResizeScale(storedPhysical, liveSizeHandlerScale(ent, "GetActualPhysicsScale"))
+        end
+
+        if not isvector(visual) then
+            visual = preferLiveResizeScale(storedVisual, liveSizeHandlerScale(ent, "GetVisualScale"))
+        end
+    end
+
+    return stripAxisSign(physical, currentAxis), stripAxisSign(visual, currentAxis)
+end
+
+local function syncLiveSizeHandlerScales(ent, physical, visual)
+    if not SERVER or not IsValid(ent) then return end
+
+    local handler = M.FindSizeHandler and M.FindSizeHandler(ent) or nil
+    if not IsValid(handler) then return end
+
+    if isvector(physical) and isfunction(handler.SetActualPhysicsScale) then
+        handler:SetActualPhysicsScale(tostring(physical))
+    end
+
+    if isvector(visual) and isfunction(handler.SetVisualScale) then
+        handler:SetVisualScale(tostring(visual))
+    end
+end
+
+local function ensureStoredResizeScales(ent, physical, visual)
+    if not SERVER or not IsValid(ent) then return end
+    if scaleIsIdentity(physical) and scaleIsIdentity(visual) then return end
+
+    ent.EntityMods = istable(ent.EntityMods) and ent.EntityMods or {}
+    local data = istable(ent.EntityMods.advr) and table.Copy(ent.EntityMods.advr) or {}
+    data[1] = physical.x
+    data[2] = physical.y
+    data[3] = physical.z
+    data[4] = visual.x
+    data[5] = visual.y
+    data[6] = visual.z
+    if data[7] == nil then
+        data[7] = false
+    end
+
+    if duplicator and isfunction(duplicator.StoreEntityModifier) then
+        duplicator.StoreEntityModifier(ent, "advr", data)
+    else
+        ent.EntityMods.advr = data
+    end
+
+    syncLiveSizeHandlerScales(ent, physical, visual)
+end
+
+local function physicsScaleFor(ent, axis, out, physicalScale, currentAxis)
+    if not isvector(physicalScale) then
+        local physical
+        if M.GetAdvResizerScales then
+            physical = M.GetAdvResizerScales(ent)
+        end
+
+        physicalScale = preferLiveResizeScale(physical, liveSizeHandlerScale(ent, "GetActualPhysicsScale"))
+    end
+
+    local base = stripAxisSign(physicalScale, currentAxis, out)
+    return applyAxisSign(base, axis, out)
+end
+
+local function liveSizeHandlerVisualScale(ent)
+    return liveSizeHandlerScale(ent, "GetVisualScale")
+end
+
+local function resizeVisualScaleFor(ent, currentAxis)
+    local visual = liveSizeHandlerVisualScale(ent)
+        or (M.GetAdvResizerVisualScale and M.GetAdvResizerVisualScale(ent) or nil)
+
+    if isvector(visual) then
+        local base = stripAxisSign(
+            visual,
+            currentAxis,
+            ent._magicAlignEntityMirrorResizeVisualScale
+        )
+        ent._magicAlignEntityMirrorResizeVisualScale = base
+        return base
+    end
+
+    return ent._magicAlignEntityMirrorResizeVisualScale
+end
+
+local function visualScaleFor(ent, axis, out, currentAxis)
+    local base = resizeVisualScaleFor(ent, currentAxis)
+    return applyAxisSign(base, axis, out)
 end
 
 local function scaleKey(scale)
@@ -727,40 +902,56 @@ if SERVER then
         return ent:GetPhysicsObject(), collisionMins, collisionMaxs, renderMins, renderMaxs
     end
 
-    local function rebuildModelPhysics(ent, axis, state)
+    local function rebuildModelPhysics(ent, axis, state, options)
+        local currentAxis = actualPhysicsAxis(ent)
+        local physicalScale, visualScale = captureResizeScales(ent, currentAxis, options)
+        ensureStoredResizeScales(ent, physicalScale, visualScale)
+
         local phys, stockMins, stockMaxs, renderMins, renderMaxs = initStockModelPhysics(ent)
         if phys == false then return false end
 
-        local scale = physicsScaleFor(ent, axis)
+        local scale = physicsScaleFor(ent, axis, ent._magicAlignEntityMirrorPhysicsScale, physicalScale, M.ENTITY_MIRROR_NONE)
+        ent._magicAlignEntityMirrorPhysicsScale = scale
         local needsCustom = axis ~= M.ENTITY_MIRROR_NONE or not scaleIsIdentity(scale)
-        if needsCustom then
-            local source = physicsConvexes(phys)
-            local convexes = scaledConvexes(source, scratchFor(ent), scale)
-            if not convexes or not ent:PhysicsInitMultiConvex(convexes) then
-                initStockModelPhysics(ent)
-                finishPhysics(ent, false, state)
-                setActualPhysicsAxis(ent, M.ENTITY_MIRROR_NONE)
-                return false
-            end
-
-            local mins, maxs = convexBounds(convexes)
-            if not mins or not maxs then
-                mins, maxs = scaledBounds(stockMins, stockMaxs, scale)
-            end
-            setPhysicsRenderBounds(ent, mins, maxs)
-            finishPhysics(ent, true, state)
-        else
+        if not needsCustom then
             setCollisionBounds(ent, stockMins, stockMaxs)
             setRenderBounds(ent, renderMins or stockMins, renderMaxs or stockMaxs)
             finishPhysics(ent, false, state)
+            setActualPhysicsAxis(ent, axis)
+            return true
         end
 
+        local source = physicsConvexes(phys)
+        if not istable(source) or not istable(source[1]) then
+            finishPhysics(ent, false, state)
+            setActualPhysicsAxis(ent, M.ENTITY_MIRROR_NONE)
+            return false
+        end
+
+        local convexes = scaledConvexes(source, scratchFor(ent), scale)
+        if not convexes or not ent:PhysicsInitMultiConvex(convexes) then
+            initStockModelPhysics(ent)
+            finishPhysics(ent, false, state)
+            setActualPhysicsAxis(ent, M.ENTITY_MIRROR_NONE)
+            return false
+        end
+
+        local mins, maxs = convexBounds(convexes)
+        if not mins or not maxs then
+            mins, maxs = scaledBounds(stockMins, stockMaxs, scale)
+        end
+        setPhysicsRenderBounds(ent, mins, maxs)
+        finishPhysics(ent, true, state)
         setActualPhysicsAxis(ent, axis)
         return true
     end
 
     local function rebuildPrimitivePhysics(ent, axis, state, options)
         if not isfunction(ent.PrimitiveReconstruct) then return false end
+
+        local currentAxis = actualPhysicsAxis(ent)
+        local physicalScale, visualScale = captureResizeScales(ent, currentAxis, options)
+        ensureStoredResizeScales(ent, physicalScale, visualScale)
 
         local result = primitiveConstruct(ent)
         if not result then return false end
@@ -778,7 +969,7 @@ if SERVER then
             return true
         end
 
-        local scale = physicsScaleFor(ent, axis)
+        local scale = physicsScaleFor(ent, axis, nil, physicalScale, M.ENTITY_MIRROR_NONE)
         local convexes = scaledConvexes(source, scratchFor(ent), scale)
         EntityMirror.DebugConvexes("server-primitive-physics-build", ent, axis, scale, source, convexes)
         if not convexes or not ent:PhysicsInitMultiConvex(convexes) then
@@ -810,7 +1001,7 @@ if SERVER then
             return rebuildPrimitivePhysics(ent, axis, state, options)
         end
 
-        return rebuildModelPhysics(ent, axis, state)
+        return rebuildModelPhysics(ent, axis, state, options)
     end
 
     function EntityMirror.ApplyPhysics(ent, axis, options)
@@ -870,12 +1061,31 @@ if SERVER then
         local actual = actualPhysicsAxis(ent)
         local changed = current ~= axis or currentFlags ~= flags
         local forced = options.force == true
+        local capturedPhysicalScale
+        local capturedVisualScale
+
+        local function physicsOptions(extra)
+            local out = {}
+            if istable(extra) then
+                for key, value in pairs(extra) do
+                    out[key] = value
+                end
+            end
+
+            if not isvector(capturedPhysicalScale) or not isvector(capturedVisualScale) then
+                capturedPhysicalScale, capturedVisualScale = captureResizeScales(ent, actual, options)
+            end
+
+            out.resizePhysicalScale = capturedPhysicalScale
+            out.resizeVisualScale = capturedVisualScale
+            return out
+        end
 
         if axis == M.ENTITY_MIRROR_NONE then
             local restoreAfterNetwork = M.IsPrimitive and M.IsPrimitive(ent)
             if not restoreAfterNetwork
                 and (forced or actual ~= M.ENTITY_MIRROR_NONE or current ~= M.ENTITY_MIRROR_NONE or changed) then
-                EntityMirror.RestorePhysics(ent)
+                EntityMirror.RestorePhysics(ent, physicsOptions())
             end
 
             storeState(ent)
@@ -883,7 +1093,7 @@ if SERVER then
 
             if restoreAfterNetwork
                 and (forced or actual ~= M.ENTITY_MIRROR_NONE or current ~= M.ENTITY_MIRROR_NONE or changed) then
-                EntityMirror.RestorePhysics(ent)
+                EntityMirror.RestorePhysics(ent, physicsOptions())
             end
             return true
         end
@@ -905,10 +1115,10 @@ if SERVER then
             local restored = true
             if actual ~= M.ENTITY_MIRROR_NONE
                 and (actual ~= axis or (hadPhysics and not wantsPhysics) or forcePhysicsRebuild) then
-                restored = EntityMirror.RestorePhysics(ent, { suppressPrimitiveHook = true }) ~= false
+                restored = EntityMirror.RestorePhysics(ent, physicsOptions({ suppressPrimitiveHook = true })) ~= false
             end
             if restored and wantsPhysics and (actual ~= axis or forced) then
-                EntityMirror.ApplyPhysics(ent, axis, { force = forced })
+                EntityMirror.ApplyPhysics(ent, axis, physicsOptions({ force = forced }))
             end
         end
 
@@ -974,11 +1184,25 @@ if SERVER then
         return EntityMirror.SetState(ent, targetState.axis, targetState.flags, { force = true })
     end
 
+    local function scheduleModifierStateReapply(ent, state)
+        if not (timer and isfunction(timer.Simple)) then return end
+        state = EntityMirror.Sanitize(state)
+        if not state then return end
+
+        timer.Simple(0, function()
+            if not IsValid(ent) then return end
+            if EntityMirror.GetAxis(ent) ~= state.axis then return end
+
+            EntityMirror.SetState(ent, state.axis, state.flags, { force = true })
+        end)
+    end
+
     if duplicator and isfunction(duplicator.RegisterEntityModifier) then
         duplicator.RegisterEntityModifier(M.ENTITY_MIRROR_MODIFIER_ID, function(_, ent, data)
             local stored = EntityMirror.Sanitize(data)
             if stored then
                 EntityMirror.SetState(ent, stored.axis, stored.flags, { force = true })
+                scheduleModifierStateReapply(ent, stored)
             else
                 EntityMirror.SetState(ent, M.ENTITY_MIRROR_NONE, M.ENTITY_MIRROR_DEFAULT_FLAGS, { force = true })
             end
@@ -1590,23 +1814,40 @@ if CLIENT then
         return applyOwnedClientPhysics(ent, state.desiredPhysicsAxis, state)
     end
 
-    local function setRenderMatrix(ent, axis)
+    local function setRenderMatrix(ent, axis, currentAxis)
         axis = validAxis(axis)
-        if axis == M.ENTITY_MIRROR_NONE then
-            if ent._magicAlignEntityMirrorMatrix then
-                ent:DisableMatrix("RenderMultiply")
-                ent._magicAlignEntityMirrorMatrix = nil
-            end
+        currentAxis = validAxis(currentAxis)
+
+        if axis == M.ENTITY_MIRROR_NONE and not ent._magicAlignEntityMirrorMatrix then
+            ent._magicAlignEntityMirrorScale = nil
+            ent._magicAlignEntityMirrorExpectedScale = nil
+            return
+        end
+
+        local scale = visualScaleFor(ent, axis, ent._magicAlignEntityMirrorScale, currentAxis)
+        ent._magicAlignEntityMirrorScale = scale
+
+        if axis == M.ENTITY_MIRROR_NONE and scaleIsIdentity(scale) then
+            ent:DisableMatrix("RenderMultiply")
+            ent._magicAlignEntityMirrorMatrix = nil
+            ent._magicAlignEntityMirrorScale = nil
+            ent._magicAlignEntityMirrorExpectedScale = nil
             return
         end
 
         local matrix = ent._magicAlignEntityMirrorMatrix or Matrix()
         matrix:Identity()
-        local scale = EntityMirror.ScaleForAxis(axis, ent._magicAlignEntityMirrorScale)
-        ent._magicAlignEntityMirrorScale = scale
         matrix:Scale(scale)
-        ent._magicAlignEntityMirrorMatrix = matrix
         ent:EnableMatrix("RenderMultiply", matrix)
+
+        if axis == M.ENTITY_MIRROR_NONE then
+            ent._magicAlignEntityMirrorMatrix = nil
+            ent._magicAlignEntityMirrorScale = nil
+            ent._magicAlignEntityMirrorExpectedScale = nil
+        else
+            ent._magicAlignEntityMirrorMatrix = matrix
+        end
+
         EntityMirror.DebugEntity("client-visual-matrix", ent, {
             requestedAxis = EntityMirror.AxisLabel(axis),
             visualScale = scale
@@ -1640,17 +1881,34 @@ if CLIENT then
         ent._magicAlignEntityMirrorOldRenderOverride = nil
     end
 
+    local function renderMatrixNeedsSync(ent, axis, currentAxis)
+        axis = validAxis(axis)
+        currentAxis = validAxis(currentAxis)
+
+        local scale = visualScaleFor(ent, axis, ent._magicAlignEntityMirrorExpectedScale, currentAxis)
+        ent._magicAlignEntityMirrorExpectedScale = scale
+
+        local needsMatrix = axis ~= M.ENTITY_MIRROR_NONE or not scaleIsIdentity(scale)
+        if not needsMatrix then
+            return ent._magicAlignEntityMirrorMatrix ~= nil
+        end
+
+        return ent._magicAlignEntityMirrorMatrix == nil
+            or not scaleApprox(ent._magicAlignEntityMirrorScale, scale)
+    end
+
     local function visualNeedsSync(ent, axis)
         axis = validAxis(axis)
-        if validAxis(ent._magicAlignEntityMirrorAxis) ~= axis then return true end
+        local currentAxis = validAxis(ent._magicAlignEntityMirrorAxis)
+        if currentAxis ~= axis then return true end
 
         if axis == M.ENTITY_MIRROR_NONE then
             return ent.RenderOverride == mirrorRenderOverride
-                or ent._magicAlignEntityMirrorMatrix ~= nil
+                or (ent._magicAlignEntityMirrorMatrix ~= nil and renderMatrixNeedsSync(ent, axis, currentAxis))
         end
 
         return ent.RenderOverride ~= mirrorRenderOverride
-            or ent._magicAlignEntityMirrorMatrix == nil
+            or renderMatrixNeedsSync(ent, axis, currentAxis)
     end
 
     local function restoreVisualRenderBounds(ent)
@@ -1687,8 +1945,9 @@ if CLIENT then
         if not IsValid(ent) then return end
 
         axis = validAxis(axis)
+        local currentAxis = validAxis(ent._magicAlignEntityMirrorAxis)
         if axis == M.ENTITY_MIRROR_NONE then
-            setRenderMatrix(ent, M.ENTITY_MIRROR_NONE)
+            setRenderMatrix(ent, M.ENTITY_MIRROR_NONE, currentAxis)
             disableRenderOverride(ent)
             restoreVisualRenderBounds(ent)
             ACTIVE_VISUALS[ent] = nil
@@ -1697,7 +1956,7 @@ if CLIENT then
             return
         end
 
-        setRenderMatrix(ent, axis)
+        setRenderMatrix(ent, axis, currentAxis)
         enableRenderOverride(ent)
         applyVisualRenderBounds(ent, axis)
         ACTIVE_VISUALS[ent] = true
@@ -1709,6 +1968,65 @@ if CLIENT then
         if visualNeedsSync(ent, state.desiredVisualAxis) then
             EntityMirror.ApplyVisual(ent, state.desiredVisualAxis)
         end
+    end
+
+    local function predictionVisualAxis(ent)
+        local prediction = VISUAL_PREDICTIONS[ent]
+        if not istable(prediction) then return end
+        if RealTime() > (tonumber(prediction.expiresAt) or 0) then return end
+
+        return validAxis(prediction.axis)
+    end
+
+    local function forceApplyVisualState(ent, reason)
+        if not IsValid(ent) then return false end
+
+        local desiredVisualAxis = desiredAxes(ent)
+        local visualAxis = predictionVisualAxis(ent) or desiredVisualAxis
+        if visualAxis == M.ENTITY_MIRROR_NONE
+            and validAxis(ent._magicAlignEntityMirrorAxis) == M.ENTITY_MIRROR_NONE then
+            return false
+        end
+
+        local state = stateFor(ent)
+        state.currentRevision = ent.GetNWInt and ent:GetNWInt(NW_REVISION, -1) or -1
+        state.desiredVisualAxis = visualAxis
+        EntityMirror.ApplyVisual(ent, visualAxis)
+        debugClientEntity("client-visual-force", ent, state, {
+            reason = reason,
+            visualAxis = EntityMirror.AxisLabel(visualAxis)
+        })
+        return true
+    end
+
+    local function sizeHandlerParent(handler)
+        if not IsValid(handler) or handler:GetClass() ~= "sizehandler" then return end
+        if not isfunction(handler.GetParent) then return end
+
+        local parent = handler:GetParent()
+        if IsValid(parent) then return parent end
+    end
+
+    local function scheduleSizeHandlerVisualRefresh(handler, reason)
+        local parent = sizeHandlerParent(handler)
+        if not IsValid(parent) then return end
+        if parent._magicAlignEntityMirrorVisualRefreshQueued then return end
+
+        local desiredVisualAxis = desiredAxes(parent)
+        local predictedAxis = predictionVisualAxis(parent)
+        if validAxis(desiredVisualAxis) == M.ENTITY_MIRROR_NONE
+            and validAxis(predictedAxis) == M.ENTITY_MIRROR_NONE
+            and validAxis(parent._magicAlignEntityMirrorAxis) == M.ENTITY_MIRROR_NONE then
+            return
+        end
+
+        parent._magicAlignEntityMirrorVisualRefreshQueued = true
+        timer.Simple(0, function()
+            if not IsValid(parent) then return end
+
+            parent._magicAlignEntityMirrorVisualRefreshQueued = nil
+            forceApplyVisualState(parent, reason)
+        end)
     end
 
     local function normalizedCommitId(commitId)
@@ -1806,6 +2124,7 @@ if CLIENT then
         if not IsValid(ent) then return end
 
         axis = validAxis(axis)
+        local currentAxis = validAxis(ent._magicAlignEntityMirrorPreviewAxis)
         if axis == M.ENTITY_MIRROR_NONE then
             if validAxis(ent._magicAlignEntityMirrorPreviewAxis) == M.ENTITY_MIRROR_NONE
                 and ent.RenderOverride ~= mirrorRenderOverride
@@ -1813,7 +2132,7 @@ if CLIENT then
                 return
             end
 
-            setRenderMatrix(ent, M.ENTITY_MIRROR_NONE)
+            setRenderMatrix(ent, M.ENTITY_MIRROR_NONE, currentAxis)
             disableRenderOverride(ent)
             restoreVisualRenderBounds(ent)
             ACTIVE_VISUALS[ent] = nil
@@ -1823,11 +2142,11 @@ if CLIENT then
 
         if validAxis(ent._magicAlignEntityMirrorPreviewAxis) == axis
             and ent.RenderOverride == mirrorRenderOverride
-            and ent._magicAlignEntityMirrorMatrix ~= nil then
+            and not renderMatrixNeedsSync(ent, axis, currentAxis) then
             return
         end
 
-        setRenderMatrix(ent, axis)
+        setRenderMatrix(ent, axis, currentAxis)
         enableRenderOverride(ent)
         applyVisualRenderBounds(ent, axis)
         ACTIVE_VISUALS[ent] = nil
@@ -1912,11 +2231,20 @@ if CLIENT then
     end
 
     hook.Add("EntityNetworkedVarChanged", "MagicAlignEntityMirrorNetworked", function(ent, name)
+        if IsValid(ent) and ent:GetClass() == "sizehandler" then
+            scheduleSizeHandlerVisualRefresh(ent, "sizehandler_var")
+            return
+        end
+
         if name ~= NW_AXIS and name ~= NW_FLAGS and name ~= NW_REVISION then return end
         reconcileEntity(ent, "network_var")
     end)
 
     hook.Add("NetworkEntityCreated", "MagicAlignEntityMirrorCreated", function(ent)
+        if IsValid(ent) and ent:GetClass() == "sizehandler" then
+            scheduleSizeHandlerVisualRefresh(ent, "sizehandler_created")
+        end
+
         reconcileEntity(ent, "created")
     end)
 

@@ -160,6 +160,12 @@ local function resetCache(status)
     cache.stageTotal = 0
     cache.stageProcessed = 0
     cache.stageStartedAt = nil
+    cache.stageSampleAt = nil
+    cache.stageSampleProcessed = nil
+    cache.stageSampleTotal = nil
+    cache.progressSampleAt = nil
+    cache.progressSampleDone = nil
+    cache.progressSampleTotal = nil
     cache.lastProgressHintAt = nil
     cache.startedAt = nil
     cache.readyAt = nil
@@ -1213,10 +1219,14 @@ local function addSurfaceNeighbor(surfaceData, neighbor)
 end
 
 function worldBSP.setBuildStage(stage, total, processed)
+    local stageNow = now()
     cache.stage = stage
     cache.stageTotal = math.max(tonumber(total) or 0, 0)
     cache.stageProcessed = math.Clamp(tonumber(processed) or 0, 0, cache.stageTotal)
-    cache.stageStartedAt = now()
+    cache.stageStartedAt = stageNow
+    cache.stageSampleAt = stageNow
+    cache.stageSampleProcessed = cache.stageProcessed
+    cache.stageSampleTotal = cache.stageTotal
 end
 
 function worldBSP.updateBuildStage(processed, total)
@@ -1228,6 +1238,49 @@ function worldBSP.updateBuildStage(processed, total)
     cache.stageProcessed = stageTotal > 0
         and math.Clamp(tonumber(processed) or 0, 0, stageTotal)
         or math.max(tonumber(processed) or 0, 0)
+
+    if cache.stageSampleTotal ~= nil and cache.stageSampleTotal ~= stageTotal then
+        cache.stageSampleAt = now()
+        cache.stageSampleProcessed = cache.stageProcessed
+        cache.stageSampleTotal = stageTotal
+    end
+end
+
+local function estimateRemainingFromFraction(elapsed, fraction)
+    if not fraction or fraction <= 0 or fraction >= 1 then return nil end
+    elapsed = tonumber(elapsed) or 0
+    if elapsed <= 0 then return nil end
+
+    return elapsed * (1 - fraction) / fraction
+end
+
+local function estimateRemainingFromSample(currentTime, done, total, sampleAt, sampleDone, sampleTotal)
+    done = tonumber(done)
+    total = tonumber(total)
+    sampleAt = tonumber(sampleAt)
+    sampleDone = tonumber(sampleDone)
+    sampleTotal = tonumber(sampleTotal)
+
+    if not done or not total or total <= 0 or done <= 0 or done >= total then return nil end
+    if not sampleAt or not sampleDone or sampleTotal ~= total then return nil end
+
+    local deltaDone = done - sampleDone
+    local deltaTime = (tonumber(currentTime) or 0) - sampleAt
+    if deltaDone <= 0 or deltaTime <= 0 then return nil end
+
+    return ((total - done) / deltaDone) * deltaTime
+end
+
+local function maxProgressEta(...)
+    local eta
+    for i = 1, select("#", ...) do
+        local value = tonumber(select(i, ...))
+        if value and value >= 0 and value ~= math.huge and value == value then
+            eta = eta and math.max(eta, value) or value
+        end
+    end
+
+    return eta
 end
 
 function worldBSP.cacheOverallProgress()
@@ -1277,13 +1330,22 @@ function worldBSP.cacheProgress()
     local elapsed = startedAt and math.max((readyAt or currentTime) - startedAt, 0) or 0
     local done, total = worldBSP.cacheOverallProgress()
     local fraction = done and total and total > 0 and math.Clamp(done / total, 0, 1) or nil
-    local eta
+    local overallEta
+    local recentEta
 
     if currentStatus == cache.STATUS.BUILDING and fraction and fraction > 0 and fraction < 1 then
-        eta = elapsed * (1 - fraction) / fraction
+        overallEta = estimateRemainingFromFraction(elapsed, fraction)
+        recentEta = estimateRemainingFromSample(
+            currentTime,
+            done,
+            total,
+            cache.progressSampleAt,
+            cache.progressSampleDone,
+            cache.progressSampleTotal
+        )
     elseif currentStatus == cache.STATUS.READY then
         fraction = 1
-        eta = 0
+        overallEta = 0
     end
 
     local stageTotal = tonumber(cache.stageTotal) or 0
@@ -1291,8 +1353,49 @@ function worldBSP.cacheProgress()
     local stageFraction = stageTotal > 0 and math.Clamp(stageProcessed / stageTotal, 0, 1) or nil
     local stageElapsed = cache.stageStartedAt and math.max(currentTime - cache.stageStartedAt, 0) or 0
     local stageEta
+    local stageRecentEta
     if currentStatus == cache.STATUS.BUILDING and stageFraction and stageFraction > 0 and stageFraction < 1 then
-        stageEta = stageElapsed * (1 - stageFraction) / stageFraction
+        stageEta = estimateRemainingFromFraction(stageElapsed, stageFraction)
+        stageRecentEta = estimateRemainingFromSample(
+            currentTime,
+            stageProcessed,
+            stageTotal,
+            cache.stageSampleAt,
+            cache.stageSampleProcessed,
+            cache.stageSampleTotal
+        )
+    end
+
+    local eta = maxProgressEta(overallEta, recentEta, stageEta, stageRecentEta)
+    if currentStatus == cache.STATUS.READY then
+        eta = 0
+    end
+
+    if currentStatus == cache.STATUS.BUILDING then
+        if done and total and total > 0 then
+            local sampleDone = tonumber(cache.progressSampleDone)
+            if cache.progressSampleTotal ~= total or not sampleDone or done > sampleDone then
+                cache.progressSampleAt = currentTime
+                cache.progressSampleDone = done
+                cache.progressSampleTotal = total
+            end
+        end
+
+        if stageTotal > 0 then
+            local sampleProcessed = tonumber(cache.stageSampleProcessed)
+            if cache.stageSampleTotal ~= stageTotal or not sampleProcessed or stageProcessed > sampleProcessed then
+                cache.stageSampleAt = currentTime
+                cache.stageSampleProcessed = stageProcessed
+                cache.stageSampleTotal = stageTotal
+            end
+        end
+    else
+        cache.progressSampleAt = nil
+        cache.progressSampleDone = nil
+        cache.progressSampleTotal = nil
+        cache.stageSampleAt = nil
+        cache.stageSampleProcessed = nil
+        cache.stageSampleTotal = nil
     end
 
     return {
@@ -1301,12 +1404,15 @@ function worldBSP.cacheProgress()
         percent = fraction and fraction * 100 or nil,
         fraction = fraction,
         eta = eta,
+        overallEta = overallEta,
+        recentEta = recentEta,
         elapsed = elapsed,
         done = done,
         total = total,
         stagePercent = stageFraction and stageFraction * 100 or nil,
         stageFraction = stageFraction,
         stageEta = stageEta,
+        stageRecentEta = stageRecentEta,
         stageElapsed = stageElapsed,
         stageDone = stageProcessed,
         stageTotal = stageTotal
