@@ -23,6 +23,10 @@ local COMPASS_RING_RT_HALF = COMPASS_RING_RT_SIZE * 0.5
 local COMPASS_RING_RT_NAME = "magic_align_toolgun_compass_ring_48_v1"
 local COMPASS_RING_MATERIAL_NAME = "magic_align_toolgun_compass_ring_48_mat_v1"
 local COMPASS_RING_REBUILD_HOOK = "MagicAlignToolgunCompassRingRebuild"
+local WORLDGRID_CACHE_LABEL = "LOADING GRID"
+local WORLDGRID_CACHE_PHASE_COUNT = 5
+local WORLDGRID_CACHE_OVERALL_TRACK = Color(34, 40, 50)
+local WORLDGRID_CACHE_OVERALL_FILL = Color(76, 96, 124)
 local TAU = math.pi * 2
 local fontsReady = false
 local compassNeedles = {}
@@ -822,6 +826,105 @@ local function drawBackdrop(width, height, accent)
 
 end
 
+local function activeWorldGridCacheProgress()
+    local worldBSP = client.WorldBSP
+    if not worldBSP or not isfunction(worldBSP.cacheProgressSnapshot) then return end
+
+    local progress = worldBSP.cacheProgressSnapshot()
+    local buildingStatus = worldBSP.STATUS and worldBSP.STATUS.BUILDING or "building"
+    if not progress or progress.status ~= buildingStatus then return end
+
+    return progress
+end
+
+local function worldGridCacheAccent(progress)
+    local stage = progress and progress.stage
+    if stage == "displacements" then return panelAccent.prop2 or palette.idle end
+    if stage == "neighbor_index" then return footerTabAccent.points or palette.idle end
+    if stage == "neighbor_count" then return footerTabAccent.world or palette.idle end
+    if stage == "neighbor_links" then return footerTabAccent.mirror or palette.idle end
+
+    return panelAccent.prop1 or palette.idle
+end
+
+local function worldGridCachePhaseIndex(progress)
+    local stage = progress and progress.stage
+    if stage == "displacements" then return 2 end
+    if stage == "neighbor_index" then return 3 end
+    if stage == "neighbor_count" then return 4 end
+    if stage == "neighbor_links" then return 5 end
+
+    return 1
+end
+
+local function stageProgressFraction(progress)
+    if not progress then return 0 end
+
+    local fraction = tonumber(progress.stageFraction)
+    if not fraction then
+        local stagePercent = tonumber(progress.stagePercent)
+        if stagePercent then
+            fraction = stagePercent * 0.01
+        end
+    end
+
+    return math.Clamp(fraction or 0, 0, 1)
+end
+
+local function overallProgressFraction(progress)
+    local phaseIndex = worldGridCachePhaseIndex(progress)
+    local phaseFraction = stageProgressFraction(progress)
+
+    return math.Clamp((phaseIndex - 1 + phaseFraction) / WORLDGRID_CACHE_PHASE_COUNT, 0, 1)
+end
+
+local function formatEtaClock(seconds)
+    seconds = tonumber(seconds)
+    if not seconds or seconds < 0 or seconds == math.huge or seconds ~= seconds then
+        return "--:--"
+    end
+
+    seconds = math.max(math.ceil(seconds), 0)
+    return ("%02d:%02d"):format(math.floor(seconds / 60), seconds % 60)
+end
+
+local function drawWorldGridCacheHeader(width, progress, accent)
+    local etaText = formatEtaClock(progress and (progress.eta or progress.stageEta))
+    local font = "MagicAlignToolgunBrand"
+    accent = accent or worldGridCacheAccent(progress)
+
+    draw.SimpleText(WORLDGRID_CACHE_LABEL, font, 24, 30, palette.text, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    draw.SimpleText(etaText, font, width - 24, 30, palette.text, TEXT_ALIGN_RIGHT, TEXT_ALIGN_TOP)
+
+    local x = 20
+    local y = 66
+    local w = width - 40
+    local h = 12
+    local overallX = x + 2
+    local overallY = y + 2
+    local overallW = math.max(w - 4, 0)
+    local overallH = math.max(h - 4, 0)
+    local overallFill = math.floor(overallW * overallProgressFraction(progress))
+    local phaseX = x + 4
+    local phaseY = y + 3
+    local phaseW = math.max(w - 8, 0)
+    local phaseH = math.max(h - 8, 0)
+    local phaseFill = math.floor(phaseW * stageProgressFraction(progress))
+
+    draw.RoundedBox(5, x, y, w, h, palette.card)
+    surface.SetDrawColor(colorAlpha(palette.border, 115))
+    surface.DrawOutlinedRect(x, y, w, h, 1)
+
+    draw.RoundedBox(4, overallX, overallY, overallW, overallH, colorAlpha(WORLDGRID_CACHE_OVERALL_TRACK, 210))
+    if overallFill > 0 then
+        draw.RoundedBox(4, overallX, overallY, overallFill, overallH, colorAlpha(WORLDGRID_CACHE_OVERALL_FILL, 210))
+    end
+
+    if phaseFill > 0 then
+        draw.RoundedBox(3, phaseX, phaseY, phaseFill, phaseH, colorAlpha(accent, 178))
+    end
+end
+
 local function drawValueCards(width, height, items)
     local margin = 24
     local gap = 8
@@ -1497,10 +1600,16 @@ function TOOL:DrawToolScreen(width, height)
     local data = buildDisplayData(self, state, toolScreenCache)
     local mirrorContext = not data and client.Mirror and client.Mirror.displayContext and client.Mirror.displayContext(self, state) or nil
     local accent = data and data.accent or (mirrorContext and mirrorContext.accent) or palette.idle
+    local cacheProgress = activeWorldGridCacheProgress()
+    local cacheAccent = cacheProgress and worldGridCacheAccent(cacheProgress) or nil
 
     drawBackdrop(width, height, accent)
 
-    draw.SimpleText("MAGIC ALIGN", "MagicAlignToolgunBrand", 24, 30, palette.text, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    if cacheProgress then
+        drawWorldGridCacheHeader(width, cacheProgress, cacheAccent)
+    else
+        draw.SimpleText("MAGIC ALIGN", "MagicAlignToolgunBrand", 24, 30, palette.text, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    end
 
     if not data then
         drawIdleCompasses(width, height, self, state, mirrorContext)
@@ -1508,10 +1617,12 @@ function TOOL:DrawToolScreen(width, height)
         return
     end
 
-    draw.SimpleText(data.title, "MagicAlignToolgunTitle", 24, 58, palette.textMuted, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    if not cacheProgress then
+        draw.SimpleText(data.title, "MagicAlignToolgunTitle", 24, 58, palette.textMuted, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
 
-    local chipX = width - chipWidth(data.handle) - 24
-    drawChip(chipX, 28, data.handle, data.accent)
+        local chipX = width - chipWidth(data.handle) - 24
+        drawChip(chipX, 28, data.handle, data.accent)
+    end
 
     drawValueCards(width, height, data.items)
     drawFooter(width, height, self, state, data)

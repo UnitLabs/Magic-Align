@@ -72,7 +72,7 @@ local CONFIG = {
     planeBucketDistanceStep = 4,
     planeBucketDistanceRadius = 1,
     planeBucketMinSurfaceCandidates = 10,
-    hintAfterSeconds = 5,
+    progressSnapshotInterval = 1,
     defaultBudgetMs = 2.5,
     minBudgetMs = 0.1,
     maxBudgetMs = 8
@@ -166,11 +166,11 @@ local function resetCache(status)
     cache.progressSampleAt = nil
     cache.progressSampleDone = nil
     cache.progressSampleTotal = nil
-    cache.lastProgressHintAt = nil
+    cache.progressSnapshot = nil
+    cache.progressSnapshotAt = nil
     cache.startedAt = nil
     cache.readyAt = nil
     cache.worker = nil
-    cache.hintedSlow = false
     cache.error = nil
     worldBSP.lastTraceSurface = nil
 end
@@ -1146,7 +1146,7 @@ local function vertexCellKey(x, y, z)
     return tostring(x) .. ":" .. tostring(y) .. ":" .. tostring(z)
 end
 
-local function addVertexToCell(key, surfaceData, index, vertex)
+local function addVertexToCell(key, surfaceData, index, vertex, uid)
     local cell = cache.vertexIndex[key]
     if not cell then
         cell = {}
@@ -1156,22 +1156,32 @@ local function addVertexToCell(key, surfaceData, index, vertex)
     cell[#cell + 1] = {
         surface = surfaceData,
         index = index,
-        vertex = vertex
+        vertex = vertex,
+        uid = uid
     }
 end
 
-local function indexSurfaceVertices(surfaceData)
+local function indexSurfaceVertices(surfaceData, nextCandidateUid)
+    nextCandidateUid = tonumber(nextCandidateUid) or 0
+    local vertexNeighborUids = {}
+    surfaceData.vertexNeighborUids = vertexNeighborUids
+
     for i = 1, #(surfaceData.vertices or {}) do
         local vertex = surfaceData.vertices[i]
         if isvector(vertex) then
+            nextCandidateUid = nextCandidateUid + 1
+            vertexNeighborUids[i] = nextCandidateUid
             addVertexToCell(
                 vertexCellKey(vertexCellCoord(vertex.x), vertexCellCoord(vertex.y), vertexCellCoord(vertex.z)),
                 surfaceData,
                 i,
-                vertex
+                vertex,
+                nextCandidateUid
             )
         end
     end
+
+    return nextCandidateUid
 end
 
 local function edgeCellBounds(edge)
@@ -1184,18 +1194,27 @@ local function edgeCellBounds(edge)
         edgeCellCoord(edge.maxs.z + tol)
 end
 
-local function indexSurfaceEdges(surfaceData)
+local function indexSurfaceEdges(surfaceData, nextCandidateUid)
+    nextCandidateUid = tonumber(nextCandidateUid) or 0
+
     for i = 1, #(surfaceData.edges or {}) do
         local edge = surfaceData.edges[i]
-        local minX, minY, minZ, maxX, maxY, maxZ = edgeCellBounds(edge)
-        for x = minX, maxX do
-            for y = minY, maxY do
-                for z = minZ, maxZ do
-                    addEdgeToCell(edgeCellKey(x, y, z), edge)
+        if edge then
+            nextCandidateUid = nextCandidateUid + 1
+            edge.uid = nextCandidateUid
+
+            local minX, minY, minZ, maxX, maxY, maxZ = edgeCellBounds(edge)
+            for x = minX, maxX do
+                for y = minY, maxY do
+                    for z = minZ, maxZ do
+                        addEdgeToCell(edgeCellKey(x, y, z), edge)
+                    end
                 end
             end
         end
     end
+
+    return nextCandidateUid
 end
 
 local function addSurfaceNeighbor(surfaceData, neighbor)
@@ -1216,6 +1235,16 @@ local function addSurfaceNeighbor(surfaceData, neighbor)
     end
 
     neighbors[#neighbors + 1] = neighbor
+end
+
+worldBSP.neighborBuild = worldBSP.neighborBuild or {}
+
+function worldBSP.neighborBuild.surfacesAreNeighbors(surfaceA, surfaceB)
+    local seenA = surfaceA and surfaceA.neighborSeen
+    if seenA and seenA[surfaceB] then return true end
+
+    local seenB = surfaceB and surfaceB.neighborSeen
+    return seenB and seenB[surfaceA] == true
 end
 
 function worldBSP.setBuildStage(stage, total, processed)
@@ -1274,7 +1303,8 @@ end
 local function maxProgressEta(...)
     local eta
     for i = 1, select("#", ...) do
-        local value = tonumber(select(i, ...))
+        local value = select(i, ...)
+        value = tonumber(value)
         if value and value >= 0 and value ~= math.huge and value == value then
             eta = eta and math.max(eta, value) or value
         end
@@ -1419,6 +1449,28 @@ function worldBSP.cacheProgress()
     }
 end
 
+function worldBSP.refreshCacheProgressSnapshot(force)
+    local currentTime = now()
+    local snapshotAt = tonumber(cache.progressSnapshotAt)
+    if not force
+        and cache.progressSnapshot
+        and snapshotAt
+        and currentTime - snapshotAt < CONFIG.progressSnapshotInterval then
+        return cache.progressSnapshot
+    end
+
+    local progress = worldBSP.cacheProgress()
+    progress.sampledAt = currentTime
+    cache.progressSnapshot = progress
+    cache.progressSnapshotAt = currentTime
+
+    return progress
+end
+
+function worldBSP.cacheProgressSnapshot()
+    return cache.progressSnapshot
+end
+
 function worldBSP.formatProgressPercent(value)
     if value == nil then return "n/a" end
     return ("%.1f%%"):format(math.Clamp(tonumber(value) or 0, 0, 100))
@@ -1454,10 +1506,12 @@ local function edgesAreAdjacent(edgeA, edgeB)
     local parallel = math.abs(dot(edgeA.dir, edgeB.dir))
     if parallel < CONFIG.edgeParallelDotMin then return false end
 
+    local tolerance = tonumber(CONFIG.edgeCollinearTolerance) or 0
+    if tolerance < 0 then return false end
+
     local offset = edgeB.a - edgeA.a
-    local lineDistance = M.VectorLengthPrecise and M.VectorLengthPrecise(cross(offset, edgeA.dir))
-        or math.sqrt(M.VectorLengthSqrPrecise(cross(offset, edgeA.dir)))
-    if lineDistance > CONFIG.edgeCollinearTolerance then return false end
+    local lineOffset = cross(offset, edgeA.dir)
+    if M.VectorLengthSqrPrecise(lineOffset) > tolerance * tolerance then return false end
 
     return edgeIntervalsOverlap(edgeA, edgeB)
 end
@@ -1466,35 +1520,45 @@ local function verticesAreAdjacent(surfaceData, vertex, other)
     if not surfaceData or not other or surfaceData == other.surface then return false end
     if not isvector(vertex) or not isvector(other.vertex) then return false end
 
-    local delta = other.vertex - vertex
     local tolerance = tonumber(CONFIG.vertexNeighborTolerance) or 0
-    return M.VectorLengthSqrPrecise(delta) <= tolerance * tolerance
+    if tolerance < 0 then return false end
+
+    local otherVertex = other.vertex
+    local dx = otherVertex.x - vertex.x
+    if math.abs(dx) > tolerance then return false end
+
+    local dy = otherVertex.y - vertex.y
+    if math.abs(dy) > tolerance then return false end
+
+    local dz = otherVertex.z - vertex.z
+    if math.abs(dz) > tolerance then return false end
+
+    return dx * dx + dy * dy + dz * dz <= tolerance * tolerance
 end
 
-local function buildDirectNeighborCache()
-    cache.edgeIndex = {}
-    cache.vertexIndex = {}
-    cache.neighborTotal = math.max(#(cache.surfaces or {}) * 2, 0)
-    cache.neighborProcessed = 0
-    worldBSP.setBuildStage("neighbor_index", #(cache.surfaces or {}), 0)
+function worldBSP.neighborBuild.markCandidatePair(seenPairs, uidA, uidB)
+    if not uidA or not uidB or uidA >= uidB then return false end
 
-    for i = 1, #(cache.surfaces or {}) do
-        local surfaceData = cache.surfaces[i]
-        surfaceData.neighbors = {}
-        surfaceData.neighborSeen = {}
-        indexSurfaceEdges(surfaceData)
-        indexSurfaceVertices(surfaceData)
-        cache.neighborProcessed = i
-        worldBSP.updateBuildStage(i)
-        maybeYield()
+    local seenForA = seenPairs[uidA]
+    if seenForA then
+        if seenForA[uidB] then return false end
+    else
+        seenForA = {}
+        seenPairs[uidA] = seenForA
     end
 
-    local tested = {}
-    worldBSP.setBuildStage("neighbor_links", #(cache.surfaces or {}), 0)
-    for i = 1, #(cache.surfaces or {}) do
-        local surfaceData = cache.surfaces[i]
-        for edgeIndex = 1, #(surfaceData.edges or {}) do
-            local edge = surfaceData.edges[edgeIndex]
+    seenForA[uidB] = true
+    return true
+end
+
+function worldBSP.neighborBuild.walkSurfaceEdgePairs(surfaceData, seenPairs, onPair)
+    local count = 0
+    local markCandidatePair = worldBSP.neighborBuild.markCandidatePair
+
+    for edgeIndex = 1, #(surfaceData.edges or {}) do
+        local edge = surfaceData.edges[edgeIndex]
+        local uid = edge and edge.uid
+        if uid then
             local minX, minY, minZ, maxX, maxY, maxZ = edgeCellBounds(edge)
             for x = minX, maxX do
                 for y = minY, maxY do
@@ -1504,16 +1568,12 @@ local function buildDirectNeighborCache()
                             for j = 1, #cell do
                                 local other = cell[j]
                                 local otherSurface = other and other.surface
-                                if otherSurface and otherSurface ~= surfaceData then
-                                    local aId = math.min(surfaceData.id or 0, otherSurface.id or 0)
-                                    local bId = math.max(surfaceData.id or 0, otherSurface.id or 0)
-                                    local key = aId .. ":" .. bId .. ":" .. edgeIndex .. ":" .. tostring(other.index or j)
-                                    if not tested[key] then
-                                        tested[key] = true
-                                        if edgesAreAdjacent(edge, other) then
-                                            addSurfaceNeighbor(surfaceData, otherSurface)
-                                            addSurfaceNeighbor(otherSurface, surfaceData)
-                                        end
+                                if otherSurface
+                                    and otherSurface ~= surfaceData
+                                    and markCandidatePair(seenPairs, uid, other.uid) then
+                                    count = count + 1
+                                    if onPair then
+                                        onPair(surfaceData, edge, otherSurface, other)
                                     end
                                 end
                             end
@@ -1521,49 +1581,150 @@ local function buildDirectNeighborCache()
                     end
                 end
             end
-
-            maybeYield()
         end
 
-        for vertexIndex = 1, #(surfaceData.vertices or {}) do
-            local vertex = surfaceData.vertices[vertexIndex]
-            if isvector(vertex) then
-                local cellX = vertexCellCoord(vertex.x)
-                local cellY = vertexCellCoord(vertex.y)
-                local cellZ = vertexCellCoord(vertex.z)
-                for x = cellX - 1, cellX + 1 do
-                    for y = cellY - 1, cellY + 1 do
-                        for z = cellZ - 1, cellZ + 1 do
-                            local cell = cache.vertexIndex[vertexCellKey(x, y, z)]
-                            if cell then
-                                for j = 1, #cell do
-                                    local other = cell[j]
-                                    local otherSurface = other and other.surface
-                                    if otherSurface and otherSurface ~= surfaceData and not surfaceData.neighborSeen[otherSurface] then
-                                        local aId = math.min(surfaceData.id or 0, otherSurface.id or 0)
-                                        local bId = math.max(surfaceData.id or 0, otherSurface.id or 0)
-                                        local key = aId .. ":" .. bId .. ":v:" .. vertexIndex .. ":" .. tostring(other.index or j)
-                                        if not tested[key] then
-                                            tested[key] = true
-                                            if verticesAreAdjacent(surfaceData, vertex, other) then
-                                                addSurfaceNeighbor(surfaceData, otherSurface)
-                                                addSurfaceNeighbor(otherSurface, surfaceData)
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-
-            maybeYield()
-        end
-
-        cache.neighborProcessed = #(cache.surfaces or {}) + i
-        worldBSP.updateBuildStage(i)
+        maybeYield()
     end
+
+    return count
+end
+
+function worldBSP.neighborBuild.walkSurfaceVertexPairs(surfaceData, seenPairs, onPair)
+    local count = 0
+    local vertexNeighborUids = surfaceData.vertexNeighborUids
+    local markCandidatePair = worldBSP.neighborBuild.markCandidatePair
+
+    for vertexIndex = 1, #(surfaceData.vertices or {}) do
+        local vertex = surfaceData.vertices[vertexIndex]
+        local uid = vertexNeighborUids and vertexNeighborUids[vertexIndex]
+        if uid and isvector(vertex) then
+            local cellX = vertexCellCoord(vertex.x)
+            local cellY = vertexCellCoord(vertex.y)
+            local cellZ = vertexCellCoord(vertex.z)
+            for x = cellX - 1, cellX + 1 do
+                for y = cellY - 1, cellY + 1 do
+                    for z = cellZ - 1, cellZ + 1 do
+                        local cell = cache.vertexIndex[vertexCellKey(x, y, z)]
+                        if cell then
+                            for j = 1, #cell do
+                                local other = cell[j]
+                                local otherSurface = other and other.surface
+                                if otherSurface
+                                    and otherSurface ~= surfaceData
+                                    and markCandidatePair(seenPairs, uid, other.uid) then
+                                    count = count + 1
+                                    if onPair then
+                                        onPair(surfaceData, vertex, otherSurface, other)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        maybeYield()
+    end
+
+    return count
+end
+
+function worldBSP.neighborBuild.countCandidatePairs()
+    local total = 0
+    local edgePairs = {}
+    local vertexPairs = {}
+    local surfaces = cache.surfaces or {}
+    local walkSurfaceEdgePairs = worldBSP.neighborBuild.walkSurfaceEdgePairs
+    local walkSurfaceVertexPairs = worldBSP.neighborBuild.walkSurfaceVertexPairs
+
+    worldBSP.setBuildStage("neighbor_count", #surfaces, 0)
+    for i = 1, #surfaces do
+        local surfaceData = surfaces[i]
+        total = total + walkSurfaceEdgePairs(surfaceData, edgePairs)
+        total = total + walkSurfaceVertexPairs(surfaceData, vertexPairs)
+        worldBSP.updateBuildStage(i)
+        maybeYield()
+    end
+
+    return total
+end
+
+function worldBSP.neighborBuild.updateLinkProgress(processed)
+    cache.neighborProcessed = processed
+    cache.stageProcessed = processed
+end
+
+function worldBSP.neighborBuild.linkCandidatePairs(total)
+    local processed = 0
+    local edgePairs = {}
+    local vertexPairs = {}
+    local surfaces = cache.surfaces or {}
+    local helpers = worldBSP.neighborBuild
+    local walkSurfaceEdgePairs = helpers.walkSurfaceEdgePairs
+    local walkSurfaceVertexPairs = helpers.walkSurfaceVertexPairs
+
+    local function advance()
+        processed = processed + 1
+        helpers.updateLinkProgress(processed)
+    end
+
+    local function linkEdgePair(surfaceData, edge, otherSurface, other)
+        advance()
+        if helpers.surfacesAreNeighbors(surfaceData, otherSurface) then return end
+
+        if edgesAreAdjacent(edge, other) then
+            addSurfaceNeighbor(surfaceData, otherSurface)
+            addSurfaceNeighbor(otherSurface, surfaceData)
+        end
+    end
+
+    local function linkVertexPair(surfaceData, vertex, otherSurface, other)
+        advance()
+        if helpers.surfacesAreNeighbors(surfaceData, otherSurface) then return end
+
+        if verticesAreAdjacent(surfaceData, vertex, other) then
+            addSurfaceNeighbor(surfaceData, otherSurface)
+            addSurfaceNeighbor(otherSurface, surfaceData)
+        end
+    end
+
+    for i = 1, #surfaces do
+        local surfaceData = surfaces[i]
+        walkSurfaceEdgePairs(surfaceData, edgePairs, linkEdgePair)
+        walkSurfaceVertexPairs(surfaceData, vertexPairs, linkVertexPair)
+        worldBSP.updateBuildStage(processed)
+    end
+
+    cache.neighborTotal = math.max(tonumber(total) or 0, processed)
+    helpers.updateLinkProgress(processed)
+    worldBSP.updateBuildStage(processed, cache.neighborTotal)
+end
+
+local function buildDirectNeighborCache()
+    cache.edgeIndex = {}
+    cache.vertexIndex = {}
+    cache.neighborTotal = 0
+    cache.neighborProcessed = 0
+    worldBSP.setBuildStage("neighbor_index", #(cache.surfaces or {}), 0)
+
+    local nextCandidateUid = 0
+    for i = 1, #(cache.surfaces or {}) do
+        local surfaceData = cache.surfaces[i]
+        surfaceData.neighbors = {}
+        surfaceData.neighborSeen = {}
+        nextCandidateUid = indexSurfaceEdges(surfaceData, nextCandidateUid)
+        nextCandidateUid = indexSurfaceVertices(surfaceData, nextCandidateUid)
+        worldBSP.updateBuildStage(i)
+        maybeYield()
+    end
+
+    local neighborHelpers = worldBSP.neighborBuild
+    local neighborWorkTotal = neighborHelpers.countCandidatePairs()
+    cache.neighborTotal = neighborWorkTotal
+    cache.neighborProcessed = 0
+    worldBSP.setBuildStage("neighbor_links", neighborWorkTotal, 0)
+    neighborHelpers.linkCandidatePairs(neighborWorkTotal)
 
     for i = 1, #(cache.surfaces or {}) do
         cache.surfaces[i].neighborSeen = nil
@@ -1596,9 +1757,7 @@ local function finishBuild()
         displacementInfo
     ))
 
-    if notification and notification.AddLegacy then
-        notification.AddLegacy("Magic Align world snapping is ready.", NOTIFY_HINT, 3)
-    end
+    worldBSP.refreshCacheProgressSnapshot(true)
 end
 
 local function entityIndex(ent)
@@ -2321,7 +2480,8 @@ local function buildWorker()
     end
     cache.brushTotal = cache.total
     cache.brushProcessed = 0
-    cache.neighborTotal = cache.total * 2
+    cache.neighborTotal = 0
+    cache.neighborProcessed = 0
     if cache.total <= 0 then
         cache.status = cache.STATUS.UNAVAILABLE
         cache.worker = nil
@@ -2366,45 +2526,10 @@ local function startBuild()
     resetCache(cache.STATUS.BUILDING)
     cache.startedAt = now()
     cache.worker = coroutine.create(buildWorker)
-    cache.hintedSlow = false
-    cache.lastProgressHintAt = cache.startedAt
     worldBSP.setBuildStage("starting", 0, 0)
+    worldBSP.refreshCacheProgressSnapshot(true)
 
     print("Magic Align: World BSP snapping cache is building...")
-    if notification and notification.AddLegacy then
-        notification.AddLegacy("Magic Align world snapping cache is building...", NOTIFY_HINT, 3)
-    end
-end
-
-local function maybeSlowHint()
-    if cache.status ~= cache.STATUS.BUILDING then return end
-
-    local currentTime = now()
-    local lastHintAt = tonumber(cache.lastProgressHintAt) or tonumber(cache.startedAt) or currentTime
-    if currentTime - lastHintAt < CONFIG.hintAfterSeconds then return end
-
-    cache.hintedSlow = true
-    cache.lastProgressHintAt = currentTime
-
-    local progress = worldBSP.cacheProgress()
-    local message = ("Magic Align: World BSP snapping is still building (%s, stage=%s %s, ETA %s)."):format(
-        worldBSP.formatProgressPercent(progress.percent),
-        tostring(progress.stage or "unknown"),
-        worldBSP.formatProgressPercent(progress.stagePercent),
-        worldBSP.formatProgressSeconds(progress.eta or progress.stageEta)
-    )
-
-    print(message)
-    if notification and notification.AddLegacy then
-        notification.AddLegacy(
-            ("Magic Align BSP cache: %s, ETA %s."):format(
-                worldBSP.formatProgressPercent(progress.percent),
-                worldBSP.formatProgressSeconds(progress.eta or progress.stageEta)
-            ),
-            NOTIFY_HINT,
-            4
-        )
-    end
 end
 
 function worldBSP.update(settings)
@@ -2433,15 +2558,16 @@ function worldBSP.update(settings)
         cache.status = cache.STATUS.ERROR
         cache.error = tostring(err)
         cache.worker = nil
+        worldBSP.refreshCacheProgressSnapshot(true)
         print("Magic Align: World BSP snapping failed: " .. cache.error)
         return
     end
 
     if coroutine.status(worker) == "dead" and cache.status == cache.STATUS.BUILDING then
         finishBuild()
+    elseif cache.status == cache.STATUS.BUILDING then
+        worldBSP.refreshCacheProgressSnapshot(false)
     end
-
-    maybeSlowHint()
 end
 
 function worldBSP.isReady()
