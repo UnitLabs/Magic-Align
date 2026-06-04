@@ -403,6 +403,11 @@ local function cloneViaSpawnFallback(ply, src, pos, ang)
     return ent
 end
 
+local function physicsMotionEnabled(ent)
+    local phys = IsValid(ent) and ent:GetPhysicsObject() or nil
+    return IsValid(phys) and isfunction(phys.IsMotionEnabled) and phys:IsMotionEnabled() == true
+end
+
 local function captureEntityState(ent)
     if not IsValid(ent) then return end
 
@@ -415,14 +420,17 @@ local function captureEntityState(ent)
         pos = cloneVec(pos),
         ang = cloneAng(ang),
         entityMirror = M.EntityMirror and M.EntityMirror.Capture and M.EntityMirror.Capture(ent) or nil,
-        parent = IsValid(ent:GetParent()) and ent:GetParent() or nil
+        parent = IsValid(ent:GetParent()) and ent:GetParent() or nil,
+        motionEnabled = physicsMotionEnabled(ent)
     }
 end
 
-local function canUse(ply, ent)
+local function canUse(ply, ent, toolMode)
     if not M.IsProp(ent) then return false end
 
-    if ent.CPPICanTool and ent:CPPICanTool(ply, "magic_align") == false then
+    toolMode = M.IsMagicAlignToolMode and M.IsMagicAlignToolMode(toolMode) and toolMode or M.TOOL_MODE_MAGIC_ALIGN
+
+    if ent.CPPICanTool and ent:CPPICanTool(ply, toolMode) == false then
         return false
     end
 
@@ -433,7 +441,7 @@ local function canUse(ply, ent)
         StartPos = ply:EyePos()
     }
 
-    if hook.Run("CanTool", ply, tr, "magic_align") == false then
+    if hook.Run("CanTool", ply, tr, toolMode) == false then
         return false
     end
 
@@ -509,7 +517,26 @@ local function settlePhysics(ent)
     phys:SetAngles(ent:GetAngles())
 
     phys:EnableMotion(false)
-    phys:Sleep()
+    if isfunction(phys.Sleep) then
+        phys:Sleep()
+    end
+end
+
+local function restorePreservedMotion(ent, startState, preserveFrozenState)
+    if preserveFrozenState ~= true or not istable(startState) or startState.motionEnabled ~= true then return end
+
+    local phys = IsValid(ent) and ent:GetPhysicsObject() or nil
+    if not IsValid(phys) then return end
+
+    phys:EnableMotion(true)
+    if isfunction(phys.Wake) then
+        phys:Wake()
+    end
+end
+
+local function toolClientBool(tool, name)
+    if not tool or not isfunction(tool.GetClientNumber) then return false end
+    return tool:GetClientNumber(name) == 1
 end
 
 local function applyEntityMirrorStateFromStart(ent, startState, deltaAxis, options)
@@ -702,6 +729,20 @@ local function worldBounds(ent)
     return worldMins, worldMaxs
 end
 
+local function toolLocalBounds(ent)
+    local mins, maxs = M.GetLocalBounds(ent)
+    if not hasFiniteVectorFields(mins) or not hasFiniteVectorFields(maxs) then return end
+
+    if M.EntityMirror and M.EntityMirror.BoundsInBaseSpace then
+        local baseMins, baseMaxs = M.EntityMirror.BoundsInBaseSpace(ent, mins, maxs)
+        if hasFiniteVectorFields(baseMins) and hasFiniteVectorFields(baseMaxs) then
+            return baseMins, baseMaxs
+        end
+    end
+
+    return mins, maxs
+end
+
 local function aabbOverlap(minsA, maxsA, minsB, maxsB)
     if not hasFiniteVectorFields(minsA) or not hasFiniteVectorFields(maxsA)
         or not hasFiniteVectorFields(minsB) or not hasFiniteVectorFields(maxsB) then
@@ -808,13 +849,20 @@ function runCommit(task)
     local parent = task.parent
     local mode = task.mode
     local entityMirrorAxis = tonumber(task.entityMirrorAxis) or M.ENTITY_MIRROR_NONE
+    local toolMode = M.IsMagicAlignToolMode and M.IsMagicAlignToolMode(task.toolMode)
+        and task.toolMode
+        or M.TOOL_MODE_MAGIC_ALIGN
+    local isMirrorAction = toolMode == M.TOOL_MODE_MAGIC_MIRROR
+        or (istable(task.sessionSnapshot) and task.sessionSnapshot.isMirrorAction == true)
+    local preserveFrozenState = isMirrorAction and task.preserveFrozenState == true
+    local createUndo = not isMirrorAction or task.createUndo == true
     local linkedTargets = istable(task.linkedTargets) and task.linkedTargets or nil
     local usesAbsoluteTargets = linkedTargets ~= nil
     local effectiveNocollide = nocollide or weld
 
     if not IsValid(ply) then return end
-    if not canUse(ply, prop1) then return end
-    if IsValid(prop2) and not canUse(ply, prop2) then return end
+    if not canUse(ply, prop1, toolMode) then return end
+    if IsValid(prop2) and not canUse(ply, prop2, toolMode) then return end
     if prop1 == prop2 then return end
     if #linkedProps > M.GetMaxLinkedProps() then return end
     if linkedTargets and #linkedTargets ~= #linkedProps then return end
@@ -838,7 +886,7 @@ function runCommit(task)
 
     for i = 1, #linkedProps do
         local ent = linkedProps[i]
-        if not IsValid(ent) or seen[ent] or not canUse(ply, ent) then return end
+        if not IsValid(ent) or seen[ent] or not canUse(ply, ent, toolMode) then return end
 
         local absolute = linkedTargets and linkedTargets[i] or nil
         if linkedTargets and (
@@ -937,6 +985,7 @@ function runCommit(task)
                 normalizeInherited = true
             })
             settlePhysics(target)
+            restorePreservedMotion(target, spec.start, preserveFrozenState)
             debugCommitEntity("commit-copy-after-mirror", target, spec, entityMirrorAxis)
             committed[#committed + 1] = target
             created[#created + 1] = target
@@ -967,6 +1016,7 @@ function runCommit(task)
                     normalizeInherited = true
                 })
                 settlePhysics(backup)
+                restorePreservedMotion(backup, spec.start, preserveFrozenState)
                 created[#created + 1] = backup
                 commitCheckpoint(task)
             end
@@ -996,6 +1046,7 @@ function runCommit(task)
                     settlePhysics(target)
                     debugCommitEntity("commit-move-after-mirror", target, spec, entityMirrorAxis)
                 end
+                restorePreservedMotion(target, spec.start, preserveFrozenState)
                 committed[#committed + 1] = target
             commitCheckpoint(task)
         end
@@ -1030,10 +1081,12 @@ function runCommit(task)
 
     if not IsValid(ply) then return end
 
-    undo.Create("Magic Align")
-        undo.SetPlayer(ply)
-        undo.AddFunction(restoreCommitStep, undoProps, created, ply, task.sessionSnapshot)
-    undo.Finish()
+    if createUndo then
+        undo.Create(toolMode == M.TOOL_MODE_MAGIC_MIRROR and "Magic Mirror" or "Magic Align")
+            undo.SetPlayer(ply)
+            undo.AddFunction(restoreCommitStep, undoProps, created, ply, task.sessionSnapshot)
+        undo.Finish()
+    end
 
     return true
 end
@@ -1081,7 +1134,9 @@ net.Receive(M.NET_BOUNDS_REQUEST, function(_, ply)
 
     local ent = net.ReadEntity()
     local sessionId = net.ReadUInt(32)
-    if not canUse(ply, ent) then return end
+    local activeGetter = M.GetActiveMagicAlignFamilyTool or M.GetActiveMagicAlignTool
+    local activeTool = activeGetter and activeGetter(ply) or nil
+    if not activeTool or not canUse(ply, ent, activeTool.Mode) then return end
 
     local byPlayer = REQUEST_STATE[ply]
     if not byPlayer then
@@ -1094,7 +1149,7 @@ net.Receive(M.NET_BOUNDS_REQUEST, function(_, ply)
     if now < (byPlayer[idx] or 0) then return end
     byPlayer[idx] = now + M.AABB_REQUEST_COOLDOWN
 
-    local mins, maxs = M.GetLocalBounds(ent)
+    local mins, maxs = toolLocalBounds(ent)
 
     net.Start(M.NET_BOUNDS_REPLY)
         net.WriteEntity(ent)
@@ -1117,7 +1172,7 @@ net.Receive(M.NET_VIEW_ANGLES, function(_, ply)
     if not IsValid(weapon) or weapon:GetClass() ~= "gmod_tool" then return end
 
     local tool = ply:GetTool()
-    if not tool or tool.Mode ~= "magic_align" then return end
+    if not tool or not (M.IsMagicAlignToolMode and M.IsMagicAlignToolMode(tool.Mode)) then return end
 
     local eyeAng = asGModAngle(ang)
     if eyeAng then
@@ -1180,6 +1235,20 @@ net.Receive(M.NET, function(_, ply)
         return
     end
 
+    local activeGetter = M.GetActiveMagicAlignFamilyTool or M.GetActiveMagicAlignTool
+    local activeTool, activeWeapon
+    if activeGetter then
+        activeTool, activeWeapon = activeGetter(ply)
+    end
+    if not activeTool or activeWeapon ~= toolEnt then
+        rejectCommit(ply, commitId, M.COMMIT_RESULT_INVALID)
+        return
+    end
+
+    local isMagicMirrorTool = activeTool.Mode == M.TOOL_MODE_MAGIC_MIRROR
+    local preserveFrozenState = isMagicMirrorTool and toolClientBool(activeTool, "preserve_frozen_state")
+    local createUndo = not isMagicMirrorTool or toolClientBool(activeTool, "log_undo")
+
     PENDING_COMMITS[ply] = {
         id = commitId,
         expiresAt = RealTime() + COMMIT_UPLOAD_TIMEOUT,
@@ -1206,6 +1275,9 @@ net.Receive(M.NET, function(_, ply)
             parent = parent,
             mode = mode,
             entityMirrorAxis = entityMirrorAxis,
+            preserveFrozenState = preserveFrozenState,
+            createUndo = createUndo,
+            toolMode = activeTool.Mode,
             sessionSnapshot = sessionSnapshot or {
                 schema = M.SESSION_SNAPSHOT_SCHEMA,
                 lastActionType = "align",

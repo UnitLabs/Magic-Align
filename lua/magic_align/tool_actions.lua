@@ -53,7 +53,8 @@ function client.activeSpace()
     if not CLIENT then return end
 
     local ply = LocalPlayer()
-    local tool = IsValid(ply) and M.GetActiveMagicAlignTool(ply) or nil
+    local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
+    local tool = IsValid(ply) and getter(ply) or nil
     if tool and tool.GetClientInfo then
         return tool:GetClientInfo("space")
     end

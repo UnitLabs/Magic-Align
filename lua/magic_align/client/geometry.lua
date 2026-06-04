@@ -76,6 +76,10 @@ function geometry.worldPosFromLocalPoint(ent, localPos)
         return copyVec(localPos)
     end
 
+    if M.EntityMirror and M.EntityMirror.LocalPointToWorld then
+        return M.EntityMirror.LocalPointToWorld(ent, localPos)
+    end
+
     local pos = entityBasePos(ent)
     local ang = entityBaseAng(ent)
     if not isvector(pos) or not isangle(ang) then return end
@@ -88,6 +92,10 @@ function geometry.localPointFromWorldPos(ent, worldPos)
 
     if geometry.isWorldTarget(ent) then
         return copyVec(worldPos)
+    end
+
+    if M.EntityMirror and M.EntityMirror.WorldPointToLocal then
+        return M.EntityMirror.WorldPointToLocal(ent, worldPos)
     end
 
     local pos = entityBasePos(ent)
@@ -104,6 +112,10 @@ function geometry.localNormalFromWorld(ent, worldPos, worldNormal)
 
     if geometry.isWorldTarget(ent) then
         return copyVec(normal)
+    end
+
+    if M.EntityMirror and M.EntityMirror.WorldVectorToLocal then
+        return normalizedVec(M.EntityMirror.WorldVectorToLocal(ent, normal))
     end
 
     local localPos = geometry.localPointFromWorldPos(ent, worldPoint)
@@ -123,6 +135,12 @@ function geometry.worldNormalFromLocal(ent, localPos, localNormal)
 
     if geometry.isWorldTarget(ent) then
         return copyVec(normal)
+    end
+
+    if not isvector(localPos) then return end
+
+    if M.EntityMirror and M.EntityMirror.LocalVectorToWorld then
+        return normalizedVec(M.EntityMirror.LocalVectorToWorld(ent, normal))
     end
 
     local worldPos = geometry.worldPosFromLocalPoint(ent, localPos)

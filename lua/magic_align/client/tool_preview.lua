@@ -491,12 +491,6 @@ function client.Mirror.previewEntityMirrorAxis(ent, deltaAxis)
     return M.EntityMirror.ComposeAxis(M.EntityMirror.GetAxis(ent), deltaAxis)
 end
 
-local function addMirroredPrimitiveEntity(out, ent)
-    if IsValid(ent) and M.IsPrimitive and M.IsPrimitive(ent) then
-        out[ent] = true
-    end
-end
-
 local function copyMirrorReference(reference)
     if not istable(reference) then return end
 
@@ -528,98 +522,8 @@ local function mirrorWorldPoint(worldPos, reference)
     return isvector(mirroredPos) and mirroredPos or nil
 end
 
-local function poseEntry(startPos, startAng, targetPos, targetAng)
-    if not isvector(startPos) or not isangle(startAng)
-        or not isvector(targetPos) or not isangle(targetAng) then
-        return
-    end
-
-    return {
-        startPos = startPos,
-        startAng = startAng,
-        targetPos = targetPos,
-        targetAng = targetAng
-    }
-end
-
-local function primitiveMigrationPoses(payload)
-    local poses = {}
-    if IsValid(payload.prop1) then
-        poses[payload.prop1] = poseEntry(payload.startPos, payload.startAng, payload.pos, payload.ang)
-    end
-
-    for i = 1, #(payload.linked or {}) do
-        local ent = payload.linked[i]
-        local start = payload.linkedStarts and payload.linkedStarts[i] or nil
-        local target = payload.linkedTargets and payload.linkedTargets[i] or nil
-        if IsValid(ent) then
-            poses[ent] = poseEntry(
-                start and start.pos,
-                start and start.ang,
-                target and target.pos or ent:GetPos(),
-                target and target.ang or ent:GetAngles()
-            )
-        end
-    end
-
-    return poses
-end
-
-local function migratePrimitivePointByPose(point, pose, reference)
-    if not isvector(point) or not istable(pose) or not istable(reference) then return false end
-
-    local oldLocal = copyVec(point)
-    local oldNormal = isvector(point.normal) and copyVec(point.normal) or nil
-    local oldWorld = LocalToWorldPosPrecise(oldLocal, pose.startPos, pose.startAng)
-    local newWorld = mirrorWorldPoint(oldWorld, reference)
-    if not isvector(newWorld) then return false end
-
-    local newLocal = WorldToLocalPosPrecise(newWorld, pose.targetPos, pose.targetAng)
-    if not isvector(newLocal) then return false end
-
-    setVec(point, newLocal)
-
-    if oldNormal then
-        local oldTipWorld = LocalToWorldPosPrecise(oldLocal + oldNormal, pose.startPos, pose.startAng)
-        local newTipWorld = mirrorWorldPoint(oldTipWorld, reference)
-        local newTipLocal = isvector(newTipWorld)
-            and WorldToLocalPosPrecise(newTipWorld, pose.targetPos, pose.targetAng)
-            or nil
-        local newNormal = isvector(newTipLocal) and normalizedVec(newTipLocal - newLocal) or nil
-        if newNormal then
-            point.normal = setVec(point.normal, newNormal)
-        else
-            point.normal = nil
-        end
-    end
-
-    return true
-end
-
-local function migratePrimitivePointList(points, fallbackEnt, mirrored, deltaAxis, poses, reference)
-    if not istable(points) then return false end
-
-    local changed = false
-    for i = 1, #points do
-        local point = points[i]
-        local ent = pointReferenceEntity(point, fallbackEnt)
-        if mirrored[ent] then
-            local migrated = migratePrimitivePointByPose(point, poses and poses[ent], reference)
-            if not migrated and M.EntityMirror.ApplyAxisToPoint(point, deltaAxis) then
-                migrated = true
-            end
-            if migrated then
-                changed = true
-            end
-        end
-    end
-
-    return changed
-end
-
 function client.Mirror.migrateCommittedPrimitivePoints(payload)
     if not istable(payload) or payload.mode == M.COMMIT_COPY then return false end
-    if not (M.EntityMirror and M.EntityMirror.ApplyAxisToPoint) then return false end
 
     local deltaAxis = math.Clamp(
         math.floor(tonumber(payload.entityMirrorAxis) or M.ENTITY_MIRROR_NONE),
@@ -628,37 +532,10 @@ function client.Mirror.migrateCommittedPrimitivePoints(payload)
     )
     if deltaAxis == M.ENTITY_MIRROR_NONE then return false end
 
-    local mirrored = {}
-    addMirroredPrimitiveEntity(mirrored, payload.prop1)
-    for i = 1, #(payload.linked or {}) do
-        addMirroredPrimitiveEntity(mirrored, payload.linked[i])
-    end
-    if next(mirrored) == nil then return false end
-
-    local poses = primitiveMigrationPoses(payload)
-    local reference = copyMirrorReference(payload.mirrorReference)
-    local state = ensureStateShape(M.ClientState)
-    local changed = false
-    changed = migratePrimitivePointList(state.source, state.prop1, mirrored, deltaAxis, poses, reference) or changed
-    changed = migratePrimitivePointList(state.target, state.prop2, mirrored, deltaAxis, poses, reference) or changed
-    changed = migratePrimitivePointList(client.Mirror.state(state).points, nil, mirrored, deltaAxis, poses, reference) or changed
-    if not changed then return false end
-
-    state._magicAlignPreviewCache = nil
-    state._magicAlignPendingPreviewCache = nil
-    state._magicAlignPendingPreview = nil
-    state._magicAlignPendingPoints = nil
-    state.pending = nil
-
-    if istable(state.mirror) then
-        state.mirror._magicAlignMirrorCache = nil
-        state.mirror._magicAlignPendingMirrorCache = nil
-    end
-
-    markPreviewChangedFrame(state)
-    M.RefreshState(state)
-
-    return true
+    -- Stored Magic Align points remain unmirrored model-local coordinates.
+    -- The committed mirror axis is now part of the shared entity transform, so
+    -- mutating session points here would apply the same mirror twice.
+    return false
 end
 
 local function rebasePrimitivePointByPose(point, pose)
@@ -768,7 +645,8 @@ function client.Mirror.sourceAnchorLocal(state, deltaAxis, selected, priority, a
 
     local mirroredWorld
     if isvector(anchor) and IsValid(state.prop1) and istable(reference) then
-        local sourceWorld = LocalToWorldPosPrecise(anchor, state.prop1:GetPos(), state.prop1:GetAngles())
+        local sourceWorld = M.EntityMirror and M.EntityMirror.LocalPointToWorld
+            and M.EntityMirror.LocalPointToWorld(state.prop1, anchor)
         mirroredWorld = mirrorWorldPoint(sourceWorld, reference)
     end
 

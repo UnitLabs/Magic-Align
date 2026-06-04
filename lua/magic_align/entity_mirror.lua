@@ -3,6 +3,8 @@ if not M then return end
 
 local isvector = M.IsVectorLike or isvector
 local isangle = M.IsAngleLike or isangle
+local VectorP = M.VectorP
+local ZERO_VEC = VectorP(0, 0, 0)
 
 M.ENTITY_MIRROR_NONE = 0
 M.ENTITY_MIRROR_X = 1
@@ -139,6 +141,21 @@ local function axisSigns(axis)
     return 1, 1, 1
 end
 
+local function setVector(out, value)
+    if not isvector(value) then return end
+
+    if not isvector(out) then
+        return VectorP(value.x, value.y, value.z)
+    end
+
+    out.x, out.y, out.z = value.x, value.y, value.z
+    return out
+end
+
+function EntityMirror.AxisSigns(axis)
+    return axisSigns(validAxis(axis))
+end
+
 function EntityMirror.ApplyAxisToVector(out, value, axis)
     if not isvector(value) then return end
     out = isvector(out) and out or Vector()
@@ -166,6 +183,67 @@ function EntityMirror.ScaleForAxis(axis, out)
     out = isvector(out) and out or Vector()
     out.x, out.y, out.z = axisSigns(validAxis(axis))
     return out
+end
+
+function EntityMirror.AxisForEntity(ent)
+    if not IsValid(ent) then return M.ENTITY_MIRROR_NONE end
+    return EntityMirror.GetAxis(ent)
+end
+
+function EntityMirror.LocalPointToWorldForAxis(localPos, originPos, originAng, axis, out)
+    if not isvector(localPos) or not isvector(originPos) or not isangle(originAng) then return end
+
+    local sx, sy, sz = axisSigns(validAxis(axis))
+    local transformedLocal = VectorP(localPos.x * sx, localPos.y * sy, localPos.z * sz)
+    return setVector(out, M.LocalToWorldPosPrecise(transformedLocal, originPos, originAng))
+end
+
+function EntityMirror.WorldPointToLocalForAxis(worldPos, originPos, originAng, axis, out)
+    if not isvector(worldPos) or not isvector(originPos) or not isangle(originAng) then return end
+
+    local rawLocal = M.WorldToLocalPosPrecise(worldPos, originPos, originAng)
+    if not isvector(rawLocal) then return end
+
+    local sx, sy, sz = axisSigns(validAxis(axis))
+    return setVector(out, VectorP(rawLocal.x * sx, rawLocal.y * sy, rawLocal.z * sz))
+end
+
+function EntityMirror.LocalVectorToWorldForAxis(localVec, originAng, axis, out)
+    if not isvector(localVec) or not isangle(originAng) then return end
+
+    local sx, sy, sz = axisSigns(validAxis(axis))
+    local transformedLocal = VectorP(localVec.x * sx, localVec.y * sy, localVec.z * sz)
+    return setVector(out, M.LocalToWorldPosPrecise(transformedLocal, ZERO_VEC, originAng))
+end
+
+function EntityMirror.WorldVectorToLocalForAxis(worldVec, originAng, axis, out)
+    if not isvector(worldVec) or not isangle(originAng) then return end
+
+    local rawLocal = M.WorldToLocalPosPrecise(worldVec, ZERO_VEC, originAng)
+    if not isvector(rawLocal) then return end
+
+    local sx, sy, sz = axisSigns(validAxis(axis))
+    return setVector(out, VectorP(rawLocal.x * sx, rawLocal.y * sy, rawLocal.z * sz))
+end
+
+function EntityMirror.LocalPointToWorld(ent, localPos, out)
+    if not IsValid(ent) then return end
+    return EntityMirror.LocalPointToWorldForAxis(localPos, ent:GetPos(), ent:GetAngles(), EntityMirror.AxisForEntity(ent), out)
+end
+
+function EntityMirror.WorldPointToLocal(ent, worldPos, out)
+    if not IsValid(ent) then return end
+    return EntityMirror.WorldPointToLocalForAxis(worldPos, ent:GetPos(), ent:GetAngles(), EntityMirror.AxisForEntity(ent), out)
+end
+
+function EntityMirror.LocalVectorToWorld(ent, localVec, out)
+    if not IsValid(ent) then return end
+    return EntityMirror.LocalVectorToWorldForAxis(localVec, ent:GetAngles(), EntityMirror.AxisForEntity(ent), out)
+end
+
+function EntityMirror.WorldVectorToLocal(ent, worldVec, out)
+    if not IsValid(ent) then return end
+    return EntityMirror.WorldVectorToLocalForAxis(worldVec, ent:GetAngles(), EntityMirror.AxisForEntity(ent), out)
 end
 
 local function scaleIsIdentity(scale)
@@ -402,6 +480,97 @@ local function captureRenderBounds(ent)
     return captureCollisionBounds(ent)
 end
 
+local function boundsCenter(mins, maxs, out)
+    if not isvector(mins) or not isvector(maxs) then return end
+    out = isvector(out) and out or Vector()
+    out.x = (mins.x + maxs.x) * 0.5
+    out.y = (mins.y + maxs.y) * 0.5
+    out.z = (mins.z + maxs.z) * 0.5
+    return out
+end
+
+local function captureLocalBounds(ent)
+    if not IsValid(ent) then return end
+
+    if M.GetLocalBounds then
+        local mins, maxs = M.GetLocalBounds(ent)
+        if isvector(mins) and isvector(maxs) then
+            return mins, maxs
+        end
+    end
+
+    return captureCollisionBounds(ent)
+end
+
+local function localBoundsCenter(ent, out)
+    local mins, maxs = captureLocalBounds(ent)
+    return boundsCenter(mins, maxs, out)
+end
+
+local function axisPoint(value, axis, out)
+    if not isvector(value) then return end
+    out = isvector(out) and out or Vector()
+
+    local sx, sy, sz = axisSigns(validAxis(axis))
+    out.x = value.x * sx
+    out.y = value.y * sy
+    out.z = value.z * sz
+    return out
+end
+
+function EntityMirror.LocalBoundsCenter(ent, out)
+    return localBoundsCenter(ent, out)
+end
+
+function EntityMirror.BaseMirrorPivot(ent, currentAxis, out)
+    local center = localBoundsCenter(ent)
+    if not isvector(center) then return end
+
+    local boundsAxis = EntityMirror.BoundsAxisForEntity and EntityMirror.BoundsAxisForEntity(ent) or currentAxis
+    return axisPoint(center, boundsAxis, out)
+end
+
+function EntityMirror.LocalPivotForAxis(basePivot, axis, out)
+    return axisPoint(basePivot, axis, out)
+end
+
+function EntityMirror.PositionForLocalPivot(ent, targetAng, targetAxis, targetPivotWorld, basePivot, out)
+    if not IsValid(ent) or not isangle(targetAng) or not isvector(targetPivotWorld) then return end
+    basePivot = isvector(basePivot) and basePivot or EntityMirror.BaseMirrorPivot(ent, EntityMirror.GetAxis(ent))
+    if not isvector(basePivot) then return end
+
+    local targetLocalPivot = axisPoint(basePivot, targetAxis)
+    if not isvector(targetLocalPivot) or not M.LocalToWorldPosPrecise or not M.SubtractVectorsPrecise then return end
+
+    local targetOffset = M.LocalToWorldPosPrecise(targetLocalPivot, ZERO_VEC, targetAng)
+    if not isvector(targetOffset) then return end
+
+    return setVector(out, M.SubtractVectorsPrecise(targetPivotWorld, targetOffset))
+end
+
+function EntityMirror.PositionForInPlaceAxisChange(ent, targetAng, currentAxis, targetAxis, out)
+    if not IsValid(ent) or not isangle(targetAng) then return end
+    if not M.LocalToWorldPosPrecise then return end
+
+    currentAxis = validAxis(currentAxis)
+    targetAxis = validAxis(targetAxis)
+
+    local basePivot = EntityMirror.BaseMirrorPivot(ent, currentAxis)
+    if not isvector(basePivot) then
+        return setVector(out, ent:GetPos())
+    end
+
+    local currentLocalPivot = axisPoint(basePivot, currentAxis)
+    local currentPivotWorld = currentLocalPivot
+        and M.LocalToWorldPosPrecise(currentLocalPivot, ent:GetPos(), ent:GetAngles())
+        or nil
+    if not isvector(currentPivotWorld) then
+        return setVector(out, ent:GetPos())
+    end
+
+    return EntityMirror.PositionForLocalPivot(ent, targetAng, targetAxis, currentPivotWorld, basePivot, out)
+end
+
 local function scaledBounds(mins, maxs, scale)
     if not isvector(mins) or not isvector(maxs) or not isvector(scale) then return end
 
@@ -414,6 +583,57 @@ local function scaledBounds(mins, maxs, scale)
         math.max(mins.y * scale.y, maxs.y * scale.y),
         math.max(mins.z * scale.z, maxs.z * scale.z)
     )
+end
+
+function EntityMirror.BoundsForAxis(mins, maxs, axis)
+    if not isvector(mins) or not isvector(maxs) then return end
+
+    local scale = EntityMirror.ScaleForAxis(axis, Vector())
+    return scaledBounds(mins, maxs, scale)
+end
+
+function EntityMirror.BoundsAxisForEntity(ent)
+    if not IsValid(ent) then return M.ENTITY_MIRROR_NONE end
+
+    if EntityMirror.PhysicsAxisForEntity then
+        return validAxis(EntityMirror.PhysicsAxisForEntity(ent))
+    end
+
+    local flags = EntityMirror.GetFlags and EntityMirror.GetFlags(ent) or M.ENTITY_MIRROR_DEFAULT_FLAGS
+    if bit.band(flags, M.ENTITY_MIRROR_PHYSICS) == 0 then
+        return M.ENTITY_MIRROR_NONE
+    end
+
+    if M.IsPrimitive and M.IsPrimitive(ent)
+        and bit.band(flags, M.ENTITY_MIRROR_PRIMITIVE_AWARE) == 0 then
+        return M.ENTITY_MIRROR_NONE
+    end
+
+    return EntityMirror.GetAxis and EntityMirror.GetAxis(ent) or M.ENTITY_MIRROR_NONE
+end
+
+function EntityMirror.BoundsInBaseSpace(ent, mins, maxs, boundsAxis)
+    boundsAxis = validAxis(boundsAxis ~= nil and boundsAxis or EntityMirror.BoundsAxisForEntity(ent))
+    return EntityMirror.BoundsForAxis(mins, maxs, boundsAxis)
+end
+
+function EntityMirror.RevisionForEntity(ent)
+    if not IsValid(ent) or not ent.GetNWInt then return -1 end
+    return tonumber(ent:GetNWInt(NW_REVISION, -1)) or -1
+end
+
+function EntityMirror.BoundsRevisionForEntity(ent)
+    if not IsValid(ent) then return "invalid" end
+
+    local axis = EntityMirror.GetAxis and EntityMirror.GetAxis(ent) or M.ENTITY_MIRROR_NONE
+    local flags = EntityMirror.GetFlags and EntityMirror.GetFlags(ent) or M.ENTITY_MIRROR_DEFAULT_FLAGS
+
+    return table.concat({
+        tostring(axis),
+        tostring(flags),
+        tostring(EntityMirror.BoundsAxisForEntity(ent)),
+        tostring(EntityMirror.RevisionForEntity(ent))
+    }, "|")
 end
 
 local function convexBounds(convexes)
@@ -779,6 +999,10 @@ if SERVER then
 
     local function actualPhysicsAxis(ent)
         return validAxis(IsValid(ent) and ent._magicAlignEntityMirrorPhysicsAxis or M.ENTITY_MIRROR_NONE)
+    end
+
+    function EntityMirror.PhysicsAxisForEntity(ent)
+        return actualPhysicsAxis(ent)
     end
 
     local function setActualPhysicsAxis(ent, axis)
@@ -1272,6 +1496,22 @@ if CLIENT then
         end
 
         return validAxis(desiredVisualAxis), validAxis(desiredPhysicsAxis), axis, flags
+    end
+
+    function EntityMirror.PhysicsAxisForEntity(ent)
+        if not IsValid(ent) then return M.ENTITY_MIRROR_NONE end
+
+        local state = CLIENT_ENTITY_STATE[ent]
+        if state then
+            if state.ownsPhysics == true then
+                return validAxis(state.ownedPhysicsAxis)
+            end
+
+            return M.ENTITY_MIRROR_NONE
+        end
+
+        local _, desiredPhysicsAxis = desiredAxes(ent)
+        return validAxis(desiredPhysicsAxis)
     end
 
     local function truthy(value)

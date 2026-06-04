@@ -10,6 +10,8 @@ local toAngle = M.ToAngle
 local LocalToWorldPosPrecise = M.LocalToWorldPosPrecise
 local client = M.Client or {}
 M.Client = client
+local geometry = client.geometry or {}
+local renderPrimitives = client.RenderPrimitives or include("magic_align/client/render_primitives.lua")
 local colors = client.colors or {}
 local RENDER_CONFIG = {
     billboardScale = 0.035,
@@ -3874,64 +3876,9 @@ local function drawStripedTriangle(a, b, c, frontColor, stripePhase, viewerPos)
 end
 
 local function drawAxisArrow(startPos, endPos, color, viewerPos)
-    if not isvector(startPos) or not isvector(endPos) then return end
-
-    local axis = endPos - startPos
-    local length = axis:Length()
-    if length < 0.01 then return end
-
-    axis:Normalize()
-
-    local center = (startPos + endPos) * 0.5
-    viewerPos = isvector(viewerPos)
-        and viewerPos
-        or setVec(shapeMetricCache.renderPerf.fallbackViewerPos, IsValid(LocalPlayer()) and LocalPlayer():GetShootPos() or EyePos())
-    shapeMetricCache.renderPerf.fallbackViewerPos = viewerPos
-    local toViewer = viewerPos - center
-    local width = axis:Cross(toViewer)
-    if width:LengthSqr() < 1e-8 then
-        width = axis:Cross(math.abs(axis.z) < 0.99 and VectorP(0, 0, 1) or VectorP(0, 1, 0))
+    if renderPrimitives and isfunction(renderPrimitives.DrawAxisArrow) then
+        return renderPrimitives.DrawAxisArrow(startPos, endPos, color, viewerPos)
     end
-    if width:LengthSqr() < 1e-8 then return end
-    width:Normalize()
-
-    local normal = width:Cross(axis)
-    if normal:LengthSqr() > 1e-8 then
-        normal:Normalize()
-    else
-        normal = VectorP(0, 0, 1)
-    end
-
-    local push = normal * 0.08
-    local shaftHalf = math.Clamp(length * 0.006, 0.06, 0.22)
-    local headHalf = shaftHalf * 3.8
-    local headLength = math.Clamp(length * 0.16, shaftHalf * 4.2, length * 0.28)
-    local headBase = endPos - axis * headLength
-
-    local tailLeft = startPos - width * shaftHalf + push
-    local tailRight = startPos + width * shaftHalf + push
-    local baseLeft = headBase - width * shaftHalf + push
-    local baseRight = headBase + width * shaftHalf + push
-    local headLeft = headBase - width * headHalf + push
-    local headRight = headBase + width * headHalf + push
-    local tip = endPos + push
-    local fill = cappedAlpha(color, 225)
-    local outline = cachedColor(
-        math.min(color.r + 55, 255),
-        math.min(color.g + 55, 255),
-        math.min(color.b + 55, 255),
-        math.min((color.a or 255) + 26, 110)
-    )
-
-    drawFilledQuad(tailLeft, baseLeft, baseRight, tailRight, fill)
-    drawFilledTriangle(headLeft, tip, headRight, fill)
-
-    drawLine(tailLeft, baseLeft, outline, true)
-    drawLine(tailRight, baseRight, outline, true)
-    drawLine(headLeft, tip, outline, true)
-    drawLine(tip, headRight, outline, true)
-    drawLine(tailLeft, tailRight, outline, true)
-    drawLine(headLeft, headRight, outline, true)
 end
 
 local function drawFrame(pos, ang, size, alpha)
@@ -4713,8 +4660,8 @@ local function drawInteractionOverlay(tool, state)
     client.MirrorRender.drawReference(state, spriteSettings, viewerPos)
 
     if state.preview and state.preview.pos and state.preview.ang and #state.source > 0 then
-        local previewPointAxis = state.preview.transformMode == M.TRANSFORM_MODE_MIRROR
-            and (state.preview.entityMirrorPreviewAxis or state.preview.entityMirrorAxis)
+        local previewPointAxis = state.preview.entityMirrorPreviewAxis
+            or state.preview.entityMirrorAxis
             or M.ENTITY_MIRROR_NONE
         drawPointSet(
             nil,
@@ -4749,8 +4696,10 @@ local function drawInteractionOverlay(tool, state)
             for i = 1, #state.press.aggregatedProbes do
                 local probe = state.press.aggregatedProbes[i]
                 if isvector(probe.localPos) then
-                    local worldPos = LocalToWorldPosPrecise(probe.localPos, state.press.ent:GetPos(), state.press.ent:GetAngles())
-                    drawCircleSprite(worldPos, 0.22, colorAlpha(pathColor, 190), spriteSettings, viewerPos)
+                    local worldPos = geometry.worldPosFromLocalPoint(state.press.ent, probe.localPos)
+                    if isvector(worldPos) then
+                        drawCircleSprite(worldPos, 0.22, colorAlpha(pathColor, 190), spriteSettings, viewerPos)
+                    end
                 end
             end
         end

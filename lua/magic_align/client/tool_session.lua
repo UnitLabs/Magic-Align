@@ -46,6 +46,19 @@ colors.xy = Color(255, 210, 80, 150)
 colors.xz = Color(255, 130, 210, 150)
 colors.yz = Color(110, 240, 255, 150)
 
+local sessionStates = client.SessionStates or setmetatable({}, { __mode = "v" })
+client.SessionStates = sessionStates
+
+local function registerSessionState(state)
+    if not istable(state) then return end
+
+    local sessionId = tonumber(state.sessionId)
+    if not sessionId then return end
+
+    sessionStates[sessionId] = state
+    return state
+end
+
 local function ensureStateShape(state)
     state = state or M.NewSession()
 
@@ -64,7 +77,45 @@ local function ensureStateShape(state)
     state.attackDown = state.attackDown == true
     state.useDown = state.useDown == true
 
+    registerSessionState(state)
+
     return state
+end
+
+local function ensureRegisteredStateShape(state)
+    if istable(state) and state._magicAlignTransientState == true then
+        state.sessionId = tonumber(state.sessionId) or M.NextSessionId()
+        state.bounds = state.bounds or {}
+        state.linked = state.linked or {}
+        state.compatGhosts = state.compatGhosts or { linked = {} }
+        state.compatGhosts.linked = state.compatGhosts.linked or {}
+        state.linkedGhosts = state.linkedGhosts or {}
+
+        registerSessionState(state)
+        return state
+    end
+
+    return ensureStateShape(state)
+end
+
+local function stateBySessionId(sessionId)
+    sessionId = tonumber(sessionId)
+    if not sessionId then return end
+
+    local registered = sessionStates[sessionId]
+    if istable(registered) and tonumber(registered.sessionId) == sessionId then
+        return ensureRegisteredStateShape(registered)
+    end
+
+    if istable(M.ClientState) and tonumber(M.ClientState.sessionId) == sessionId then
+        return ensureRegisteredStateShape(M.ClientState)
+    end
+
+    local magicMirror = client.MagicMirror or (M.MagicMirror and M.MagicMirror.Client)
+    local mirrorState = magicMirror and magicMirror.ClientState or M.MagicMirrorClientState
+    if istable(mirrorState) and tonumber(mirrorState.sessionId) == sessionId then
+        return ensureRegisteredStateShape(mirrorState)
+    end
 end
 
 local function state()
@@ -125,11 +176,17 @@ local function clientNumber(tool, name, fallback)
     local value
 
     if tool and isfunction(tool.GetClientInfo) then
-        value = tonumber(tool:GetClientInfo(name))
+        local raw = tool:GetClientInfo(name)
+        if raw ~= nil then
+            value = tonumber(raw)
+        end
     end
 
     if value == nil and tool and isfunction(tool.GetClientNumber) then
-        value = tonumber(tool:GetClientNumber(name))
+        local raw = tool:GetClientNumber(name)
+        if raw ~= nil then
+            value = tonumber(raw)
+        end
     end
 
     if not M.IsFiniteNumber(value) then
@@ -466,6 +523,14 @@ local function primitiveRevision(ent)
     return table.concat(parts, "|")
 end
 
+local function mirrorBoundsRevision(ent)
+    if M.EntityMirror and M.EntityMirror.BoundsRevisionForEntity then
+        return M.EntityMirror.BoundsRevisionForEntity(ent)
+    end
+
+    return "nomirror"
+end
+
 local function boundsRevision(ent)
     if not IsValid(ent) then return "invalid" end
 
@@ -479,7 +544,8 @@ local function boundsRevision(ent)
         isvector(renderMins) and tostring(renderMins) or "nil",
         isvector(renderMaxs) and tostring(renderMaxs) or "nil",
         resizeRevision(ent),
-        primitiveRevision(ent)
+        primitiveRevision(ent),
+        mirrorBoundsRevision(ent)
     }, "|")
 end
 
@@ -493,6 +559,7 @@ local function resetBoundsEntry(entry)
     entry.maxs = nil
     entry.center = nil
     entry.requestRevision = nil
+    entry.mirrorRevision = nil
     entry.nextRevisionCheck = nil
 end
 
@@ -500,13 +567,15 @@ local function refreshBoundsEntry(ent, entry)
     if not IsValid(ent) or not istable(entry) then return end
 
     local revision = boundsRevision(ent)
-    if entry.revision == revision then
+    local mirrorRevision = mirrorBoundsRevision(ent)
+    if entry.revision == revision and entry.mirrorRevision == mirrorRevision then
         return revision
     end
 
     resetBoundsEntry(entry)
     entry.requestedAt = 0
     entry.revision = revision
+    entry.mirrorRevision = mirrorRevision
 
     return revision
 end
@@ -517,6 +586,10 @@ local function maybeRefreshBoundsEntry(ent, entry, force)
     if not istable(entry) then return end
 
     if entry.ready and not force then
+        if entry.mirrorRevision ~= mirrorBoundsRevision(ent) then
+            return refreshBoundsEntry(ent, entry)
+        end
+
         local now = RealTime()
         if now < (entry.nextRevisionCheck or 0) then
             return entry.revision
@@ -833,7 +906,9 @@ hook.Add("Think", "MagicAlignHideGhostsWhenInactive", function()
     if not istable(state) then return end
 
     local ply = LocalPlayer()
-    if IsValid(ply) and M.GetActiveMagicAlignTool(ply) then return end
+    local activeClassic = IsValid(ply)
+        and (M.GetActiveClassicMagicAlignTool and M.GetActiveClassicMagicAlignTool(ply) or nil)
+    if activeClassic then return end
 
     hideGhosts(state)
 end)
@@ -994,7 +1069,8 @@ local function playClientActionFeedback(action, trace)
     local ply = LocalPlayer()
     if not IsValid(ply) then return false end
 
-    local tool, weapon = M.GetActiveMagicAlignTool(ply)
+    local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
+    local tool, weapon = getter(ply)
     if not tool or not IsValid(weapon) then return false end
 
     local wouldAffect = clientActionWouldAffect(action, trace)
@@ -1031,13 +1107,21 @@ net.Receive(M.NET_CLIENT_ACTION, function()
     local action = net.ReadUInt(2)
     local trace = readClientActionTrace()
 
+    if action == M.CLIENT_ACTION_MAGIC_MIRROR_LEFTCLICK then
+        local mirrorClient = client.MagicMirror
+        if mirrorClient and isfunction(mirrorClient.handleClientAction) then
+            mirrorClient.handleClientAction(action, trace)
+        end
+        return
+    end
+
     playClientActionFeedback(action, trace)
 
-    if action == M.CLIENT_ACTION_LEFTCLICK then
+    if action == M.CLIENT_ACTION_LEFTCLICK and isfunction(core.queueClientLeftClick) then
         core.queueClientLeftClick()
-    elseif action == M.CLIENT_ACTION_RIGHTCLICK then
+    elseif action == M.CLIENT_ACTION_RIGHTCLICK and isfunction(performClientRightClick) then
         performClientRightClick(trace)
-    elseif action == M.CLIENT_ACTION_RESET then
+    elseif action == M.CLIENT_ACTION_RESET and isfunction(performClientReload) then
         performClientReload()
     end
 end)
@@ -1048,7 +1132,7 @@ net.Receive(M.NET_BOUNDS_REPLY, function()
     local hasBounds = net.ReadBool()
     local mins = hasBounds and net.ReadPreciseVector() or nil
     local maxs = hasBounds and net.ReadPreciseVector() or nil
-    local state = ensureStateShape(M.ClientState)
+    local state = stateBySessionId(sessionId)
 
     if not state or not IsValid(ent) or state.sessionId ~= sessionId then return end
 
@@ -1067,6 +1151,7 @@ net.Receive(M.NET_BOUNDS_REPLY, function()
 
     resetBoundsEntry(entry)
     entry.revision = revision
+    entry.mirrorRevision = mirrorBoundsRevision(ent)
 
     if isvector(mins) and isvector(maxs) then
         entry.size = maxs - mins
@@ -1129,7 +1214,8 @@ end
 
 local function activeTool()
     local ply = LocalPlayer()
-    local tool = IsValid(ply) and M.GetActiveMagicAlignTool(ply) or nil
+    local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
+    local tool = IsValid(ply) and getter(ply) or nil
     if not tool then return end
 
     return tool, state()
@@ -1214,7 +1300,8 @@ hook.Add("PlayerBindPress", "MagicAlignCycleReferenceSpace", function(ply, bind,
 
     if not isReferenceSpaceSelector and not wheelStep then return end
 
-    local tool = M.GetActiveMagicAlignTool(ply)
+    local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
+    local tool = getter(ply)
     if not tool then return end
 
     if isReferenceSpaceSelector then
@@ -1390,6 +1477,8 @@ end)
 
 core.colors = colors
 client.colors = colors
+core.registerSessionState = registerSessionState
+core.stateBySessionId = stateBySessionId
 core.ensureStateShape = ensureStateShape
 core.comp = comp
 core.copyVec = copyVec

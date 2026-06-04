@@ -4,9 +4,9 @@ local M = MAGIC_ALIGN
 local VectorP = M.VectorP
 local isvector = M.IsVectorLike
 local toVector = M.ToVector
-local LocalToWorldPosPrecise = M.LocalToWorldPosPrecise
 local client = M.Client or {}
 M.Client = client
+local geometry = client.geometry or {}
 
 local colors = client.colors or {}
 
@@ -399,10 +399,7 @@ local function faceLineWorldPoints(ent, face, grid, axisKey, value, outA, outB)
     if not a or not b then return end
     if not IsValid(ent) then return end
 
-    local pos = ent:GetPos()
-    local ang = ent:GetAngles()
-
-    return LocalToWorldPosPrecise(a, pos, ang), LocalToWorldPosPrecise(b, pos, ang)
+    return geometry.worldPosFromLocalPoint(ent, a), geometry.worldPosFromLocalPoint(ent, b)
 end
 
 local function drawSnapLineLabels2D(a, b, label, color)
@@ -529,16 +526,13 @@ function hoverRender.drawFaceOutline(state, candidate)
 
     local ent = candidate.ent
     local corners = face.corners
-    local entPos = ent:GetPos()
-    local entAng = ent:GetAngles()
 
     for i = 1, 4 do
-        drawLine(
-            LocalToWorldPosPrecise(corners[i], entPos, entAng),
-            LocalToWorldPosPrecise(corners[i % 4 + 1], entPos, entAng),
-            cachedColor(255, 255, 255, 70),
-            true
-        )
+        local a = geometry.worldPosFromLocalPoint(ent, corners[i])
+        local b = geometry.worldPosFromLocalPoint(ent, corners[i % 4 + 1])
+        if a and b then
+            drawLine(a, b, cachedColor(255, 255, 255, 70), true)
+        end
     end
 end
 

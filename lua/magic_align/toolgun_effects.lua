@@ -132,7 +132,7 @@ end
 local function weaponFor(tool, fallbackWeapon)
     if IsValid(fallbackWeapon) and fallbackWeapon:GetClass() == "gmod_tool" then return fallbackWeapon end
     if IsValid(tool) and tool:GetClass() == "gmod_tool" then return tool end
-    if not tool or tool.Mode ~= "magic_align" then return end
+    if not tool or not (M.IsMagicAlignToolMode and M.IsMagicAlignToolMode(tool.Mode)) then return end
 
     if isfunction(tool.GetWeapon) then
         local weapon = tool:GetWeapon()
@@ -148,7 +148,11 @@ local function activeMagicAlignToolForWeapon(weapon)
     local owner = weapon:GetOwner()
     if not IsValid(owner) or not M.GetActiveMagicAlignTool then return end
 
-    local tool, activeWeapon = M.GetActiveMagicAlignTool(owner)
+    local getter = M.GetActiveMagicAlignFamilyTool or M.GetActiveMagicAlignTool
+    local tool, activeWeapon
+    if getter then
+        tool, activeWeapon = getter(owner)
+    end
     return activeWeapon == weapon and tool or nil
 end
 
@@ -182,7 +186,7 @@ local function markerFor(kind)
         expires = now() + MARK_LIFETIME,
         kind = kind,
         sound = preset.sound,
-        hit = preset.hit ~= false,
+        hit = mirror or preset.hit ~= false,
         muzzleSpecial = preset.special == true,
         weaponAnim = preset.weaponAnim ~= false,
         color = markerColor(preset, mirror),
@@ -486,7 +490,11 @@ if CLIENT then
         if not IsValid(viewModel) or not IsValid(ply) or not IsValid(weapon) or weapon:GetClass() ~= "gmod_tool" then return end
         if not M.GetActiveMagicAlignTool then return end
 
-        local _, activeWeapon = M.GetActiveMagicAlignTool(ply)
+        local getter = M.GetActiveMagicAlignFamilyTool or M.GetActiveMagicAlignTool
+        local _, activeWeapon
+        if getter then
+            _, activeWeapon = getter(ply)
+        end
         if activeWeapon ~= weapon then return end
 
         local pos = attachmentPosition(viewModel, 1)

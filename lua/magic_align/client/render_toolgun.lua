@@ -4,7 +4,6 @@ local M = MAGIC_ALIGN
 local VectorP = M.VectorP
 local isvector = M.IsVectorLike
 local toVector = M.ToVector
-local LocalToWorldPosPrecise = M.LocalToWorldPosPrecise
 local client = M.Client or {}
 local FormulaManager = M.FormulaManager or include("magic_align/client/formula_manager.lua")
 local colors = client.colors or {}
@@ -273,6 +272,10 @@ local function ensureToolgunGlowMaterial()
 end
 
 local function toolgunLedSpace(tool)
+    if tool and tool.Mode == M.TOOL_MODE_MAGIC_MIRROR then
+        return M.MIRROR_SPACE
+    end
+
     local space = tool and tool.GetClientInfo and tool:GetClientInfo("space") or nil
     if not space or space == "" then
         space = M.ClientState and M.ClientState.activeSpace or "prop1"
@@ -447,7 +450,11 @@ hook.Add("Think", "MagicAlignToolgunLedAccent", function()
         return
     end
 
-    local tool, weapon = M.GetActiveMagicAlignTool(ply)
+    local getter = M.GetActiveMagicAlignFamilyTool or M.GetActiveMagicAlignTool
+    local tool, weapon
+    if getter then
+        tool, weapon = getter(ply)
+    end
     if not tool then
         clearToolgunLedOverride()
         return
@@ -580,7 +587,9 @@ local function activeAnchorWorldPos(tool, state, ent, points, side)
         return localPos
     end
 
-    return LocalToWorldPosPrecise(localPos, ent:GetPos(), ent:GetAngles())
+    if M.EntityMirror and M.EntityMirror.LocalPointToWorld then
+        return M.EntityMirror.LocalPointToWorld(ent, localPos)
+    end
 end
 
 local function commitUploadProgress()

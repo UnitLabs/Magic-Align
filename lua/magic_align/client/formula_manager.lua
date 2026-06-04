@@ -723,7 +723,8 @@ function Manager:Think()
     end
 
     local ply = LocalPlayer()
-    if not (IsValid(ply) and isfunction(M.GetActiveMagicAlignTool) and M.GetActiveMagicAlignTool(ply)) then
+    local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
+    if not (IsValid(ply) and isfunction(getter) and getter(ply)) then
         return
     end
 

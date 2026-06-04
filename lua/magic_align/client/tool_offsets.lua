@@ -14,8 +14,6 @@ local PICK_CONFIG = core.PICK_CONFIG
 local copyVec = core.copyVec
 local comp = core.comp
 local ZERO_VEC = core.ZERO_VEC
-local LocalToWorldPosPrecise = core.LocalToWorldPosPrecise
-local WorldToLocalPosPrecise = core.WorldToLocalPosPrecise
 local setVec = core.setVec
 local normalizedVec = core.normalizedVec
 local clientNumber = core.clientNumber
@@ -497,9 +495,11 @@ local function projectFacePointToProp(ent, face, localPos, worldNormal, fallback
     outward = normalizedVec(outward)
     if not outward then return fallbackLocalPos, fallbackWorldPos, fallbackNormal end
 
-    local entPos = ent:GetPos()
-    local entAng = ent:GetAngles()
-    local gridWorldPos = LocalToWorldPosPrecise(localPos, entPos, entAng)
+    local gridWorldPos = geometry.worldPosFromLocalPoint(ent, localPos)
+    if not isvector(gridWorldPos) then
+        return fallbackLocalPos, fallbackWorldPos, fallbackNormal
+    end
+
     local gridNormal = outward
     local backDist = PICK_CONFIG.faceTraceOutsideOffset
     local traceStart = gridWorldPos + gridNormal * backDist
@@ -511,12 +511,14 @@ local function projectFacePointToProp(ent, face, localPos, worldNormal, fallback
 
     local hitTrace = orthogonalTrace
     if not hitTrace and isvector(face.center) then
-        local centerWorldPos = LocalToWorldPosPrecise(face.center, entPos, entAng)
-        hitTrace = traceOnlyEntity(ent, traceStart, centerWorldPos)
+        local centerWorldPos = geometry.worldPosFromLocalPoint(ent, face.center)
+        if isvector(centerWorldPos) then
+            hitTrace = traceOnlyEntity(ent, traceStart, centerWorldPos)
+        end
     end
 
     if hitTrace and isvector(hitTrace.HitPos) then
-        return WorldToLocalPosPrecise(hitTrace.HitPos, entPos, entAng), copyVec(hitTrace.HitPos), copyVec(hitTrace.HitNormal)
+        return geometry.localPointFromWorldPos(ent, hitTrace.HitPos), copyVec(hitTrace.HitPos), copyVec(hitTrace.HitNormal)
     end
 
     return fallbackLocalPos, fallbackWorldPos, fallbackNormal
@@ -526,13 +528,8 @@ local function localAimRay(ent)
     local ply = LocalPlayer()
     local eye = IsValid(ply) and ply:GetShootPos() or nil
     local aim = IsValid(ply) and ply:GetAimVector() or nil
-    local entPos = ent:GetPos()
-    local entAng = ent:GetAngles()
-    local localEye = isvector(eye) and WorldToLocalPosPrecise(eye, entPos, entAng) or nil
-    local localAim = isvector(eye)
-        and isvector(aim)
-        and (WorldToLocalPosPrecise(eye + aim * 16384, entPos, entAng) - localEye)
-        or nil
+    local localEye = isvector(eye) and geometry.localPointFromWorldPos(ent, eye) or nil
+    local localAim = isvector(eye) and isvector(aim) and geometry.localNormalFromWorld(ent, eye, aim) or nil
 
     if isvector(localAim) and M.VectorLengthSqrPrecise(localAim) > M.PICKING_VECTOR_EPSILON_SQR then
         return localEye, normalizedVec(localAim)
@@ -542,7 +539,9 @@ local function localAimRay(ent)
 end
 
 local function fallbackFaceAxis(ent, tr, localHit)
-    local localNormal = WorldToLocalPosPrecise(tr.HitPos + tr.HitNormal, ent:GetPos(), ent:GetAngles()) - localHit
+    if not (isvector(localHit) and tr and isvector(tr.HitPos) and isvector(tr.HitNormal)) then return end
+
+    local localNormal = geometry.localNormalFromWorld(ent, tr.HitPos, tr.HitNormal)
     localNormal = normalizedVec(localNormal)
     if not localNormal then return end
 
@@ -772,9 +771,8 @@ end
 local function faceCandidate(ent, tr, settings, box)
     if tr.Entity ~= ent or not isvector(tr.HitPos) then return end
 
-    local entPos = ent:GetPos()
-    local entAng = ent:GetAngles()
-    local localHit = WorldToLocalPosPrecise(tr.HitPos, entPos, entAng)
+    local localHit = geometry.localPointFromWorldPos(ent, tr.HitPos)
+    if not isvector(localHit) then return end
     if not box then return end
 
     local mins, maxs = box.mins, box.maxs
@@ -795,6 +793,11 @@ local function faceCandidate(ent, tr, settings, box)
 
     face.gridA = plane.gridA
     face.gridB = plane.gridB
+    face.u, face.v = plane.u, plane.v
+    face.uMin, face.uMax = plane.uMin, plane.uMax
+    face.vMin, face.vMax = plane.vMin, plane.vMax
+    face.uAxis = axis == 1 and 2 or 1
+    face.vAxis = axis == 3 and 2 or 3
     face.uSnap, face.vSnap = snapped.u, snapped.v
     face.snapGridU = snapped.gridU
     face.snapGridV = snapped.gridV
@@ -807,8 +810,11 @@ local function faceCandidate(ent, tr, settings, box)
     face.center = center
     face.origin = faceOrigin
 
-    local worldNormal = LocalToWorldPosPrecise(axis == 1 and VectorP(sign, 0, 0) or axis == 2 and VectorP(0, sign, 0) or VectorP(0, 0, sign), ZERO_VEC, entAng)
-    local worldPos = LocalToWorldPosPrecise(localPos, entPos, entAng)
+    local localFaceNormal = axis == 1 and VectorP(sign, 0, 0) or axis == 2 and VectorP(0, sign, 0) or VectorP(0, 0, sign)
+    local worldNormal = geometry.worldNormalFromLocal(ent, ZERO_VEC, localFaceNormal)
+    local worldPos = geometry.worldPosFromLocalPoint(ent, localPos)
+    if not isvector(worldNormal) or not isvector(worldPos) then return end
+
     local normal = worldNormal
 
     if settings.alt then

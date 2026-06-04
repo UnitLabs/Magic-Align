@@ -732,7 +732,8 @@ hook.Add("EntityRemoved", "magic_align_reset_session_on_prop_remove", function(e
     if not state then return end
     if ent ~= state.prop1 and ent ~= state.prop2 then return end
 
-    local tool = IsValid(LocalPlayer()) and M.GetActiveMagicAlignTool(LocalPlayer()) or nil
+    local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
+    local tool = IsValid(LocalPlayer()) and getter(LocalPlayer()) or nil
     resetClientSession(tool)
 end)
 

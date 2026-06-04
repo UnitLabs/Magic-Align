@@ -5,6 +5,7 @@ if SERVER then
     AddCSLuaFile("magic_align/anchor.lua")
     AddCSLuaFile("magic_align/mirror.lua")
     AddCSLuaFile("magic_align/entity_mirror.lua")
+    AddCSLuaFile("magic_align/magic_mirror.lua")
     AddCSLuaFile("magic_align/compat/primitive_sh.lua")
     AddCSLuaFile("magic_align/compat/primitive_cl.lua")
     AddCSLuaFile("magic_align/client/profiler.lua")
@@ -39,6 +40,12 @@ M.NET_BOUNDS_REQUEST = "magic_align_bounds_request"
 M.NET_BOUNDS_REPLY = "magic_align_bounds_reply"
 M.NET_CLIENT_ACTION = "magic_align_client_action"
 M.NET_VIEW_ANGLES = "magic_align_view_angles"
+M.TOOL_MODE_MAGIC_ALIGN = "magic_align"
+M.TOOL_MODE_MAGIC_MIRROR = "magic_mirror"
+M.MAGIC_ALIGN_TOOL_MODES = M.MAGIC_ALIGN_TOOL_MODES or {
+    [M.TOOL_MODE_MAGIC_ALIGN] = true,
+    [M.TOOL_MODE_MAGIC_MIRROR] = true
+}
 M.AABB_REQUEST_COOLDOWN = 0.25
 M.MAX_POINTS = 3
 M.MAX_COMMIT_PROPS = 255
@@ -55,6 +62,7 @@ M.COMMIT_COPY_MOVE = 2
 M.CLIENT_ACTION_RIGHTCLICK = 0
 M.CLIENT_ACTION_RESET = 1
 M.CLIENT_ACTION_LEFTCLICK = 2
+M.CLIENT_ACTION_MAGIC_MIRROR_LEFTCLICK = 3
 M.COMMIT_RESULT_OK = 0
 M.COMMIT_RESULT_BUSY = 1
 M.COMMIT_RESULT_INVALID = 2
@@ -291,16 +299,40 @@ function M.IsProp(ent)
     return hasUsableModel(ent) and isStoredScriptedEntity(class)
 end
 
-function M.GetActiveMagicAlignTool(ply)
+local function activeToolByPredicate(ply, predicate)
     if not IsValid(ply) then return end
 
     local weapon = ply:GetActiveWeapon()
     if not IsValid(weapon) or weapon:GetClass() ~= "gmod_tool" then return end
 
     local tool = ply:GetTool()
-    if not tool or tool.Mode ~= "magic_align" then return end
+    if not tool or not predicate(tool.Mode, tool) then return end
 
     return tool, weapon
+end
+
+function M.IsMagicAlignToolMode(mode)
+    return M.MAGIC_ALIGN_TOOL_MODES[tostring(mode or "")] == true
+end
+
+function M.IsClassicMagicAlignToolMode(mode)
+    return tostring(mode or "") == M.TOOL_MODE_MAGIC_ALIGN
+end
+
+function M.GetActiveMagicAlignFamilyTool(ply)
+    return activeToolByPredicate(ply, function(mode)
+        return M.IsMagicAlignToolMode(mode)
+    end)
+end
+
+function M.GetActiveClassicMagicAlignTool(ply)
+    return activeToolByPredicate(ply, function(mode)
+        return M.IsClassicMagicAlignToolMode(mode)
+    end)
+end
+
+function M.GetActiveMagicAlignTool(ply)
+    return M.GetActiveMagicAlignFamilyTool(ply)
 end
 
 local function sanitizeBounds(mins, maxs)
@@ -643,28 +675,56 @@ local function pointCacheSetVecComponents(out, x, y, z)
     return out
 end
 
+local function pointEntityMirrorAxis(ent)
+    if not IsValid(ent) then return M.ENTITY_MIRROR_NONE or 0 end
+
+    if M.EntityMirror then
+        if M.EntityMirror.AxisForEntity then
+            return M.EntityMirror.AxisForEntity(ent)
+        elseif M.EntityMirror.GetAxis then
+            return M.EntityMirror.GetAxis(ent)
+        end
+    end
+
+    return M.ENTITY_MIRROR_NONE or 0
+end
+
+local function mirrorAxisSigns(axis)
+    if M.EntityMirror and M.EntityMirror.AxisSigns then
+        return M.EntityMirror.AxisSigns(axis)
+    end
+
+    return 1, 1, 1
+end
+
 local function pointCacheEntPose(entry, prefix, ent)
     if M.IsWorldTarget(ent) then
+        local mirrorAxis = M.ENTITY_MIRROR_NONE or 0
         local changed = entry[prefix .. "Ent"] ~= M.WORLD_TARGET
             or entry[prefix .. "Valid"] ~= true
             or entry[prefix .. "World"] ~= true
+            or entry[prefix .. "MirrorAxis"] ~= mirrorAxis
 
         entry[prefix .. "Ent"] = M.WORLD_TARGET
         entry[prefix .. "Valid"] = true
         entry[prefix .. "World"] = true
+        entry[prefix .. "MirrorAxis"] = mirrorAxis
         entry[prefix .. "PX"], entry[prefix .. "PY"], entry[prefix .. "PZ"] = 0, 0, 0
         entry[prefix .. "AP"], entry[prefix .. "AY"], entry[prefix .. "AR"] = 0, 0, 0
         return changed
     end
 
     if not IsValid(ent) then
+        local mirrorAxis = M.ENTITY_MIRROR_NONE or 0
         local changed = entry[prefix .. "Ent"] ~= ent
             or entry[prefix .. "Valid"] ~= false
             or entry[prefix .. "World"] ~= nil
+            or entry[prefix .. "MirrorAxis"] ~= mirrorAxis
 
         entry[prefix .. "Ent"] = ent
         entry[prefix .. "Valid"] = false
         entry[prefix .. "World"] = nil
+        entry[prefix .. "MirrorAxis"] = mirrorAxis
         entry[prefix .. "PX"], entry[prefix .. "PY"], entry[prefix .. "PZ"] = nil, nil, nil
         entry[prefix .. "AP"], entry[prefix .. "AY"], entry[prefix .. "AR"] = nil, nil, nil
         return changed
@@ -672,9 +732,11 @@ local function pointCacheEntPose(entry, prefix, ent)
 
     local pos = ent:GetPos()
     local ang = ent:GetAngles()
+    local mirrorAxis = pointEntityMirrorAxis(ent)
     local changed = entry[prefix .. "Ent"] ~= ent
         or entry[prefix .. "Valid"] ~= true
         or entry[prefix .. "World"] ~= nil
+        or entry[prefix .. "MirrorAxis"] ~= mirrorAxis
         or entry[prefix .. "PX"] ~= pos.x
         or entry[prefix .. "PY"] ~= pos.y
         or entry[prefix .. "PZ"] ~= pos.z
@@ -685,6 +747,7 @@ local function pointCacheEntPose(entry, prefix, ent)
     entry[prefix .. "Ent"] = ent
     entry[prefix .. "Valid"] = true
     entry[prefix .. "World"] = nil
+    entry[prefix .. "MirrorAxis"] = mirrorAxis
     entry[prefix .. "PX"], entry[prefix .. "PY"], entry[prefix .. "PZ"] = pos.x, pos.y, pos.z
     entry[prefix .. "AP"], entry[prefix .. "AY"], entry[prefix .. "AR"] = ang.p, ang.y, ang.r
     return changed
@@ -796,13 +859,19 @@ function M.ResolvePointWorldPositionInto(out, point, fallbackEnt)
 
     local ent = M.ResolvePointReference(point, fallbackEnt)
     if M.IsWorldTarget(ent) then
-        return pointCacheSetVec(out, point)
+        return pointCacheSetVec(out, point), ent, nil, nil, M.ENTITY_MIRROR_NONE or 0
     end
 
     if IsValid(ent) then
         local pos = ent:GetPos()
         local ang = ent:GetAngles()
         local x, y, z = point.x, point.y, point.z
+        local mirrorAxis = pointEntityMirrorAxis(ent)
+        if mirrorAxis ~= (M.ENTITY_MIRROR_NONE or 0) then
+            local sx, sy, sz = mirrorAxisSigns(mirrorAxis)
+            x, y, z = x * sx, y * sy, z * sz
+        end
+
         local pitch, yaw, roll = ang.p, ang.y, ang.r
         local sp, sy, sr = math.sin(pitch * math.pi / 180), math.sin(yaw * math.pi / 180), math.sin(roll * math.pi / 180)
         local cp, cy, cr = math.cos(pitch * math.pi / 180), math.cos(yaw * math.pi / 180), math.cos(roll * math.pi / 180)
@@ -812,7 +881,7 @@ function M.ResolvePointWorldPositionInto(out, point, fallbackEnt)
             pos.x + (cp * cy) * x + (sp * sr * cy - cr * sy) * y + (sp * cr * cy + sr * sy) * z,
             pos.y + (cp * sy) * x + (sp * sr * sy + cr * cy) * y + (sp * cr * sy - sr * cy) * z,
             pos.z + (-sp) * x + (sr * cp) * y + (cr * cp) * z
-        )
+        ), ent, pos, ang, mirrorAxis
     end
 end
 
@@ -884,14 +953,7 @@ end
 function M.ResolvePointWorldPosition(point, fallbackEnt)
     if not isvector(point) then return end
 
-    local ent = M.ResolvePointReference(point, fallbackEnt)
-    if M.IsWorldTarget(ent) then
-        return copyVec(point)
-    end
-
-    if IsValid(ent) then
-        return M.LocalToWorldPosPrecise(point, ent:GetPos(), ent:GetAngles())
-    end
+    return M.ResolvePointWorldPositionInto(nil, point, fallbackEnt)
 end
 
 function M.ResolvePointWorldNormalCached(cache, point, fallbackEnt, worldPos, options)
@@ -952,6 +1014,13 @@ function M.ResolvePointWorldNormal(point, fallbackEnt, worldPos)
 
     if not IsValid(ent) then return end
 
+    local worldNormal = M.EntityMirror and M.EntityMirror.LocalVectorToWorld
+        and M.EntityMirror.LocalVectorToWorld(ent, normal)
+        or nil
+    if isvector(worldNormal) then
+        return M.NormalizeVectorPrecise(worldNormal, M.COMPUTE_VECTOR_EPSILON_SQR)
+    end
+
     local basePos = ent:GetPos()
     local baseAng = ent:GetAngles()
     if not isvector(basePos) or not isangle(baseAng) then return end
@@ -972,7 +1041,9 @@ function M.ResolvePointPositionInReference(point, fallbackEnt, referenceEnt)
     end
 
     if IsValid(referenceEnt) then
-        return M.WorldToLocalPosPrecise(worldPos, referenceEnt:GetPos(), referenceEnt:GetAngles())
+        if M.EntityMirror and M.EntityMirror.WorldPointToLocal then
+            return M.EntityMirror.WorldPointToLocal(referenceEnt, worldPos)
+        end
     end
 end
 
@@ -988,6 +1059,13 @@ function M.ResolvePointNormalInReference(point, fallbackEnt, referenceEnt, world
     end
 
     if not IsValid(referenceEnt) then return end
+
+    local localNormal = M.EntityMirror and M.EntityMirror.WorldVectorToLocal
+        and M.EntityMirror.WorldVectorToLocal(referenceEnt, worldNormal)
+        or nil
+    if isvector(localNormal) then
+        return M.NormalizeVectorPrecise(localNormal, M.COMPUTE_VECTOR_EPSILON_SQR)
+    end
 
     local basePos = referenceEnt:GetPos()
     local baseAng = referenceEnt:GetAngles()
@@ -1040,6 +1118,7 @@ end
 
 include("magic_align/mirror.lua")
 include("magic_align/entity_mirror.lua")
+include("magic_align/magic_mirror.lua")
 
 local function normalized(v)
     return M.NormalizeVectorPrecise(v, M.COMPUTE_VECTOR_EPSILON_SQR)
@@ -1093,6 +1172,42 @@ local function pointContext(points, anchorOptions)
     }
 end
 
+local function transformPointSetForEntity(ent, points, scratch)
+    points = istable(points) and points or {}
+
+    local axis = pointEntityMirrorAxis(ent)
+    if axis == (M.ENTITY_MIRROR_NONE or 0)
+        or not (M.EntityMirror and M.EntityMirror.ApplyAxisToVector) then
+        return points, axis
+    end
+
+    scratch = istable(scratch) and scratch or {}
+    local sx, sy, sz = mirrorAxisSigns(axis)
+    for i = 1, #points do
+        local point = points[i]
+        local out = scratch[i]
+        if isvector(point) then
+            out = isvector(out) and out or VectorP(0, 0, 0)
+            out.x, out.y, out.z = point.x * sx, point.y * sy, point.z * sz
+            if isvector(point.normal) then
+                local normal = isvector(out.normal) and out.normal or VectorP(0, 0, 0)
+                normal.x, normal.y, normal.z = point.normal.x * sx, point.normal.y * sy, point.normal.z * sz
+                out.normal = normal
+            elseif out then
+                out.normal = nil
+            end
+        else
+            out = nil
+        end
+        scratch[i] = out
+    end
+    for i = #points + 1, #scratch do
+        scratch[i] = nil
+    end
+
+    return scratch, axis
+end
+
 local function rotateToAxis(ang, localAxis, targetAxis)
     if not localAxis or not targetAxis then return ang end
 
@@ -1137,8 +1252,11 @@ end
 
 function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourcePriority, targetSelected, targetPriority, sourceAnchorOptions, targetAnchorOptions, options)
     options = istable(options) and options or {}
+    sourcePoints = istable(sourcePoints) and sourcePoints or {}
+    targetPoints = istable(targetPoints) and targetPoints or {}
 
-    local sourceCount = #sourcePoints
+    local sourceSolvePoints, sourceMirrorAxis = transformPointSetForEntity(prop1, sourcePoints, options.sourceMirrorScratch)
+    local sourceCount = #sourceSolvePoints
     local targetIsWorld = M.IsWorldTarget(prop2)
     local hasTarget = (targetIsWorld or IsValid(prop2)) and #targetPoints > 0
     local resolvedTargetPoints = hasTarget and M.ResolvePointSetWorld(targetPoints, prop2, {
@@ -1155,13 +1273,13 @@ function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourc
 
     local anchorCache = options.anchorCache
     local sourceAnchorId, sourceAnchorLocal
-    if anchorCache then
-        sourceAnchorId, sourceAnchorLocal = M.ResolveAnchorCached(anchorCache, sourcePoints, sourceSelected, sourcePriority, sourceAnchorOptions, {
+    if anchorCache and sourceSolvePoints == sourcePoints then
+        sourceAnchorId, sourceAnchorLocal = M.ResolveAnchorCached(anchorCache, sourceSolvePoints, sourceSelected, sourcePriority, sourceAnchorOptions, {
             revision = options.sourceAnchorRevision,
             copy = true
         })
     else
-        sourceAnchorId, sourceAnchorLocal = M.ResolveAnchor(sourcePoints, sourceSelected, sourcePriority, sourceAnchorOptions)
+        sourceAnchorId, sourceAnchorLocal = M.ResolveAnchor(sourceSolvePoints, sourceSelected, sourcePriority, sourceAnchorOptions)
     end
     if not isvector(sourceAnchorLocal) then return end
 
@@ -1178,7 +1296,7 @@ function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourc
         if not isvector(targetAnchorLocal) then return end
     end
 
-    local sourceContext = pointContext(sourcePoints, sourceAnchorOptions) or { pos = sourceAnchorLocal, anchorId = sourceAnchorId }
+    local sourceContext = pointContext(sourceSolvePoints, sourceAnchorOptions) or { pos = sourceAnchorLocal, anchorId = sourceAnchorId }
     local targetContext = hasTarget and (pointContext(resolvedTargetPoints, targetAnchorOptions) or { pos = targetAnchorLocal, anchorId = targetAnchorId }) or nil
     local targetSinglePointContext = hasTarget and #resolvedTargetPoints == 1 and singlePointNormalContext(resolvedTargetPoints) or nil
     local targetBasePos = hasTarget and VectorP(0, 0, 0) or nil
@@ -1262,7 +1380,8 @@ function M.Solve(prop1, sourcePoints, prop2, targetPoints, sourceSelected, sourc
         targetContextWorld = targetContext,
         sourceCount = sourceCount,
         targetCount = hasTarget and #resolvedTargetPoints or #targetPoints,
-        hasTarget = hasTarget
+        hasTarget = hasTarget,
+        sourceMirrorAxis = sourceMirrorAxis
     }
 end
 

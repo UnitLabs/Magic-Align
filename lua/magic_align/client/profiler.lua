@@ -427,9 +427,10 @@ function Profiler:ToolCandidates()
     local candidates = {}
     local seen = {}
 
-    if isfunction(LocalPlayer) and isfunction(M.GetActiveMagicAlignTool) then
+    local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
+    if isfunction(LocalPlayer) and isfunction(getter) then
         local ply = LocalPlayer()
-        local tool = IsValid(ply) and M.GetActiveMagicAlignTool(ply) or nil
+        local tool = IsValid(ply) and getter(ply) or nil
         self:AddToolCandidate(candidates, seen, tool)
     end
 
