@@ -398,7 +398,7 @@ local function applyGhostScale(ghost, src, mirrorAxis)
         matrixScale.y = scale and scale.y or 1
         matrixScale.z = scale and scale.z or 1
 
-        if hasMirrorScale and M.EntityMirror and M.EntityMirror.ScaleForAxis then
+        if hasMirrorScale then
             local mirrorScale = M.EntityMirror.ScaleForAxis(mirrorAxis, ghost._magicAlignMirrorScale)
             ghost._magicAlignMirrorScale = mirrorScale
             matrixScale.x = matrixScale.x * mirrorScale.x
@@ -495,7 +495,7 @@ local function resizeRevision(ent)
 end
 
 local function primitiveRevision(ent)
-    if not (M.IsPrimitive and M.IsPrimitive(ent)) then return "notprimitive" end
+    if not M.IsPrimitive(ent) then return "notprimitive" end
 
     local parts = { ent:GetClass() }
 
@@ -524,11 +524,7 @@ local function primitiveRevision(ent)
 end
 
 local function mirrorBoundsRevision(ent)
-    if M.EntityMirror and M.EntityMirror.BoundsRevisionForEntity then
-        return M.EntityMirror.BoundsRevisionForEntity(ent)
-    end
-
-    return "nomirror"
+    return M.EntityMirror.BoundsRevisionForEntity(ent)
 end
 
 local function boundsRevision(ent)
@@ -746,7 +742,7 @@ local function updateToolHelp(tool, state)
         and isfunction(worldPoints.hasToggleHint)
         and worldPoints.hasToggleHint(state)
         or false
-    local showMirrorHint = tool.GetClientInfo and M.IsMirrorMode and M.IsMirrorMode(tool:GetClientInfo("space"))
+    local showMirrorHint = tool.GetClientInfo and M.IsMirrorMode(tool:GetClientInfo("space"))
 
     if lastToolDescription ~= description then
         language.Add("tool.magic_align.desc", description)
@@ -871,9 +867,7 @@ local function applyGhostAppearance(ghost, src, pos, ang, alphaFn, mirrorAxis)
     if applyGhostScale(ghost, src, mirrorAxis) then
         needsBoneSetup = true
     end
-    if M.EntityMirror and M.EntityMirror.ApplyVisualCullPreview then
-        M.EntityMirror.ApplyVisualCullPreview(ghost, mirrorAxis or M.ENTITY_MIRROR_NONE)
-    end
+    M.EntityMirror.ApplyVisualCullPreview(ghost, mirrorAxis or M.ENTITY_MIRROR_NONE)
 
     if needsBoneSetup then
         ghost:SetupBones()
@@ -907,7 +901,7 @@ hook.Add("Think", "MagicAlignHideGhostsWhenInactive", function()
 
     local ply = LocalPlayer()
     local activeClassic = IsValid(ply)
-        and (M.GetActiveClassicMagicAlignTool and M.GetActiveClassicMagicAlignTool(ply) or nil)
+        and M.GetActiveClassicMagicAlignTool(ply)
     if activeClassic then return end
 
     hideGhosts(state)
@@ -1269,7 +1263,7 @@ end
 
 local function referenceSpaceSelectorDown()
     if referenceSpaceSelectorHeld then return true end
-    return input and input.IsKeyDown and KEY_TAB and input.IsKeyDown(KEY_TAB) or false
+    return input.IsKeyDown(KEY_TAB)
 end
 
 local function wheelReferenceSpaceStep(bindName)
@@ -1331,9 +1325,7 @@ net.Receive(M.NET_COMMIT_RESULT, function()
     local accepted = net.ReadBool()
     local reason = net.ReadUInt(4)
 
-    if M.EntityMirror and M.EntityMirror.ResolveVisualPrediction then
-        M.EntityMirror.ResolveVisualPrediction(commitId, accepted)
-    end
+    M.EntityMirror.ResolveVisualPrediction(commitId, accepted)
 
     local upload = M.CommitUpload
     if istable(upload) and upload.id == commitId then
@@ -1412,7 +1404,6 @@ end
 
 local function applyUndoSessionSnapshot(snapshot)
     if not restoreSessionOnUndoEnabled() then return false end
-    if not M.RestoreSessionSnapshot then return false end
 
     local tool = select(1, activeTool())
     local currentSpace = tool and client.activeSpaceForTool(tool) or client.activeSpace()
@@ -1463,7 +1454,7 @@ net.Receive(M.NET_UNDO_RESTORE, function()
         end
     end
 
-    local snapshot = M.ReadSessionSnapshot and M.ReadSessionSnapshot() or nil
+    local snapshot = M.ReadSessionSnapshot()
     if snapshot then
         applyUndoSessionSnapshot(snapshot)
         return

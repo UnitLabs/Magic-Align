@@ -110,33 +110,6 @@ local ROTATION_CONFIG = {
     deltaSectorAlpha = 76,
     deltaSectorEdgeAlpha = 170
 }
-client.activeTool = client.activeTool or function()
-    return nil
-end
-client.validateState = client.validateState or function()
-    return true
-end
-client.gizmo = client.gizmo or function()
-    return nil
-end
-client.rotationSnapDivisions = client.rotationSnapDivisions or function()
-    return 24
-end
-client.rotationSnapStep = client.rotationSnapStep or function(tool)
-    return 360 / math.max(client.rotationSnapDivisions(tool), 1)
-end
-client.translationSnapStep = client.translationSnapStep or function()
-    return 0
-end
-client.rotationSnapMaxVisibleTicks = client.rotationSnapMaxVisibleTicks or 20
-client.isMajorRotationTick = client.isMajorRotationTick or function()
-    return false
-end
-client.sampleWorldPos = client.sampleWorldPos or function(_, sample)
-    return sample and sample.pos or nil
-end
-client.ringQualityPresets = client.ringQualityPresets or {}
-client.defaultRingQualityIndex = client.defaultRingQualityIndex or 2
 local circlePointCache = {}
 local unitCircle
 local stripePatternTexture
@@ -175,16 +148,12 @@ local reusableRotationRings = {
 local ensureStripePatternMaterial
 
 local function setStripePatternCopyBlend(enabled)
-    if render.OverrideAlphaWriteEnable then
-        render.OverrideAlphaWriteEnable(enabled, true)
-    end
+    render.OverrideAlphaWriteEnable(enabled, true)
 
-    if render.OverrideBlend and BLEND_ONE and BLEND_ZERO and BLENDFUNC_ADD then
-        if enabled then
-            render.OverrideBlend(true, BLEND_ONE, BLEND_ZERO, BLENDFUNC_ADD, BLEND_ONE, BLEND_ZERO, BLENDFUNC_ADD)
-        else
-            render.OverrideBlend(false)
-        end
+    if enabled then
+        render.OverrideBlend(true, BLEND_ONE, BLEND_ZERO, BLENDFUNC_ADD, BLEND_ONE, BLEND_ZERO, BLENDFUNC_ADD)
+    else
+        render.OverrideBlend(false)
     end
 end
 
@@ -309,7 +278,7 @@ end
 
 local function newRenderVector(x, y, z)
     x, y, z = numberOrZero(x), numberOrZero(y), numberOrZero(z)
-    return Vector and Vector(x, y, z) or VectorP(x, y, z)
+    return Vector(x, y, z)
 end
 
 local reusableBillboardToViewer = newRenderVector(0, 0, 1)
@@ -622,7 +591,7 @@ end
 
 local function ensureShapeWhiteMaterial()
     if not shapeWhiteMaterial then
-    shapeWhiteMaterial = CreateMaterial(SHAPE_CONFIG.cacheName .. "_white_mat", "UnlitGeneric", {
+        shapeWhiteMaterial = CreateMaterial(SHAPE_CONFIG.cacheName .. "_white_mat", "UnlitGeneric", {
             ["$basetexture"] = "vgui/white",
             ["$translucent"] = "1",
             ["$additive"] = "1",
@@ -674,9 +643,9 @@ local function rebuildShapeCacheEntry(entry)
             local bandThickness = math.max(outerRadius - innerRadius, 1)
             local edgeThickness = math.min(math.max(math.floor(metrics.rtSize / 512 + 0.5), 1), bandThickness * 0.5)
 
-        drawRing2DByRadiiAt(center, center, outerRadius, innerRadius, Color(255, 255, 255, ROTATION_CONFIG.ringFillAlpha), points)
-        drawRing2DByRadiiAt(center, center, outerRadius, math.max(innerRadius, outerRadius - edgeThickness), Color(255, 255, 255, ROTATION_CONFIG.ringEdgeAlpha), points)
-        drawRing2DByRadiiAt(center, center, math.min(outerRadius, innerRadius + edgeThickness), innerRadius, Color(255, 255, 255, ROTATION_CONFIG.ringEdgeAlpha), points)
+            drawRing2DByRadiiAt(center, center, outerRadius, innerRadius, Color(255, 255, 255, ROTATION_CONFIG.ringFillAlpha), points)
+            drawRing2DByRadiiAt(center, center, outerRadius, math.max(innerRadius, outerRadius - edgeThickness), Color(255, 255, 255, ROTATION_CONFIG.ringEdgeAlpha), points)
+            drawRing2DByRadiiAt(center, center, math.min(outerRadius, innerRadius + edgeThickness), innerRadius, Color(255, 255, 255, ROTATION_CONFIG.ringEdgeAlpha), points)
         end
     cam.End2D()
     render.PopRenderTarget()
@@ -726,7 +695,7 @@ local function ensureCachedShape(shapeKind, rtSize, innerRatio, segments)
     local entry = shapeCache[cacheKey]
     if not entry then
         local texture = GetRenderTargetEx(
-        SHAPE_CONFIG.cacheName .. "_" .. cacheKey .. "_rt",
+            SHAPE_CONFIG.cacheName .. "_" .. cacheKey .. "_rt",
             rtSize,
             rtSize,
             RT_SIZE_NO_CHANGE,
@@ -735,7 +704,7 @@ local function ensureCachedShape(shapeKind, rtSize, innerRatio, segments)
             0,
             IMAGE_FORMAT_RGBA8888
         )
-    local material = CreateMaterial(SHAPE_CONFIG.cacheName .. "_" .. cacheKey .. "_mat", "UnlitGeneric", {
+        local material = CreateMaterial(SHAPE_CONFIG.cacheName .. "_" .. cacheKey .. "_mat", "UnlitGeneric", {
             ["$basetexture"] = texture:GetName(),
             ["$translucent"] = "1",
             ["$additive"] = "1",
@@ -934,27 +903,21 @@ function client.worldGridRender.worldGridRtDimensions(step, lineMode)
 end
 
 function client.worldGridRender.pushWorldGridTextureFilter()
-    if not TEXFILTER or TEXFILTER.POINT == nil then return false, false end
-
     local pushedMin = false
     local pushedMag = false
-    if isfunction(render.PushFilterMin) then
-        render.PushFilterMin(TEXFILTER.POINT)
-        pushedMin = true
-    end
-    if isfunction(render.PushFilterMag) then
-        render.PushFilterMag(TEXFILTER.POINT)
-        pushedMag = true
-    end
+    render.PushFilterMin(TEXFILTER.POINT)
+    pushedMin = true
+    render.PushFilterMag(TEXFILTER.POINT)
+    pushedMag = true
 
     return pushedMin, pushedMag
 end
 
 function client.worldGridRender.popWorldGridTextureFilter(pushedMin, pushedMag)
-    if pushedMag and isfunction(render.PopFilterMag) then
+    if pushedMag then
         render.PopFilterMag()
     end
-    if pushedMin and isfunction(render.PopFilterMin) then
+    if pushedMin then
         render.PopFilterMin()
     end
 end
@@ -1206,18 +1169,11 @@ end
 function client.worldGridRender.rebuildWorldGridRtEntry(entry)
     if not entry or not entry.texture then return end
 
-    local overrideDepthAlpha = isfunction(render.SetWriteDepthToDestAlpha)
-    if overrideDepthAlpha then
-        render.SetWriteDepthToDestAlpha(false)
-    end
+    render.SetWriteDepthToDestAlpha(false)
 
     render.PushRenderTarget(entry.texture)
-    if render.OverrideAlphaWriteEnable then
-        render.OverrideAlphaWriteEnable(true, true)
-    end
-    if render.ClearDepth then
-        render.ClearDepth()
-    end
+    render.OverrideAlphaWriteEnable(true, true)
+    render.ClearDepth()
     render.Clear(0, 0, 0, 0)
     cam.Start2D()
         draw.NoTexture()
@@ -1225,14 +1181,10 @@ function client.worldGridRender.rebuildWorldGridRtEntry(entry)
         client.worldGridRender.drawWorldGridRtLines(entry.rtWidth or entry.rtSize, entry.rtHeight or entry.rtSize, entry.lineMode, entry.thin)
         setStripePatternCopyBlend(false)
     cam.End2D()
-    if render.OverrideAlphaWriteEnable then
-        render.OverrideAlphaWriteEnable(false)
-    end
+    render.OverrideAlphaWriteEnable(false)
     render.PopRenderTarget()
 
-    if overrideDepthAlpha then
-        render.SetWriteDepthToDestAlpha(true)
-    end
+    render.SetWriteDepthToDestAlpha(true)
 
     entry.ready = true
 end
@@ -1593,8 +1545,6 @@ function client.worldGridRender.writeWorldGridBatchVertex(vertices, index, posit
 end
 
 function client.worldGridRender.createWorldGridMesh()
-    if not isfunction(Mesh) then return end
-
     local ok, meshObject = pcall(Mesh)
     if ok then
         return meshObject
@@ -1740,14 +1690,11 @@ end
 local queueConfig = client.worldGridRender.queueConfig
 
 local function worldGridQueueNow()
-    if SysTime and isfunction(SysTime) then
-        return SysTime()
-    end
-    return RealTime()
+    return SysTime()
 end
 
 local function worldGridFrameBudgetMs()
-    local frameSeconds = FrameTime and isfunction(FrameTime) and FrameTime() or nil
+    local frameSeconds = FrameTime()
     local frameMs = tonumber(frameSeconds) and frameSeconds * 1000 or queueConfig.fallbackFrameMs
     if frameMs <= 0 then
         frameMs = queueConfig.fallbackFrameMs
@@ -2168,7 +2115,7 @@ function client.worldGridRender.requestWorldBspGlobalGrid(face)
     if not (face and face.worldBSP and face.globalGrid and face.surface) then return end
 
     local key = worldGridRequestKey(face)
-    local frame = isfunction(FrameNumber) and FrameNumber() or nil
+    local frame = FrameNumber()
     if frame ~= nil
         and face._magicAlignWorldGridRequestFrame == frame
         and face._magicAlignWorldGridRequestKey == key then
@@ -2338,7 +2285,7 @@ function client.prepareWorldBspRenderCandidate(candidate)
     local face = candidate and candidate.face
     if not (face and face.worldBSP) then return end
 
-    local frame = isfunction(FrameNumber) and FrameNumber() or nil
+    local frame = FrameNumber()
     local token = face.surface
     if frame ~= nil
         and candidate._magicAlignPreparedFrame == frame
@@ -2604,15 +2551,10 @@ function client.worldGridRender.debugWorldBspGlobalGrid()
     groupGapSummary(job, face)
 end
 
-if concommand and isfunction(concommand.Add) then
-    if isfunction(concommand.Remove) then
-        concommand.Remove("magic_align_world_bsp_debug_grid")
-    end
-
-    concommand.Add("magic_align_world_bsp_debug_grid", function()
-        client.worldGridRender.debugWorldBspGlobalGrid()
-    end)
-end
+concommand.Remove("magic_align_world_bsp_debug_grid")
+concommand.Add("magic_align_world_bsp_debug_grid", function()
+    client.worldGridRender.debugWorldBspGlobalGrid()
+end)
 end)()
 
 local function queueShapeCacheWarmup(tool, qualityIndex)
@@ -2758,19 +2700,7 @@ local function scaledOccludedPreviewColor(tool, holoAlpha, stripeColorOverride)
 end
 
 local function stencilAvailable()
-    return isfunction(render.ClearStencil)
-        and isfunction(render.SetStencilEnable)
-        and isfunction(render.SetStencilWriteMask)
-        and isfunction(render.SetStencilTestMask)
-        and isfunction(render.SetStencilReferenceValue)
-        and isfunction(render.SetStencilCompareFunction)
-        and isfunction(render.SetStencilPassOperation)
-        and isfunction(render.SetStencilFailOperation)
-        and isfunction(render.SetStencilZFailOperation)
-        and STENCILCOMPARISONFUNCTION_ALWAYS ~= nil
-        and STENCILCOMPARISONFUNCTION_EQUAL ~= nil
-        and STENCILOPERATION_KEEP ~= nil
-        and STENCILOPERATION_REPLACE ~= nil
+    return true
 end
 
 local function stripeDistanceScale(distance)
@@ -2915,15 +2845,11 @@ local function drawPreviewOccludedGhost(tool, ghost, baseAlpha, stripeColorOverr
     render.SetStencilPassOperation(STENCILOPERATION_KEEP)
     render.SetStencilZFailOperation(STENCILOPERATION_REPLACE)
 
-    if render.OverrideColorWriteEnable then
-        render.OverrideColorWriteEnable(true, false)
-    end
+    render.OverrideColorWriteEnable(true, false)
     render.SetBlend(0)
     ghost:DrawModel()
     render.SetBlend(1)
-    if render.OverrideColorWriteEnable then
-        render.OverrideColorWriteEnable(false, true)
-    end
+    render.OverrideColorWriteEnable(false, true)
 
     render.SetStencilCompareFunction(STENCILCOMPARISONFUNCTION_EQUAL)
     render.SetStencilFailOperation(STENCILOPERATION_KEEP)
@@ -3126,9 +3052,7 @@ local function drawPlaneSquare(worldPos, axisA, axisB, halfSize, color, outline,
     end
 
     render.SetColorMaterial()
-    if render.DrawQuad then
-        drawQuad(p1, p2, p3, p4, colorAlpha(color, color.a or 160))
-    end
+    drawQuad(p1, p2, p3, p4, colorAlpha(color, color.a or 160))
     drawLine(p1, p2, edge, true)
     drawLine(p2, p3, edge, true)
     drawLine(p3, p4, edge, true)
@@ -3323,15 +3247,11 @@ local function drawRotationDeltaSector(origin, a, b, radius, padding, startAngle
             render.SetStencilPassOperation(STENCILOPERATION_REPLACE)
             render.SetStencilZFailOperation(STENCILOPERATION_REPLACE)
 
-            if render.OverrideColorWriteEnable then
-                render.OverrideColorWriteEnable(true, false)
-            end
+            render.OverrideColorWriteEnable(true, false)
             render.SetBlend(0)
             drawRotationSectorMask(origin, axisA, axisB, discRadius, startAngle, delta, segments)
             render.SetBlend(1)
-            if render.OverrideColorWriteEnable then
-                render.OverrideColorWriteEnable(false, true)
-            end
+            render.OverrideColorWriteEnable(false, true)
 
             render.SetStencilCompareFunction(STENCILCOMPARISONFUNCTION_EQUAL)
             render.SetStencilFailOperation(STENCILOPERATION_KEEP)
@@ -4015,7 +3935,7 @@ local function drawPointSet(ent, points, color, posOverride, angOverride, stripe
     local basePos, baseAng
     if isvector(posOverride) and isangle(angOverride) then
         basePos, baseAng = posOverride, angOverride
-    elseif M.IsWorldTarget and M.IsWorldTarget(ent) then
+    elseif M.IsWorldTarget(ent) then
         basePos, baseAng = ZERO_VEC, ZERO_ANG
     elseif IsValid(ent) then
         basePos, baseAng = ent:GetPos(), ent:GetAngles()
@@ -4026,9 +3946,9 @@ local function drawPointSet(ent, points, color, posOverride, angOverride, stripe
     local localPoints = renderLocalPoints(points, localMirrorAxis)
     local worldPoints = reusablePointWorldPositions
     for i = 1, #localPoints do
-        local resolved = M.ResolvePointWorldPositionCached and pointCache
+        local resolved = pointCache
             and M.ResolvePointWorldPositionCached(pointCache, localPoints[i], ent)
-            or (M.ResolvePointWorldPosition and M.ResolvePointWorldPosition(localPoints[i], ent) or nil)
+            or M.ResolvePointWorldPosition(localPoints[i], ent)
         if isvector(resolved) then
             worldPoints[i] = setVec(worldPoints[i], resolved)
         else
@@ -4087,9 +4007,9 @@ end
 function pointWorldPosition(point, ent, basePos, baseAng, pointCache)
     if not isvector(point) then return end
 
-    local world = M.ResolvePointWorldPositionCached and pointCache
+    local world = pointCache
         and M.ResolvePointWorldPositionCached(pointCache, point, ent)
-        or (M.ResolvePointWorldPosition and M.ResolvePointWorldPosition(point, ent) or nil)
+        or M.ResolvePointWorldPosition(point, ent)
     if not world and isvector(basePos) and isangle(baseAng) then
         world = LocalToWorldPosPrecise(point, basePos, baseAng)
     end
@@ -4128,20 +4048,18 @@ end
 
 local function drawPoints(ent, points, color, anchorId, anchorConfig, labelPrefix, pointCache)
     local basePos, baseAng
-    if M.IsWorldTarget and M.IsWorldTarget(ent) then
+    if M.IsWorldTarget(ent) then
         basePos, baseAng = ZERO_VEC, ZERO_ANG
     elseif IsValid(ent) then
         basePos, baseAng = ent:GetPos(), ent:GetAngles()
-    elseif M.ResolvePointWorldPosition then
-        basePos, baseAng = ZERO_VEC, ZERO_ANG
     else
-        return
+        basePos, baseAng = ZERO_VEC, ZERO_ANG
     end
 
     for i = 1, #points do
-        local world = M.ResolvePointWorldPositionCached and pointCache
+        local world = pointCache
             and M.ResolvePointWorldPositionCached(pointCache, points[i], ent)
-            or (M.ResolvePointWorldPosition and M.ResolvePointWorldPosition(points[i], ent) or nil)
+            or M.ResolvePointWorldPosition(points[i], ent)
         if not world and isvector(basePos) and isangle(baseAng) then
             world = LocalToWorldPosPrecise(points[i], basePos, baseAng)
         end
@@ -4325,17 +4243,15 @@ function client.MirrorRender.drawAxis(reference, viewerPos, color)
 end
 
 function client.MirrorRender.state(state)
-    if not (state and M.IsMirrorMode and M.IsMirrorMode(state)) then return end
+    if not (state and M.IsMirrorMode(state)) then return end
 
     if client.Mirror and client.Mirror.resolve then
         return client.Mirror.resolve(state)
     end
 
-    return M.ResolveMirrorState
-        and M.ResolveMirrorState(state.mirror, M.GetMirrorStateCache and M.GetMirrorStateCache(state) or nil, {
-            activeSpace = state.activeSpace
-        })
-        or nil
+    return M.ResolveMirrorState(state.mirror, M.GetMirrorStateCache(state), {
+        activeSpace = state.activeSpace
+    })
 end
 
 function client.MirrorRender.drawPointLabels(state, color)
@@ -4416,7 +4332,6 @@ local function reusableHoverGizmoForRender(state)
     if press and press.kind == "gizmo" then return end
 
     if state._magicAlignPreviewChangedFrame ~= nil
-        and isfunction(FrameNumber)
         and state._magicAlignPreviewChangedFrame == FrameNumber() then
         return
     end
@@ -4608,7 +4523,7 @@ local function drawOverlayWireMarkers(state)
 
     local targetReferenceMarkers = {}
     for i = 1, #(state.target or {}) do
-        local ref = M.ResolvePointReference and M.ResolvePointReference(state.target[i], state.prop2) or nil
+        local ref = M.ResolvePointReference(state.target[i], state.prop2)
         if IsValid(ref)
             and ref ~= state.prop1
             and ref ~= state.prop2
@@ -4639,7 +4554,7 @@ local function drawInteractionOverlay(tool, state)
     drawOverlayWireMarkers(state)
 
     local hoverCandidate = state.hover and (state.hover.candidate or state.hover.overlay)
-    local mirrorActive = M.IsMirrorMode and M.IsMirrorMode(state)
+    local mirrorActive = M.IsMirrorMode(state)
     local sourceAnchorOptions = anchorOptions(tool, "from")
     local targetAnchorOptions = not mirrorActive and anchorOptions(tool, "to") or nil
     local spriteSettings = ringRenderSettingsForTool(tool)
@@ -4765,7 +4680,7 @@ function TOOL:DrawHUD()
     if not client.validateState(self, state) then return end
 
     local hoverCandidate = state.hover and (state.hover.candidate or state.hover.overlay)
-    local mirrorActive = M.IsMirrorMode and M.IsMirrorMode(state)
+    local mirrorActive = M.IsMirrorMode(state)
     local sourceAnchorOptions = anchorOptions(tool, "from")
     local targetAnchorOptions = not mirrorActive and anchorOptions(tool, "to") or nil
     local pointCache = state._magicAlignPointWorldCache or {}
@@ -4787,19 +4702,17 @@ hook.Remove("PostDrawTranslucentRenderables", "magic_align_draw_overlay")
 
 local lastOpaqueGhostFrame
 local function shouldDrawOpaqueGhostPass()
-    if render.GetRenderTarget and render.GetRenderTarget() ~= nil then
+    if render.GetRenderTarget() ~= nil then
         return false
     end
 
-    if isfunction(FrameNumber) then
-        local frame = FrameNumber()
-        if frame ~= nil then
-            if lastOpaqueGhostFrame == frame then
-                return false
-            end
-
-            lastOpaqueGhostFrame = frame
+    local frame = FrameNumber()
+    if frame ~= nil then
+        if lastOpaqueGhostFrame == frame then
+            return false
         end
+
+        lastOpaqueGhostFrame = frame
     end
 
     return true
@@ -4853,19 +4766,17 @@ end)
 
 local lastTranslucentOverlayFrame
 local function shouldDrawTranslucentOverlayPass()
-    if render.GetRenderTarget and render.GetRenderTarget() ~= nil then
+    if render.GetRenderTarget() ~= nil then
         return false
     end
 
-    if isfunction(FrameNumber) then
-        local frame = FrameNumber()
-        if frame ~= nil then
-            if lastTranslucentOverlayFrame == frame then
-                return false
-            end
-
-            lastTranslucentOverlayFrame = frame
+    local frame = FrameNumber()
+    if frame ~= nil then
+        if lastTranslucentOverlayFrame == frame then
+            return false
         end
+
+        lastTranslucentOverlayFrame = frame
     end
 
     return true

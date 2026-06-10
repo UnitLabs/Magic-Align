@@ -54,7 +54,7 @@ local function targetPoints(state)
 end
 
 local function mirrorActive(state)
-    return M.IsMirrorMode and M.IsMirrorMode(state) or false
+    return M.IsMirrorMode(state)
 end
 
 local function mirrorState(state)
@@ -76,7 +76,7 @@ end
 local function activePointKind(state)
     if not istable(state) then return end
     if mirrorActive(state) then return MIRROR_POINT_KIND end
-    if M.HasTargetEntity and M.HasTargetEntity(state.prop2) then return TARGET_POINT_KIND end
+    if M.HasTargetEntity(state.prop2) then return TARGET_POINT_KIND end
 end
 
 local function isPointKindActive(state, kind)
@@ -85,7 +85,6 @@ local function isPointKindActive(state, kind)
     elseif kind == TARGET_POINT_KIND then
         return istable(state)
             and not mirrorActive(state)
-            and M.HasTargetEntity
             and M.HasTargetEntity(state.prop2)
     end
 end
@@ -306,11 +305,7 @@ local function pointFromWorldPosition(state, kind, currentPoint, worldPos, world
 
     if not isvector(point) then return end
 
-    if M.SetPointReference then
-        M.SetPointReference(point, ref)
-    elseif isWorldTarget(ref) then
-        point.world = true
-    end
+    M.SetPointReference(point, ref)
 
     if localNormal then
         point.normal = copyVec(localNormal)
@@ -547,13 +542,8 @@ local function beginPointGizmoDrag(state, handle)
 
     local lineScratch = state._magicAlignPointGizmoLinePlaneScratch or {}
     state._magicAlignPointGizmoLinePlaneScratch = lineScratch
-    local worldPos, localPos
-    if M.LinePlaneIntersectionInto then
-        worldPos, localPos = M.LinePlaneIntersectionInto(lineScratch.world, lineScratch.localPos, dir, eye, normal, origin, basis)
-        lineScratch.world, lineScratch.localPos = worldPos, localPos
-    else
-        worldPos, localPos = M.LinePlaneIntersection(dir, eye, normal, origin, basis)
-    end
+    local worldPos, localPos = M.LinePlaneIntersectionInto(lineScratch.world, lineScratch.localPos, dir, eye, normal, origin, basis)
+    lineScratch.world, lineScratch.localPos = worldPos, localPos
     if not isvector(worldPos) or not isvector(localPos) then return false end
 
     state.press = {
@@ -603,12 +593,8 @@ local function updatePointGizmoDrag(state)
     local lineScratch = press.linePlaneScratch or {}
     press.linePlaneScratch = lineScratch
     local _, localPos
-    if M.LinePlaneIntersectionInto then
-        lineScratch.world, localPos = M.LinePlaneIntersectionInto(lineScratch.world, lineScratch.localPos, dir, eye, press.normal, press.origin, press.basis)
-        lineScratch.localPos = localPos
-    else
-        _, localPos = M.LinePlaneIntersection(dir, eye, press.normal, press.origin, press.basis)
-    end
+    lineScratch.world, localPos = M.LinePlaneIntersectionInto(lineScratch.world, lineScratch.localPos, dir, eye, press.normal, press.origin, press.basis)
+    lineScratch.localPos = localPos
     if not isvector(localPos) then return true end
 
     local dragStartLocal = press.dragStartLocal or press.startLocal or ZERO_VEC

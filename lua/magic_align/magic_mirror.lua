@@ -6,8 +6,8 @@ M.MagicMirror = MagicMirror
 
 local VectorP = M.VectorP
 local AngleP = M.AngleP
-local isvector = M.IsVectorLike or isvector
-local isangle = M.IsAngleLike or isangle
+local isvector = M.IsVectorLike
+local isangle = M.IsAngleLike
 local copyVec = M.CopyVectorPrecise
 local copyAng = M.CopyAnglePrecise
 
@@ -34,24 +34,11 @@ local function axisLabel(axis)
 end
 
 local function composeAxis(currentAxis, deltaAxis)
-    if M.EntityMirror and M.EntityMirror.ComposeAxis then
-        return M.EntityMirror.ComposeAxis(currentAxis, deltaAxis)
-    end
-
-    currentAxis = sanitizeAxis(currentAxis)
-    deltaAxis = sanitizeAxis(deltaAxis)
-    if deltaAxis == AXIS_NONE then return currentAxis end
-    if currentAxis == AXIS_NONE then return deltaAxis end
-    if currentAxis == deltaAxis then return AXIS_NONE end
-    return AXIS_NONE
+    return M.EntityMirror.ComposeAxis(currentAxis, deltaAxis)
 end
 
 local function currentEntityAxis(ent)
-    if M.EntityMirror and M.EntityMirror.GetAxis then
-        return sanitizeAxis(M.EntityMirror.GetAxis(ent))
-    end
-
-    return AXIS_NONE
+    return sanitizeAxis(M.EntityMirror.GetAxis(ent))
 end
 
 local function remainingAxis(a, b)
@@ -150,11 +137,11 @@ local function localAxisWorld(ang, axis)
     if not isangle(ang) then return end
 
     axis = sanitizeAxis(axis)
-    if axis == AXIS_X and M.AngleForwardPrecise then
+    if axis == AXIS_X then
         return M.AngleForwardPrecise(ang)
-    elseif axis == AXIS_Y and M.AngleRightPrecise then
+    elseif axis == AXIS_Y then
         return M.AngleRightPrecise(ang)
-    elseif axis == AXIS_Z and M.AngleUpPrecise then
+    elseif axis == AXIS_Z then
         return M.AngleUpPrecise(ang)
     end
 end
@@ -172,10 +159,10 @@ local function targetPose(ent, deltaAxis, out)
     local currentAxis = currentEntityAxis(ent)
     local targetAxis = composeAxis(currentAxis, deltaAxis)
     local rotationAxis = remainingAxis(currentAxis, deltaAxis)
-    local targetAng = copyAng and copyAng(ang) or AngleP(ang.p, ang.y, ang.r)
+    local targetAng = copyAng(ang)
     local bakedRotation = false
 
-    if rotationAxis ~= AXIS_NONE and M.RotateAngleAroundAxisPrecise then
+    if rotationAxis ~= AXIS_NONE then
         local worldAxis = localAxisWorld(ang, rotationAxis)
         if isvector(worldAxis) then
             targetAng = M.RotateAngleAroundAxisPrecise(targetAng, worldAxis, 180)
@@ -184,15 +171,13 @@ local function targetPose(ent, deltaAxis, out)
     end
 
     local targetPos = pos
-    if M.EntityMirror and M.EntityMirror.PositionForInPlaceAxisChange then
-        local adjusted = M.EntityMirror.PositionForInPlaceAxisChange(ent, targetAng, currentAxis, targetAxis)
-        if isvector(adjusted) then
-            targetPos = adjusted
-        end
+    local adjusted = M.EntityMirror.PositionForInPlaceAxisChange(ent, targetAng, currentAxis, targetAxis)
+    if isvector(adjusted) then
+        targetPos = adjusted
     end
 
     out = istable(out) and out or {}
-    out.pos = copyVec and copyVec(targetPos) or VectorP(targetPos.x, targetPos.y, targetPos.z)
+    out.pos = copyVec(targetPos)
     out.ang = targetAng
     out.entityMirrorAxis = deltaAxis
     out.entityMirrorPreviewAxis = targetAxis

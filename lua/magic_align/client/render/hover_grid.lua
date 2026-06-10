@@ -26,8 +26,7 @@ local GRID_CONFIG = {
 }
 
 local function newRenderVector(x, y, z)
-    return Vector and Vector(tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0)
-        or VectorP(tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0)
+    return Vector(tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0)
 end
 
 local function setRenderVector(out, x, y, z)
@@ -188,7 +187,7 @@ local function hasDrawableFace(candidate)
     if not candidate or not candidate.face then return false end
     if IsValid(candidate.ent) then return true end
 
-    return M.IsWorldTarget and M.IsWorldTarget(candidate.ent) and candidate.face.worldBSP == true
+    return M.IsWorldTarget(candidate.ent) and candidate.face.worldBSP == true
 end
 
 local function shouldRenderGrid(state, candidate)

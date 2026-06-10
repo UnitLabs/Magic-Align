@@ -1,8 +1,8 @@
 local M = MAGIC_ALIGN
 if not M then return end
 
-local isvector = M.IsVectorLike or isvector
-local isangle = M.IsAngleLike or isangle
+local isvector = M.IsVectorLike
+local isangle = M.IsAngleLike
 local VectorP = M.VectorP
 local ZERO_VEC = VectorP(0, 0, 0)
 
@@ -316,11 +316,11 @@ local function applyAxisSign(scale, axis, out)
 end
 
 local function liveSizeHandlerScale(ent, getterName)
-    local handler = M.FindSizeHandler and M.FindSizeHandler(ent) or nil
+    local handler = M.FindSizeHandler(ent)
     local getter = IsValid(handler) and handler[getterName] or nil
     if not isfunction(getter) then return end
 
-    local scale = M.ParseScaleVector and M.ParseScaleVector(getter(handler)) or nil
+    local scale = M.ParseScaleVector(getter(handler))
     if not isvector(scale) or scaleIsZero(scale) then return end
 
     return scale
@@ -347,10 +347,7 @@ local function captureResizeScales(ent, currentAxis, options)
     local visual = optionResizeScale(options, "resizeVisualScale")
 
     if not isvector(physical) or not isvector(visual) then
-        local storedPhysical, storedVisual
-        if M.GetAdvResizerScales then
-            storedPhysical, storedVisual = M.GetAdvResizerScales(ent)
-        end
+        local storedPhysical, storedVisual = M.GetAdvResizerScales(ent)
 
         if not isvector(physical) then
             physical = preferLiveResizeScale(storedPhysical, liveSizeHandlerScale(ent, "GetActualPhysicsScale"))
@@ -367,7 +364,7 @@ end
 local function syncLiveSizeHandlerScales(ent, physical, visual)
     if not SERVER or not IsValid(ent) then return end
 
-    local handler = M.FindSizeHandler and M.FindSizeHandler(ent) or nil
+    local handler = M.FindSizeHandler(ent)
     if not IsValid(handler) then return end
 
     if isvector(physical) and isfunction(handler.SetActualPhysicsScale) then
@@ -395,22 +392,14 @@ local function ensureStoredResizeScales(ent, physical, visual)
         data[7] = false
     end
 
-    if duplicator and isfunction(duplicator.StoreEntityModifier) then
-        duplicator.StoreEntityModifier(ent, "advr", data)
-    else
-        ent.EntityMods.advr = data
-    end
+    duplicator.StoreEntityModifier(ent, "advr", data)
 
     syncLiveSizeHandlerScales(ent, physical, visual)
 end
 
 local function physicsScaleFor(ent, axis, out, physicalScale, currentAxis)
     if not isvector(physicalScale) then
-        local physical
-        if M.GetAdvResizerScales then
-            physical = M.GetAdvResizerScales(ent)
-        end
-
+        local physical = M.GetAdvResizerScales(ent)
         physicalScale = preferLiveResizeScale(physical, liveSizeHandlerScale(ent, "GetActualPhysicsScale"))
     end
 
@@ -424,7 +413,7 @@ end
 
 local function resizeVisualScaleFor(ent, currentAxis)
     local visual = liveSizeHandlerVisualScale(ent)
-        or (M.GetAdvResizerVisualScale and M.GetAdvResizerVisualScale(ent) or nil)
+        or M.GetAdvResizerVisualScale(ent)
 
     if isvector(visual) then
         local base = stripAxisSign(
@@ -492,11 +481,9 @@ end
 local function captureLocalBounds(ent)
     if not IsValid(ent) then return end
 
-    if M.GetLocalBounds then
-        local mins, maxs = M.GetLocalBounds(ent)
-        if isvector(mins) and isvector(maxs) then
-            return mins, maxs
-        end
+    local mins, maxs = M.GetLocalBounds(ent)
+    if isvector(mins) and isvector(maxs) then
+        return mins, maxs
     end
 
     return captureCollisionBounds(ent)
@@ -526,7 +513,7 @@ function EntityMirror.BaseMirrorPivot(ent, currentAxis, out)
     local center = localBoundsCenter(ent)
     if not isvector(center) then return end
 
-    local boundsAxis = EntityMirror.BoundsAxisForEntity and EntityMirror.BoundsAxisForEntity(ent) or currentAxis
+    local boundsAxis = EntityMirror.BoundsAxisForEntity(ent) or currentAxis
     return axisPoint(center, boundsAxis, out)
 end
 
@@ -540,7 +527,7 @@ function EntityMirror.PositionForLocalPivot(ent, targetAng, targetAxis, targetPi
     if not isvector(basePivot) then return end
 
     local targetLocalPivot = axisPoint(basePivot, targetAxis)
-    if not isvector(targetLocalPivot) or not M.LocalToWorldPosPrecise or not M.SubtractVectorsPrecise then return end
+    if not isvector(targetLocalPivot) then return end
 
     local targetOffset = M.LocalToWorldPosPrecise(targetLocalPivot, ZERO_VEC, targetAng)
     if not isvector(targetOffset) then return end
@@ -550,7 +537,6 @@ end
 
 function EntityMirror.PositionForInPlaceAxisChange(ent, targetAng, currentAxis, targetAxis, out)
     if not IsValid(ent) or not isangle(targetAng) then return end
-    if not M.LocalToWorldPosPrecise then return end
 
     currentAxis = validAxis(currentAxis)
     targetAxis = validAxis(targetAxis)
@@ -599,17 +585,17 @@ function EntityMirror.BoundsAxisForEntity(ent)
         return validAxis(EntityMirror.PhysicsAxisForEntity(ent))
     end
 
-    local flags = EntityMirror.GetFlags and EntityMirror.GetFlags(ent) or M.ENTITY_MIRROR_DEFAULT_FLAGS
+    local flags = EntityMirror.GetFlags(ent)
     if bit.band(flags, M.ENTITY_MIRROR_PHYSICS) == 0 then
         return M.ENTITY_MIRROR_NONE
     end
 
-    if M.IsPrimitive and M.IsPrimitive(ent)
+    if M.IsPrimitive(ent)
         and bit.band(flags, M.ENTITY_MIRROR_PRIMITIVE_AWARE) == 0 then
         return M.ENTITY_MIRROR_NONE
     end
 
-    return EntityMirror.GetAxis and EntityMirror.GetAxis(ent) or M.ENTITY_MIRROR_NONE
+    return EntityMirror.GetAxis(ent)
 end
 
 function EntityMirror.BoundsInBaseSpace(ent, mins, maxs, boundsAxis)
@@ -625,8 +611,8 @@ end
 function EntityMirror.BoundsRevisionForEntity(ent)
     if not IsValid(ent) then return "invalid" end
 
-    local axis = EntityMirror.GetAxis and EntityMirror.GetAxis(ent) or M.ENTITY_MIRROR_NONE
-    local flags = EntityMirror.GetFlags and EntityMirror.GetFlags(ent) or M.ENTITY_MIRROR_DEFAULT_FLAGS
+    local axis = EntityMirror.GetAxis(ent)
+    local flags = EntityMirror.GetFlags(ent)
 
     return table.concat({
         tostring(axis),
@@ -804,7 +790,7 @@ local function primitiveDebugResult(ent)
 end
 
 local function debugPrimitiveBounds(ent)
-    if not (M.IsPrimitive and M.IsPrimitive(ent)) then return "non-primitive" end
+    if not M.IsPrimitive(ent) then return "non-primitive" end
 
     local result, source = primitiveDebugResult(ent)
     if not result then return source or "none" end
@@ -821,8 +807,8 @@ function EntityMirror.DebugEntity(label, ent, extra, force)
     if not force and not EntityMirror.DebugEnabled() then return end
     if not IsValid(ent) then return end
 
-    local axis = EntityMirror.GetAxis and EntityMirror.GetAxis(ent) or M.ENTITY_MIRROR_NONE
-    local flags = EntityMirror.GetFlags and EntityMirror.GetFlags(ent) or 0
+    local axis = EntityMirror.GetAxis(ent)
+    local flags = EntityMirror.GetFlags(ent)
     local clientAxis = CLIENT and ent._magicAlignEntityMirrorAxis or nil
     local previewAxis = CLIENT and ent._magicAlignEntityMirrorPreviewAxis or nil
     local phys = ent:GetPhysicsObject()
@@ -832,7 +818,7 @@ function EntityMirror.DebugEntity(label, ent, extra, force)
         ("[%s]"):format(CLIENT and "CL" or "SV"),
         tostring(label or "mirror"),
         ("ent=%s#%s"):format(ent:GetClass(), ent:EntIndex()),
-        ("primitive=%s"):format(M.IsPrimitive and M.IsPrimitive(ent) and "true" or "false"),
+        ("primitive=%s"):format(M.IsPrimitive(ent) and "true" or "false"),
         ("axis=%s"):format(EntityMirror.AxisLabel(axis)),
         ("clientAxis=%s"):format(clientAxis ~= nil and EntityMirror.AxisLabel(clientAxis) or "nil"),
         ("previewAxis=%s"):format(previewAxis ~= nil and EntityMirror.AxisLabel(previewAxis) or "nil"),
@@ -1221,7 +1207,7 @@ if SERVER then
         options = istable(options) and options or {}
         local state = physicsState(ent)
 
-        if M.IsPrimitive and M.IsPrimitive(ent) then
+        if M.IsPrimitive(ent) then
             return rebuildPrimitivePhysics(ent, axis, state, options)
         end
 
@@ -1261,15 +1247,9 @@ if SERVER then
 
         ent.EntityMods = istable(ent.EntityMods) and ent.EntityMods or {}
         if data then
-            if duplicator and isfunction(duplicator.StoreEntityModifier) then
-                duplicator.StoreEntityModifier(ent, M.ENTITY_MIRROR_MODIFIER_ID, data)
-            else
-                ent.EntityMods[M.ENTITY_MIRROR_MODIFIER_ID] = data
-            end
-        elseif duplicator and isfunction(duplicator.ClearEntityModifier) then
-            duplicator.ClearEntityModifier(ent, M.ENTITY_MIRROR_MODIFIER_ID)
+            duplicator.StoreEntityModifier(ent, M.ENTITY_MIRROR_MODIFIER_ID, data)
         else
-            ent.EntityMods[M.ENTITY_MIRROR_MODIFIER_ID] = nil
+            duplicator.ClearEntityModifier(ent, M.ENTITY_MIRROR_MODIFIER_ID)
         end
     end
 
@@ -1306,7 +1286,7 @@ if SERVER then
         end
 
         if axis == M.ENTITY_MIRROR_NONE then
-            local restoreAfterNetwork = M.IsPrimitive and M.IsPrimitive(ent)
+            local restoreAfterNetwork = M.IsPrimitive(ent)
             if not restoreAfterNetwork
                 and (forced or actual ~= M.ENTITY_MIRROR_NONE or current ~= M.ENTITY_MIRROR_NONE or changed) then
                 EntityMirror.RestorePhysics(ent, physicsOptions())
@@ -1409,7 +1389,6 @@ if SERVER then
     end
 
     local function scheduleModifierStateReapply(ent, state)
-        if not (timer and isfunction(timer.Simple)) then return end
         state = EntityMirror.Sanitize(state)
         if not state then return end
 
@@ -1421,17 +1400,15 @@ if SERVER then
         end)
     end
 
-    if duplicator and isfunction(duplicator.RegisterEntityModifier) then
-        duplicator.RegisterEntityModifier(M.ENTITY_MIRROR_MODIFIER_ID, function(_, ent, data)
-            local stored = EntityMirror.Sanitize(data)
-            if stored then
-                EntityMirror.SetState(ent, stored.axis, stored.flags, { force = true })
-                scheduleModifierStateReapply(ent, stored)
-            else
-                EntityMirror.SetState(ent, M.ENTITY_MIRROR_NONE, M.ENTITY_MIRROR_DEFAULT_FLAGS, { force = true })
-            end
-        end)
-    end
+    duplicator.RegisterEntityModifier(M.ENTITY_MIRROR_MODIFIER_ID, function(_, ent, data)
+        local stored = EntityMirror.Sanitize(data)
+        if stored then
+            EntityMirror.SetState(ent, stored.axis, stored.flags, { force = true })
+            scheduleModifierStateReapply(ent, stored)
+        else
+            EntityMirror.SetState(ent, M.ENTITY_MIRROR_NONE, M.ENTITY_MIRROR_DEFAULT_FLAGS, { force = true })
+        end
+    end)
 
     hook.Add("Primitive_PostRebuildPhysics", "MagicAlignEntityMirrorPrimitivePhysics", function(ent)
         if not IsValid(ent) then return end
@@ -1486,7 +1463,7 @@ if CLIENT then
         local desiredPhysicsAxis = M.ENTITY_MIRROR_NONE
 
         if bit.band(flags, M.ENTITY_MIRROR_PHYSICS) ~= 0 then
-            if M.IsPrimitive and M.IsPrimitive(ent) then
+            if M.IsPrimitive(ent) then
                 if bit.band(flags, M.ENTITY_MIRROR_PRIMITIVE_AWARE) ~= 0 then
                     desiredPhysicsAxis = axis
                 end
@@ -1568,13 +1545,11 @@ if CLIENT then
         data.collisionGroup = IsValid(ent) and isfunction(ent.GetCollisionGroup) and ent:GetCollisionGroup() or nil
         data.advrDcp = advResizerClientPhysicsDisabled(ent)
 
-        if M.GetAdvResizerScales then
-            local physical, visual = M.GetAdvResizerScales(ent)
-            data.advrPhysical = physical
-            data.advrVisual = visual
-        end
+        local physical, visual = M.GetAdvResizerScales(ent)
+        data.advrPhysical = physical
+        data.advrVisual = visual
 
-        local handler = M.FindSizeHandler and M.FindSizeHandler(ent) or nil
+        local handler = M.FindSizeHandler(ent)
         data.sizeHandler = IsValid(handler)
         if IsValid(handler) then
             data.handlerActualPhysics = isfunction(handler.GetActualPhysicsScale)
@@ -1799,8 +1774,8 @@ if CLIENT then
 
     local function shouldEnsureClientBaselinePhysics(ent)
         if not IsValid(ent) then return false end
-        if not (M.IsProp and M.IsProp(ent)) then return false end
-        if M.IsPrimitive and M.IsPrimitive(ent) then return false end
+        if not M.IsProp(ent) then return false end
+        if M.IsPrimitive(ent) then return false end
         if advResizerClientPhysicsDisabled(ent) then return false end
         if not isfunction(ent.PhysicsInit) then return false end
         if isfunction(ent.GetSolid) and ent:GetSolid() ~= SOLID_VPHYSICS then return false end
@@ -2031,7 +2006,7 @@ if CLIENT then
             return releaseOwnedClientPhysics(ent, state)
         end
 
-        if M.IsPrimitive and M.IsPrimitive(ent) then
+        if M.IsPrimitive(ent) then
             return applyOwnedPrimitivePhysics(ent, desiredPhysicsAxis, state)
         end
 
@@ -2042,7 +2017,7 @@ if CLIENT then
         state.desiredPhysicsAxis = validAxis(desiredPhysicsAxis)
 
         if not IsValid(ent) then return false end
-        if not (M.IsProp and M.IsProp(ent)) then
+        if not M.IsProp(ent) then
             if state.desiredPhysicsAxis == M.ENTITY_MIRROR_NONE then
                 return releaseOwnedClientPhysics(ent, state)
             end
@@ -2548,7 +2523,7 @@ if CLIENT then
     end
 
     local function addTraceCandidate(list, seen, ent, startPos, direction, maxDistance, radius)
-        if not IsValid(ent) or seen[ent] or not (M.IsProp and M.IsProp(ent)) then return end
+        if not IsValid(ent) or seen[ent] or not M.IsProp(ent) then return end
 
         local along, perpendicular, center = rayMetrics(startPos, direction, ent)
         if not along or along < 0 or along > maxDistance then return end
@@ -2572,10 +2547,8 @@ if CLIENT then
         local mins = Vector(-radius, -radius, -radius)
         local maxs = Vector(radius, radius, radius)
 
-        if ents.FindAlongRay then
-            for _, ent in ipairs(ents.FindAlongRay(startPos, endPos, mins, maxs)) do
-                addTraceCandidate(list, seen, ent, startPos, direction, maxDistance, radius)
-            end
+        for _, ent in ipairs(ents.FindAlongRay(startPos, endPos, mins, maxs)) do
+            addTraceCandidate(list, seen, ent, startPos, direction, maxDistance, radius)
         end
 
         for _, ent in ipairs(ents.GetAll()) do
@@ -2693,8 +2666,6 @@ if CLIENT then
     end
 
     local function patchPrimitiveEditor()
-        if not vgui or not vgui.GetControlTable then return false end
-
         local panel = vgui.GetControlTable("DTreeEditorBase")
         if not istable(panel) or panel._magicAlignMirrorPatched then return false end
 

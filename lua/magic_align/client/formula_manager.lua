@@ -232,7 +232,7 @@ function Manager:GetExpressionOptions(cvarName, panel)
         end
     end
 
-    if not istable(options) and isfunction(M.GetFormulaEnvironment) then
+    if not istable(options) then
         local ok, value = pcall(M.GetFormulaEnvironment, M, panel, cvarName)
         if ok and istable(value) then
             options = value

@@ -61,7 +61,7 @@ function client.activeSpace()
 end
 
 local function isMirrorSpace(space)
-    return M.IsMirrorMode and M.IsMirrorMode(space) or space == M.MIRROR_SPACE
+    return M.IsMirrorMode(space) or space == M.MIRROR_SPACE
 end
 
 local function isUiSpace(space)
@@ -116,7 +116,7 @@ local function clearSessionVisuals(state)
 end
 
 local function editable(state, ent, tr, space)
-    if M.IsMirrorMode and M.IsMirrorMode(space) then
+    if M.IsMirrorMode(space) then
         if not IsValid(state.prop1) then return end
 
         state.mirror = state.mirror or { points = {} }
@@ -198,7 +198,7 @@ function client.RightClick.removeEditablePointAtTrace(state, trace, space)
     local fallbackEnt = side == "target" and state.prop2 or ent
     local cache = pointWorldCacheForAction(state)
     for i = 1, #points do
-        local ref = M.ResolvePointReference and M.ResolvePointReference(points[i], fallbackEnt) or fallbackEnt
+        local ref = M.ResolvePointReference(points[i], fallbackEnt)
         local refMatches = geometry.isWorldTarget(ent)
             and geometry.isWorldTarget(ref)
             or (IsValid(ent) and ref == ent)
@@ -245,7 +245,7 @@ local function performClientRightClick(trace)
     state.linkedGhosts = state.linkedGhosts or {}
 
     local activeSpace = client.activeSpace()
-    local mirrorTabActive = M.IsMirrorMode and M.IsMirrorMode(activeSpace)
+    local mirrorTabActive = M.IsMirrorMode(activeSpace)
 
     if mirrorTabActive then
         if client.RightClick.removeEditablePointAtTrace(state, trace, activeSpace) then
@@ -275,7 +275,7 @@ local function pointRemovalAtTraceWouldAffect(state, trace, space)
 
     for i = 1, #(points or {}) do
         local point = points[i]
-        local ref = M.ResolvePointReference and M.ResolvePointReference(point, fallbackEnt) or fallbackEnt
+        local ref = M.ResolvePointReference(point, fallbackEnt)
         local refMatches = geometry.isWorldTarget(ent)
             and geometry.isWorldTarget(ref)
             or (IsValid(ent) and ref == ent)
@@ -477,64 +477,60 @@ function TOOL:LeftClick(trace)
     if SERVER then
         if game.SinglePlayer() then
             sendClientAction(self:GetOwner(), M.CLIENT_ACTION_LEFTCLICK, trace)
-        else
-            playToolgunFeedback(self, "normal", true, trace, nil, { direct = false })
         end
 
-        return true
+        return false
     end
 
     if game.SinglePlayer() then
-        return true
+        return false
     end
 
-    playToolgunFeedback(self, "normal", leftClickWouldAffect(trace), trace, nil, { direct = false })
+    playToolgunFeedback(self, "normal", leftClickWouldAffect(trace), trace)
 
     if isfunction(core.queueClientLeftClick) then
-        return core.queueClientLeftClick(self)
+        core.queueClientLeftClick(self)
     end
 
-    return true
+    return false
 end
 
 function TOOL:RightClick(trace)
     if SERVER then
         if game.SinglePlayer() then
             sendClientAction(self:GetOwner(), M.CLIENT_ACTION_RIGHTCLICK, trace)
-        else
-            playToolgunFeedback(self, "normal", true, trace, nil, { direct = false })
         end
 
-        return true
+        return false
     end
 
     if game.SinglePlayer() then
-        return true
+        return false
     end
 
-    playToolgunFeedback(self, "normal", rightClickWouldAffect(trace), trace, nil, { direct = false })
+    playToolgunFeedback(self, "normal", rightClickWouldAffect(trace), trace)
 
-    return performClientRightClick(trace)
+    performClientRightClick(trace)
+    return false
 end
 
 function TOOL:Reload(trace)
     if SERVER then
         if game.SinglePlayer() then
             sendClientAction(self:GetOwner(), M.CLIENT_ACTION_RESET, trace)
-        else
-            playToolgunFeedback(self, "reset", true, trace, nil, { direct = false })
         end
 
-        return true
+        return false
     end
 
     if game.SinglePlayer() then
-        return true
+        return false
     end
 
-    playToolgunFeedback(self, "reset", reloadWouldAffect(trace), trace, nil, { direct = false })
+    playToolgunFeedback(self, "reset", reloadWouldAffect(trace), trace)
 
-    return performClientReload(self)
+    performClientReload(self)
+    return false
 end
 
 if SERVER then

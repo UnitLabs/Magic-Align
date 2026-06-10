@@ -32,7 +32,7 @@ local function hoverPoint(ent, points, fallbackEnt, cache)
     local best, bestDist
 
     for i = 1, #points do
-        local ref = M.ResolvePointReference and M.ResolvePointReference(points[i], fallbackEnt or ent) or (fallbackEnt or ent)
+        local ref = M.ResolvePointReference(points[i], fallbackEnt or ent)
         local refMatches = geometry.isWorldTarget(ent)
             and geometry.isWorldTarget(ref)
             or (IsValid(ent) and ref == ent)
@@ -172,7 +172,7 @@ local GIZMO_CONFIG = {
     maxSize = 72,
     planeOffsetScale = 0.2,
     ringRadiusScale = 0.82,
-    ringPadding = 0.5,
+    ringPadding = 0.65,
     pickRadiusMin = 324,
     pickRadiusScale = 0.18
 }
@@ -269,7 +269,7 @@ end
 function gizmoShared.linearHandles(origin, basis, size, reuse)
     reuse = istable(reuse) and reuse or nil
     local basisForward, basisRight, basisUp
-    if reuse and M.AngleAxesPreciseInto then
+    if reuse then
         reuse.axes = reuse.axes or {}
         basisForward, basisRight, basisUp = M.AngleAxesPreciseInto(reuse.axes, basis)
     else
@@ -351,13 +351,8 @@ function gizmoShared.pickHoveredHandle(handles, pickRadius, ringRadius, ringPadd
         elseif item.kind == "rot" and isvector(eye) and isvector(dir) then
             local scratch = gizmoShared._linePlaneScratch or {}
             gizmoShared._linePlaneScratch = scratch
-            local worldPos, localPos
-            if M.LinePlaneIntersectionInto then
-                worldPos, localPos = M.LinePlaneIntersectionInto(scratch.world, scratch.localPos, dir, eye, item.axis, origin, basis)
-                scratch.world, scratch.localPos = worldPos, localPos
-            else
-                worldPos, localPos = M.LinePlaneIntersection(dir, eye, item.axis, origin, basis)
-            end
+            local worldPos, localPos = M.LinePlaneIntersectionInto(scratch.world, scratch.localPos, dir, eye, item.axis, origin, basis)
+            scratch.world, scratch.localPos = worldPos, localPos
             if localPos then
                 local u, v = ringCoords(item.key, localPos)
                 item.cursorAngle = math.deg(ringAngle(item.key, localPos))
@@ -457,7 +452,7 @@ local function gizmo(tool, state)
     if not preview or not preview.solve then return end
 
     local space = tool:GetClientInfo("space")
-    if M.IsMirrorMode and M.IsMirrorMode(space) then return end
+    if M.IsMirrorMode(space) then return end
     local press = state.press
     local origin = LocalToWorldPosPrecise(preview.solve.sourceAnchorLocal, preview.pos, preview.ang)
     local basis = gizmoBasisFor(space, preview, preview.solve, state.prop2)

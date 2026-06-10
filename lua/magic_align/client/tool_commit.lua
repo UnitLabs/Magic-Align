@@ -98,7 +98,7 @@ local function commit(tool, state)
         linkedTargets = absoluteLinked and linkedTargets or nil,
         absoluteLinked = absoluteLinked,
         mirrorReference = copyMirrorReference(state.preview.mirrorReference),
-        sessionSnapshot = M.CreateSessionSnapshot and M.CreateSessionSnapshot(state, {
+        sessionSnapshot = M.CreateSessionSnapshot(state, {
             activeSpace = activeSpace,
             lastNonMirrorTab = M.ClientLastNonMirrorSpace,
             actionType = isMirrorAction and "mirror" or "align",
@@ -118,7 +118,7 @@ local function commit(tool, state)
                 }
             },
             entityMirrorEnabled = mirrorEntityCvar and mirrorEntityCvar:GetBool() or false
-        }) or nil,
+        }),
         weld = weldOnCommit,
         nocollide = nocollideOnCommit,
         parent = tool:GetClientNumber("parent") == 1,

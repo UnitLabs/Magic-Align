@@ -5,8 +5,8 @@ local DEG_TO_RAD = math.pi / 180
 local RAD_TO_DEG = 180 / math.pi
 local GVector = Vector
 local GAngle = Angle
-local gIsVector = isvector or function() return false end
-local gIsAngle = isangle or function() return false end
+local gIsVector = isvector
+local gIsAngle = isangle
 
 M.COMPUTE_EPSILON = M.COMPUTE_EPSILON or 1e-12
 M.COMPUTE_VECTOR_EPSILON_SQR = M.COMPUTE_VECTOR_EPSILON_SQR or (M.COMPUTE_EPSILON * M.COMPUTE_EPSILON)
@@ -813,28 +813,26 @@ end
 LocalToWorldPrecise = M.LocalToWorldPrecise
 WorldToLocalPrecise = M.WorldToLocalPrecise
 
-if net then
-    function net.WritePreciseVector(vec)
-        vec = vecOrZero(vec)
-        net.WriteDouble(tonumber(vec.x) or 0)
-        net.WriteDouble(tonumber(vec.y) or 0)
-        net.WriteDouble(tonumber(vec.z) or 0)
-    end
+function net.WritePreciseVector(vec)
+    vec = vecOrZero(vec)
+    net.WriteDouble(tonumber(vec.x) or 0)
+    net.WriteDouble(tonumber(vec.y) or 0)
+    net.WriteDouble(tonumber(vec.z) or 0)
+end
 
-    function net.ReadPreciseVector()
-        return VectorP(net.ReadDouble(), net.ReadDouble(), net.ReadDouble())
-    end
+function net.ReadPreciseVector()
+    return VectorP(net.ReadDouble(), net.ReadDouble(), net.ReadDouble())
+end
 
-    function net.WritePreciseAngle(ang)
-        ang = angOrZero(ang)
-        net.WriteDouble(tonumber(ang.p) or 0)
-        net.WriteDouble(tonumber(ang.y) or 0)
-        net.WriteDouble(tonumber(ang.r) or 0)
-    end
+function net.WritePreciseAngle(ang)
+    ang = angOrZero(ang)
+    net.WriteDouble(tonumber(ang.p) or 0)
+    net.WriteDouble(tonumber(ang.y) or 0)
+    net.WriteDouble(tonumber(ang.r) or 0)
+end
 
-    function net.ReadPreciseAngle()
-        return AngleP(net.ReadDouble(), net.ReadDouble(), net.ReadDouble())
-    end
+function net.ReadPreciseAngle()
+    return AngleP(net.ReadDouble(), net.ReadDouble(), net.ReadDouble())
 end
 
 return M

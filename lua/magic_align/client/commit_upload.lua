@@ -19,16 +19,11 @@ local function previewEntityMirrorAxis(ent, deltaAxis)
         return client.Mirror.previewEntityMirrorAxis(ent, deltaAxis)
     end
 
-    if M.EntityMirror and M.EntityMirror.ComposeAxis and M.EntityMirror.GetAxis then
-        return M.EntityMirror.ComposeAxis(M.EntityMirror.GetAxis(ent), deltaAxis)
-    end
-
-    return M.ENTITY_MIRROR_NONE
+    return M.EntityMirror.ComposeAxis(M.EntityMirror.GetAxis(ent), deltaAxis)
 end
 
 local function predictCommitMirrorVisual(payload, commitId)
     if not istable(payload) or payload.mode == M.COMMIT_COPY then return end
-    if not (M.EntityMirror and M.EntityMirror.PredictVisual) then return end
 
     local deltaAxis = math.Clamp(
         math.floor(tonumber(payload.entityMirrorAxis) or M.ENTITY_MIRROR_NONE),
@@ -122,11 +117,7 @@ local function sendCommitUploadStep()
                 M.ENTITY_MIRROR_NONE,
                 M.ENTITY_MIRROR_Z
             ), 2)
-            if M.WriteSessionSnapshot then
-                M.WriteSessionSnapshot(payload.sessionSnapshot)
-            else
-                net.WriteBool(false)
-            end
+            M.WriteSessionSnapshot(payload.sessionSnapshot)
         net.SendToServer()
 
         upload.phase = upload.totalParts > 0 and "parts" or "finish"

@@ -7,8 +7,8 @@ M.Client = client
 local primitives = client.RenderPrimitives or {}
 client.RenderPrimitives = primitives
 
-local VectorP = M.VectorP or Vector
-local isvector = M.IsVectorLike or isvector
+local VectorP = M.VectorP
+local isvector = M.IsVectorLike
 local toVector = M.ToVector
 
 local cachedColors = primitives.cachedColors or {}
@@ -39,11 +39,7 @@ end
 
 local function renderVector(value)
     if not isvector(value) then return end
-    if toVector then
-        return toVector(value)
-    end
-
-    return Vector(value.x, value.y, value.z)
+    return toVector(value)
 end
 
 local function meshPosition(position)

@@ -191,13 +191,8 @@ function client.Press.beginGizmoDrag(tool, state, handle)
 
     local lineScratch = state._magicAlignGizmoLinePlaneScratch or {}
     state._magicAlignGizmoLinePlaneScratch = lineScratch
-    local worldPos, localPos
-    if M.LinePlaneIntersectionInto then
-        worldPos, localPos = M.LinePlaneIntersectionInto(lineScratch.world, lineScratch.localPos, dir, eye, normal, origin, basis)
-        lineScratch.world, lineScratch.localPos = worldPos, localPos
-    else
-        worldPos, localPos = M.LinePlaneIntersection(dir, eye, normal, origin, basis)
-    end
+    local worldPos, localPos = M.LinePlaneIntersectionInto(lineScratch.world, lineScratch.localPos, dir, eye, normal, origin, basis)
+    lineScratch.world, lineScratch.localPos = worldPos, localPos
     if not worldPos or not localPos then return end
 
     state.press = {
@@ -254,12 +249,8 @@ function client.Press.updateGizmo(tool, state)
     local lineScratch = press.linePlaneScratch or {}
     press.linePlaneScratch = lineScratch
     local _, localPos
-    if M.LinePlaneIntersectionInto then
-        lineScratch.world, localPos = M.LinePlaneIntersectionInto(lineScratch.world, lineScratch.localPos, dir, eye, press.normal, press.origin, press.basis)
-        lineScratch.localPos = localPos
-    else
-        _, localPos = M.LinePlaneIntersection(dir, eye, press.normal, press.origin, press.basis)
-    end
+    lineScratch.world, localPos = M.LinePlaneIntersectionInto(lineScratch.world, lineScratch.localPos, dir, eye, press.normal, press.origin, press.basis)
+    lineScratch.localPos = localPos
     if not localPos then return end
 
     local dragStartLocal = press.dragStartLocal or press.startLocal

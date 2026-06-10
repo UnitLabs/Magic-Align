@@ -62,34 +62,31 @@ function TOOL:LeftClick(trace)
     if SERVER then
         if game.SinglePlayer() then
             sendMirrorClientAction(self:GetOwner(), trace)
-        else
-            playFeedback(self, "mirrorCommit", true, trace, { direct = false })
         end
 
-        return true
+        return false
     end
 
     if game.SinglePlayer() then
-        return true
+        return false
     end
 
     local mirrorClient = client.MagicMirror
     if mirrorClient and isfunction(mirrorClient.queueClick) then
-        return mirrorClient.queueClick(self, trace)
+        mirrorClient.queueClick(self, trace)
+        return false
     end
 
-    playFeedback(self, "fail", false, trace, { direct = false })
-    return true
+    playFeedback(self, "fail", false, trace)
+    return false
 end
 
 function TOOL:RightClick(trace)
     if CLIENT and not game.SinglePlayer() then
-        playFeedback(self, "fail", false, trace, { direct = false })
-    elseif SERVER and not game.SinglePlayer() then
-        playFeedback(self, "fail", false, trace, { direct = false })
+        playFeedback(self, "fail", false, trace)
     end
 
-    return true
+    return false
 end
 
 TOOL.Reload = nil

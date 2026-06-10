@@ -285,7 +285,7 @@ local function toolgunLedSpace(tool)
 end
 
 local function toolgunGlowAccent(space)
-    local mirror = M.IsMirrorMode and M.IsMirrorMode(space) or space == M.MIRROR_SPACE
+    local mirror = M.IsMirrorMode(space) or space == M.MIRROR_SPACE
     return mirror and footerTabAccent.mirror or panelAccent.prop2 or palette.idle
 end
 
@@ -445,16 +445,12 @@ end
 hook.Remove("Think", "MagicAlignToolgunLedAccent")
 hook.Add("Think", "MagicAlignToolgunLedAccent", function()
     local ply = LocalPlayer()
-    if not IsValid(ply) or not M.GetActiveMagicAlignTool then
+    if not IsValid(ply) then
         clearToolgunLedOverride()
         return
     end
 
-    local getter = M.GetActiveMagicAlignFamilyTool or M.GetActiveMagicAlignTool
-    local tool, weapon
-    if getter then
-        tool, weapon = getter(ply)
-    end
+    local tool, weapon = M.GetActiveMagicAlignFamilyTool(ply)
     if not tool then
         clearToolgunLedOverride()
         return
@@ -468,14 +464,7 @@ local function normalizedAngle(angle)
 end
 
 local function frameDelta()
-    local dt
-
-    if isfunction(RealFrameTime) then
-        dt = RealFrameTime()
-    elseif isfunction(FrameTime) then
-        dt = FrameTime()
-    end
-
+    local dt = RealFrameTime()
     dt = tonumber(dt) or (1 / 60)
     return math.Clamp(dt, 0, COMPASS_NEEDLE.maxFrameTime)
 end
@@ -520,11 +509,7 @@ end
 
 local function safeVector(value)
     if not isvector(value) then return end
-    if toVector then
-        return toVector(value)
-    end
-
-    return Vector(value.x, value.y, value.z)
+    return toVector(value)
 end
 
 local toolgunAnchorOptionCache = {}
@@ -587,9 +572,7 @@ local function activeAnchorWorldPos(tool, state, ent, points, side)
         return localPos
     end
 
-    if M.EntityMirror and M.EntityMirror.LocalPointToWorld then
-        return M.EntityMirror.LocalPointToWorld(ent, localPos)
-    end
+    return M.EntityMirror.LocalPointToWorld(ent, localPos)
 end
 
 local function commitUploadProgress()
@@ -1003,32 +986,16 @@ end
 local function rebuildCompassRingMaterial()
     compassRingRebuildQueued = false
     if compassRingUnavailable or not compassRingRenderTarget or not compassRingMaterial then return end
-    if not render
-        or not cam
-        or not isfunction(render.PushRenderTarget)
-        or not isfunction(render.PopRenderTarget)
-        or not isfunction(render.Clear)
-        or not isfunction(cam.Start2D)
-        or not isfunction(cam.End2D) then
-        compassRingUnavailable = true
-        return
-    end
 
     render.PushRenderTarget(compassRingRenderTarget)
-    if render.OverrideAlphaWriteEnable then
-        render.OverrideAlphaWriteEnable(true, true)
-    end
-    if render.ClearDepth then
-        render.ClearDepth()
-    end
+    render.OverrideAlphaWriteEnable(true, true)
+    render.ClearDepth()
     render.Clear(0, 0, 0, 0)
     cam.Start2D()
         draw.NoTexture()
         drawCompassRingLines(COMPASS_RING_RT_HALF, COMPASS_RING_RT_HALF)
     cam.End2D()
-    if render.OverrideAlphaWriteEnable then
-        render.OverrideAlphaWriteEnable(false)
-    end
+    render.OverrideAlphaWriteEnable(false)
     render.PopRenderTarget()
 
     compassRingReady = true
@@ -1036,16 +1003,10 @@ end
 
 local function queueCompassRingRebuild()
     if compassRingReady or compassRingRebuildQueued then return end
-    if not hook or not isfunction(hook.Add) then
-        compassRingUnavailable = true
-        return
-    end
 
     compassRingRebuildQueued = true
     hook.Add("PostRender", COMPASS_RING_REBUILD_HOOK, function()
-        if isfunction(hook.Remove) then
-            hook.Remove("PostRender", COMPASS_RING_REBUILD_HOOK)
-        end
+        hook.Remove("PostRender", COMPASS_RING_REBUILD_HOOK)
         rebuildCompassRingMaterial()
     end)
 end
@@ -1053,29 +1014,18 @@ end
 local function ensureCompassRingMaterial()
     if compassRingReady then return compassRingMaterial end
     if compassRingUnavailable then return end
-    if not (isfunction(GetRenderTargetEx) or isfunction(GetRenderTarget))
-        or not isfunction(CreateMaterial)
-        or not hook
-        or not isfunction(hook.Add) then
-        compassRingUnavailable = true
-        return
-    end
 
     if not compassRingRenderTarget then
-        if isfunction(GetRenderTargetEx) then
-            compassRingRenderTarget = GetRenderTargetEx(
-                COMPASS_RING_RT_NAME,
-                COMPASS_RING_RT_SIZE,
-                COMPASS_RING_RT_SIZE,
-                RT_SIZE_NO_CHANGE,
-                MATERIAL_RT_DEPTH_NONE,
-                0,
-                0,
-                IMAGE_FORMAT_RGBA8888
-            )
-        else
-            compassRingRenderTarget = GetRenderTarget(COMPASS_RING_RT_NAME, COMPASS_RING_RT_SIZE, COMPASS_RING_RT_SIZE, false)
-        end
+        compassRingRenderTarget = GetRenderTargetEx(
+            COMPASS_RING_RT_NAME,
+            COMPASS_RING_RT_SIZE,
+            COMPASS_RING_RT_SIZE,
+            RT_SIZE_NO_CHANGE,
+            MATERIAL_RT_DEPTH_NONE,
+            0,
+            0,
+            IMAGE_FORMAT_RGBA8888
+        )
         if not compassRingRenderTarget then
             compassRingUnavailable = true
             return

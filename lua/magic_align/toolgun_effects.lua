@@ -15,7 +15,6 @@ local RESET_SOUND = "ui/buttonclickrelease.wav"
 local FAIL_SOUND = "ui/buttonrollover.wav"
 local SOUND_VOLUME_CVAR = "magic_align_toolgun_sound_volume"
 local MARK_LIFETIME = 0.5
-local PATCH_VERSION = 1
 local COLOR_DEFAULT = 0
 local COLOR_FAIL = 1
 
@@ -38,7 +37,7 @@ local CONFIG = {
 }
 
 local PRESETS = {
-    click = { sound = CLICK_SOUND, hit = true },
+    click = { sound = CLICK_SOUND, hit = true, weaponAnim = false },
     commit = { sound = COMMIT_SOUND, hit = false, special = true, color = "commit" },
     reset = { sound = RESET_SOUND, hit = false, special = true, failColor = true },
     fail = { sound = FAIL_SOUND, hit = false, failColor = true, weaponAnim = false }
@@ -53,27 +52,22 @@ local ALIASES = {
     noEffect = "fail"
 }
 
-local pendingActions = toolgunEffects.pendingActions or setmetatable({}, { __mode = "k" })
-toolgunEffects.pendingActions = pendingActions
 local activeFeedback = toolgunEffects.activeFeedback or setmetatable({}, { __mode = "k" })
 toolgunEffects.activeFeedback = activeFeedback
 toolgunEffects.muzzleCache = toolgunEffects.muzzleCache or {}
 
 local function now()
-    return isfunction(RealTime) and RealTime() or CurTime()
+    return RealTime()
 end
 
 local function finiteVector(value)
-    if M.IsFiniteVector then return M.IsFiniteVector(value) end
-    return isvector(value)
+    return M.IsFiniteVector(value)
 end
 
 local function effectVector(value)
     if not finiteVector(value) then return end
-    if M.ToVector then
-        local converted = M.ToVector(value)
-        if isvector(converted) then return converted end
-    end
+    local converted = M.ToVector(value)
+    if isvector(converted) then return converted end
 
     return Vector(value.x, value.y, value.z)
 end
@@ -123,7 +117,7 @@ local function toolOwner(tool)
         if IsValid(owner) then return owner end
     end
 
-    if CLIENT and isfunction(LocalPlayer) then
+    if CLIENT then
         local ply = LocalPlayer()
         if IsValid(ply) then return ply end
     end
@@ -132,7 +126,7 @@ end
 local function weaponFor(tool, fallbackWeapon)
     if IsValid(fallbackWeapon) and fallbackWeapon:GetClass() == "gmod_tool" then return fallbackWeapon end
     if IsValid(tool) and tool:GetClass() == "gmod_tool" then return tool end
-    if not tool or not (M.IsMagicAlignToolMode and M.IsMagicAlignToolMode(tool.Mode)) then return end
+    if not tool or not M.IsMagicAlignToolMode(tool.Mode) then return end
 
     if isfunction(tool.GetWeapon) then
         local weapon = tool:GetWeapon()
@@ -142,19 +136,82 @@ local function weaponFor(tool, fallbackWeapon)
     return activeToolWeapon(toolOwner(tool))
 end
 
-local function activeMagicAlignToolForWeapon(weapon)
-    if not IsValid(weapon) or weapon:GetClass() ~= "gmod_tool" or not isfunction(weapon.GetOwner) then return end
+local function storedToolgun()
+    if not weapons or not isfunction(weapons.GetStored) then return end
 
-    local owner = weapon:GetOwner()
-    if not IsValid(owner) or not M.GetActiveMagicAlignTool then return end
-
-    local getter = M.GetActiveMagicAlignFamilyTool or M.GetActiveMagicAlignTool
-    local tool, activeWeapon
-    if getter then
-        tool, activeWeapon = getter(owner)
-    end
-    return activeWeapon == weapon and tool or nil
+    local toolgun = weapons.GetStored("gmod_tool")
+    if istable(toolgun) then return toolgun end
 end
+
+-- Hot-reload cleanup for versions that replaced gmod_tool:DoShootEffect globally.
+local function previousMagicAlignPatch(callback, owner)
+    if not isfunction(callback) then return false end
+    if owner and callback == owner._magicAlignToolgunEffectsPatchedDoShootEffect then return true end
+
+    local callbacks = toolgunEffects.patchedDoShootEffectCallbacks
+    if istable(callbacks) and callbacks[callback] then return true end
+
+    if not debug or not isfunction(debug.getinfo) then return false end
+
+    local info = debug.getinfo(callback, "S")
+    local source = info and tostring(info.source or "") or ""
+    return source:find("magic_align/toolgun_effects.lua", 1, true) ~= nil
+        or source:find("magic_align\\toolgun_effects.lua", 1, true) ~= nil
+end
+
+local function savedOriginalDoShootEffect(owner)
+    local saved = owner and owner._magicAlignToolgunEffectsOriginalDoShootEffect
+    if isfunction(saved) and not previousMagicAlignPatch(saved, owner) then return saved end
+
+    local chain = toolgunEffects.originalDoShootEffects
+    if istable(chain) then
+        for i = 1, #chain do
+            saved = chain[i]
+            if isfunction(saved) and not previousMagicAlignPatch(saved, owner) then return saved end
+        end
+    end
+
+    saved = toolgunEffects.originalDoShootEffect
+    if isfunction(saved) and not previousMagicAlignPatch(saved, owner) then return saved end
+end
+
+local function restorePreviousPatch(owner)
+    if not owner or not previousMagicAlignPatch(owner.DoShootEffect, owner) then return false end
+
+    local original = savedOriginalDoShootEffect(owner)
+    if not isfunction(original) then return false end
+
+    owner.DoShootEffect = original
+    owner._magicAlignToolgunEffectsOriginalDoShootEffect = nil
+    owner._magicAlignToolgunEffectsPatchedDoShootEffect = nil
+    owner._magicAlignToolgunEffectsInstalled = nil
+    return true
+end
+
+local function removePreviousGlobalPatch()
+    restorePreviousPatch(storedToolgun())
+
+    if ents and isfunction(ents.FindByClass) then
+        for _, weapon in ipairs(ents.FindByClass("gmod_tool")) do
+            restorePreviousPatch(weapon)
+        end
+    end
+
+    if hook then
+        hook.Remove("OnEntityCreated", "MagicAlignToolgunEffectsInstallWeapon")
+        hook.Remove("Initialize", "MagicAlignToolgunEffectsInstall")
+    end
+
+    toolgunEffects.pendingActions = nil
+    toolgunEffects.originalCallDepth = nil
+    toolgunEffects.patchedDoShootEffectCallbacks = nil
+    toolgunEffects.originalDoShootEffects = nil
+    toolgunEffects.originalDoShootEffect = nil
+    toolgunEffects.Install = nil
+    toolgunEffects.weaponLifecycleHookVersion = nil
+end
+
+removePreviousGlobalPatch()
 
 local function effectKind(kind)
     kind = ALIASES[kind] or kind
@@ -221,13 +278,6 @@ function toolgunEffects.ActiveFeedback(weapon)
     return feedback, time
 end
 
-local function consumeAction(weapon)
-    local marker = pendingActions[weapon]
-    pendingActions[weapon] = nil
-    if not marker or (tonumber(marker.expires) and marker.expires < now()) then return end
-    return marker
-end
-
 local function drawEffectsEnabled()
     return not GetConVarNumber or GetConVarNumber("gmod_drawtooleffects") ~= 0
 end
@@ -248,7 +298,7 @@ end
 
 local function emitFeedbackSound(weapon, soundPath)
     local volume = CONFIG.soundVolume
-    local cvar = GetConVar and GetConVar(SOUND_VOLUME_CVAR) or nil
+    local cvar = GetConVar(SOUND_VOLUME_CVAR)
     if cvar and isfunction(cvar.GetFloat) then
         volume = cvar:GetFloat()
     end
@@ -360,12 +410,6 @@ local function playFeedbackForWeapon(weapon, marker, hitPos, hitNormal, entity, 
     return true
 end
 
-local function markFeedback(kind, weapon)
-    if not IsValid(weapon) then return false end
-    pendingActions[weapon] = markerFor(kind)
-    return true
-end
-
 local function traceParts(trace)
     return trace and trace.HitPos,
         trace and trace.HitNormal,
@@ -374,19 +418,17 @@ local function traceParts(trace)
 end
 
 function toolgunEffects.DispatchFeedback(kind, tool, trace, weaponOverride, options)
+    if not CLIENT then return false end
+
     local weapon = weaponFor(tool, weaponOverride)
     if not IsValid(weapon) then return false end
-
-    if not CLIENT or (options and options.direct == false) then
-        return markFeedback(kind, weapon)
-    end
 
     local hitPos, hitNormal, entity, physBone = traceParts(trace)
     return playFeedbackForWeapon(weapon, markerFor(kind), hitPos, hitNormal, entity, physBone, true)
 end
 
 function toolgunEffects.MarkFeedback(kind, tool, weaponOverride)
-    return toolgunEffects.DispatchFeedback(kind, tool, nil, weaponOverride, { direct = false })
+    return toolgunEffects.DispatchFeedback(kind, tool, nil, weaponOverride)
 end
 
 function toolgunEffects.PlayFeedback(kind, tool, trace, weaponOverride)
@@ -407,48 +449,6 @@ end
 
 function toolgunEffects.PlayNoEffect(tool)
     return toolgunEffects.PlayFeedback("fail", tool)
-end
-
-local function patchedDoShootEffect(self, hitPos, hitNormal, entity, physBone, firstTimePredicted)
-    local marker = consumeAction(self)
-    if marker then
-        return toolgunEffects.DoShootEffect(self, hitPos, hitNormal, entity, physBone, firstTimePredicted, marker)
-    end
-
-    if activeMagicAlignToolForWeapon(self) then
-        if SERVER and game.SinglePlayer() then return true end
-        return true
-    end
-
-    local original = self._magicAlignToolgunEffectsOriginalDoShootEffect or toolgunEffects.originalDoShootEffect
-    if isfunction(original) then return original(self, hitPos, hitNormal, entity, physBone, firstTimePredicted) end
-end
-
-function toolgunEffects.Install()
-    if not weapons or not isfunction(weapons.GetStored) then return false end
-
-    local toolgun = weapons.GetStored("gmod_tool")
-    if not istable(toolgun) then return false end
-
-    local original = toolgun._magicAlignToolgunEffectsOriginalDoShootEffect or toolgunEffects.originalDoShootEffect or toolgun.DoShootEffect
-    if original == patchedDoShootEffect then return false end
-
-    toolgunEffects.originalDoShootEffect = original
-    toolgun._magicAlignToolgunEffectsOriginalDoShootEffect = original
-    toolgun.DoShootEffect = patchedDoShootEffect
-    toolgun._magicAlignToolgunEffectsInstalled = PATCH_VERSION
-
-    if ents and isfunction(ents.FindByClass) then
-        for _, weapon in ipairs(ents.FindByClass("gmod_tool")) do
-            if IsValid(weapon) then
-                weapon._magicAlignToolgunEffectsOriginalDoShootEffect = original
-                weapon.DoShootEffect = patchedDoShootEffect
-                weapon._magicAlignToolgunEffectsInstalled = PATCH_VERSION
-            end
-        end
-    end
-
-    return true
 end
 
 if CLIENT then
@@ -488,13 +488,8 @@ if CLIENT then
     hook.Remove("PostDrawViewModel", "MagicAlignToolgunMuzzleCache")
     hook.Add("PostDrawViewModel", "MagicAlignToolgunMuzzleCache", function(viewModel, ply, weapon)
         if not IsValid(viewModel) or not IsValid(ply) or not IsValid(weapon) or weapon:GetClass() ~= "gmod_tool" then return end
-        if not M.GetActiveMagicAlignTool then return end
 
-        local getter = M.GetActiveMagicAlignFamilyTool or M.GetActiveMagicAlignTool
-        local _, activeWeapon
-        if getter then
-            _, activeWeapon = getter(ply)
-        end
+        local _, activeWeapon = M.GetActiveMagicAlignFamilyTool(ply)
         if activeWeapon ~= weapon then return end
 
         local pos = attachmentPosition(viewModel, 1)
@@ -577,12 +572,6 @@ if CLIENT then
     end
 
     effects.Register(muzzleRing, MUZZLE_EFFECT)
-end
-
-if not toolgunEffects.Install() and hook then
-    hook.Add("Initialize", "MagicAlignToolgunEffectsInstall", function()
-        if toolgunEffects.Install() then hook.Remove("Initialize", "MagicAlignToolgunEffectsInstall") end
-    end)
 end
 
 return toolgunEffects

@@ -162,8 +162,7 @@ function M.IsWorldTarget(ent)
         return ent:IsWorld()
     end
 
-    local world = game and game.GetWorld and game.GetWorld() or nil
-    return world ~= nil and ent == world
+    return ent == game.GetWorld()
 end
 
 function M.HasTargetEntity(ent)
@@ -279,7 +278,6 @@ end
 
 local function isStoredScriptedEntity(class)
     if not isstring(class) or class == "" then return false end
-    if not scripted_ents or not isfunction(scripted_ents.GetStored) then return false end
 
     local stored = scripted_ents.GetStored(class)
     return istable(stored) and stored.t ~= nil
@@ -288,7 +286,7 @@ end
 function M.IsProp(ent)
     if not IsValid(ent) then return false end
     if ent:IsWorld() or ent:IsPlayer() or ent:IsNPC() or ent:IsWeapon() then return false end
-    if M.IsPrimitive and M.IsPrimitive(ent) then return true end
+    if M.IsPrimitive(ent) then return true end
 
     local class = ent:GetClass()
     if string.StartWith(class, "prop_") then return true end
@@ -459,15 +457,13 @@ local function findSizeHandler(ent)
         end
     end
 
-    if ents and isfunction(ents.FindByClass) then
-        local handlers = ents.FindByClass("sizehandler")
-        for i = 1, #handlers do
-            local child = handlers[i]
-            if IsValid(child)
-                and isfunction(child.GetParent)
-                and child:GetParent() == ent then
-                return child
-            end
+    local handlers = ents.FindByClass("sizehandler")
+    for i = 1, #handlers do
+        local child = handlers[i]
+        if IsValid(child)
+            and isfunction(child.GetParent)
+            and child:GetParent() == ent then
+            return child
         end
     end
 end
@@ -580,13 +576,13 @@ function M.GetLocalBounds(ent)
 end
 
 function M.RefreshState(session)
-    local mirrorActive = M.IsMirrorMode and M.IsMirrorMode(session)
+    local mirrorActive = M.IsMirrorMode(session)
 
     if not IsValid(session.prop1) then
         session.state = "source_prop"
-    elseif mirrorActive and not (M.ResolveMirrorState and M.ResolveMirrorState(
+    elseif mirrorActive and not (M.ResolveMirrorState(
         session.mirror,
-        M.GetMirrorStateCache and M.GetMirrorStateCache(session) or nil,
+        M.GetMirrorStateCache(session),
         { activeSpace = session.activeSpace }
     ).valid) then
         session.state = "mirror_points"
@@ -652,7 +648,7 @@ function M.ResolvePointReference(point, fallbackEnt)
 end
 
 local function pointCacheFrame()
-    return isfunction(FrameNumber) and FrameNumber() or nil
+    return FrameNumber()
 end
 
 local function pointCacheSetVec(out, value)
@@ -678,23 +674,11 @@ end
 local function pointEntityMirrorAxis(ent)
     if not IsValid(ent) then return M.ENTITY_MIRROR_NONE or 0 end
 
-    if M.EntityMirror then
-        if M.EntityMirror.AxisForEntity then
-            return M.EntityMirror.AxisForEntity(ent)
-        elseif M.EntityMirror.GetAxis then
-            return M.EntityMirror.GetAxis(ent)
-        end
-    end
-
-    return M.ENTITY_MIRROR_NONE or 0
+    return M.EntityMirror.AxisForEntity(ent)
 end
 
 local function mirrorAxisSigns(axis)
-    if M.EntityMirror and M.EntityMirror.AxisSigns then
-        return M.EntityMirror.AxisSigns(axis)
-    end
-
-    return 1, 1, 1
+    return M.EntityMirror.AxisSigns(axis)
 end
 
 local function pointCacheEntPose(entry, prefix, ent)
@@ -945,7 +929,7 @@ function M.IsPointReferenceValid(point, fallbackEnt, options)
     end
 
     if not IsValid(ent) then return false end
-    if options.requireProp == true and M.IsProp and not M.IsProp(ent) then return false end
+    if options.requireProp == true and not M.IsProp(ent) then return false end
 
     return true
 end
@@ -1014,9 +998,7 @@ function M.ResolvePointWorldNormal(point, fallbackEnt, worldPos)
 
     if not IsValid(ent) then return end
 
-    local worldNormal = M.EntityMirror and M.EntityMirror.LocalVectorToWorld
-        and M.EntityMirror.LocalVectorToWorld(ent, normal)
-        or nil
+    local worldNormal = M.EntityMirror.LocalVectorToWorld(ent, normal)
     if isvector(worldNormal) then
         return M.NormalizeVectorPrecise(worldNormal, M.COMPUTE_VECTOR_EPSILON_SQR)
     end
@@ -1041,9 +1023,7 @@ function M.ResolvePointPositionInReference(point, fallbackEnt, referenceEnt)
     end
 
     if IsValid(referenceEnt) then
-        if M.EntityMirror and M.EntityMirror.WorldPointToLocal then
-            return M.EntityMirror.WorldPointToLocal(referenceEnt, worldPos)
-        end
+        return M.EntityMirror.WorldPointToLocal(referenceEnt, worldPos)
     end
 end
 
@@ -1060,9 +1040,7 @@ function M.ResolvePointNormalInReference(point, fallbackEnt, referenceEnt, world
 
     if not IsValid(referenceEnt) then return end
 
-    local localNormal = M.EntityMirror and M.EntityMirror.WorldVectorToLocal
-        and M.EntityMirror.WorldVectorToLocal(referenceEnt, worldNormal)
-        or nil
+    local localNormal = M.EntityMirror.WorldVectorToLocal(referenceEnt, worldNormal)
     if isvector(localNormal) then
         return M.NormalizeVectorPrecise(localNormal, M.COMPUTE_VECTOR_EPSILON_SQR)
     end
@@ -1176,8 +1154,7 @@ local function transformPointSetForEntity(ent, points, scratch)
     points = istable(points) and points or {}
 
     local axis = pointEntityMirrorAxis(ent)
-    if axis == (M.ENTITY_MIRROR_NONE or 0)
-        or not (M.EntityMirror and M.EntityMirror.ApplyAxisToVector) then
+    if axis == (M.ENTITY_MIRROR_NONE or 0) then
         return points, axis
     end
 
@@ -1635,9 +1612,9 @@ local function restoreSnapshotPoint(point, fallbackEnt)
         copy.world = true
     end
 
-    if istable(point.reference) and M.SetPointReference then
+    if istable(point.reference) then
         M.SetPointReference(copy, refEnt)
-    elseif point.world == true and M.SetPointReference then
+    elseif point.world == true then
         M.SetPointReference(copy, M.WORLD_TARGET)
     end
 
@@ -1740,7 +1717,7 @@ end
 
 local function validNonMirrorSpace(space)
     space = validUiSpace(space)
-    if space and not (M.IsMirrorMode and M.IsMirrorMode(space)) and space ~= M.MIRROR_SPACE then
+    if space and not M.IsMirrorMode(space) and space ~= M.MIRROR_SPACE then
         return space
     end
 end
@@ -1758,7 +1735,7 @@ function M.ResolveSnapshotRestoreSpace(snapshot, currentSpace)
         or validNonMirrorSpace(snapshot.lastNonMirrorTab)
         or validNonMirrorSpace(selected)
 
-    if (M.IsMirrorMode and M.IsMirrorMode(currentSpace)) or selected == M.MIRROR_SPACE then
+    if M.IsMirrorMode(currentSpace) or selected == M.MIRROR_SPACE then
         return lastNonMirror or "points"
     end
 
@@ -1780,11 +1757,9 @@ function M.CreateSessionSnapshot(session, options)
         options.actionType or options.lastActionType,
         options.isMirrorAction
     )
-    local mirrorCache = M.ResolveMirrorState
-        and M.ResolveMirrorState(mirror, M.GetMirrorStateCache and M.GetMirrorStateCache(session) or nil, {
-            activeSpace = activeSpace
-        })
-        or nil
+    local mirrorCache = M.ResolveMirrorState(mirror, M.GetMirrorStateCache(session), {
+        activeSpace = activeSpace
+    })
 
     local linked = {}
     for i = 1, #(session.linked or {}) do
@@ -1814,7 +1789,7 @@ function M.CreateSessionSnapshot(session, options)
         selectedWorldPointIndex = tonumber(session.selectedWorldPointIndex),
         mirror = {
             enabled = mirror.enabled == true,
-            activeTab = M.IsMirrorMode and M.IsMirrorMode(activeSpace) or activeSpace == M.MIRROR_SPACE,
+            activeTab = M.IsMirrorMode(activeSpace) or activeSpace == M.MIRROR_SPACE,
             points = mirrorPoints,
             classification = mirrorCache and mirrorCache.label or nil,
             entityMirrorEnabled = options.entityMirrorEnabled == true

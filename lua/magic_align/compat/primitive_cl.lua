@@ -63,16 +63,7 @@ local function angleApprox(a, b, eps)
 end
 
 local function vectorApprox(a, b, eps)
-    if isfunction(M.VectorApprox) then
-        return M.VectorApprox(a, b, eps)
-    end
-
-    if not isvector(a) or not isvector(b) then return false end
-
-    eps = tonumber(eps) or M.UI_COMPARE_EPSILON or 0.0001
-    return math.abs(a.x - b.x) <= eps
-        and math.abs(a.y - b.y) <= eps
-        and math.abs(a.z - b.z) <= eps
+    return M.VectorApprox(a, b, eps)
 end
 
 local function invalidateGhostSyncCache(ghost)
@@ -209,11 +200,6 @@ local function ensureGhostEntity(entry)
     end
 
     removeGhostEntity(entry)
-
-    if not ents or not isfunction(ents.CreateClientside) then
-        entry.failed = true
-        return
-    end
 
     ghost = ents.CreateClientside(entry.ent:GetClass(), RENDERGROUP_TRANSLUCENT)
     if not IsValid(ghost) then
@@ -394,9 +380,7 @@ local function syncGhostEntity(entry)
         ghost._magicAlignNeedsBoneSetup = false
     end
 
-    if M.EntityMirror and M.EntityMirror.ApplyVisualPreview then
-        M.EntityMirror.ApplyVisualPreview(ghost, entry.entityMirrorAxis or M.ENTITY_MIRROR_NONE)
-    end
+    M.EntityMirror.ApplyVisualPreview(ghost, entry.entityMirrorAxis or M.ENTITY_MIRROR_NONE)
 
     ghost:SetNoDraw(false)
 

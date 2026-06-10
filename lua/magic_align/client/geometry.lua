@@ -44,11 +44,11 @@ local function entityBaseAng(ent)
 end
 
 function geometry.isWorldTarget(ent)
-    return M.IsWorldTarget and M.IsWorldTarget(ent) or false
+    return M.IsWorldTarget(ent)
 end
 
 function geometry.hasTargetEntity(ent)
-    return M.HasTargetEntity and M.HasTargetEntity(ent) or geometry.isWorldTarget(ent) or IsValid(ent)
+    return M.HasTargetEntity(ent)
 end
 
 function geometry.traceHitsWorld(tr)
@@ -76,9 +76,8 @@ function geometry.worldPosFromLocalPoint(ent, localPos)
         return copyVec(localPos)
     end
 
-    if M.EntityMirror and M.EntityMirror.LocalPointToWorld then
-        return M.EntityMirror.LocalPointToWorld(ent, localPos)
-    end
+    local mirrored = M.EntityMirror.LocalPointToWorld(ent, localPos)
+    if isvector(mirrored) then return mirrored end
 
     local pos = entityBasePos(ent)
     local ang = entityBaseAng(ent)
@@ -94,9 +93,8 @@ function geometry.localPointFromWorldPos(ent, worldPos)
         return copyVec(worldPos)
     end
 
-    if M.EntityMirror and M.EntityMirror.WorldPointToLocal then
-        return M.EntityMirror.WorldPointToLocal(ent, worldPos)
-    end
+    local mirrored = M.EntityMirror.WorldPointToLocal(ent, worldPos)
+    if isvector(mirrored) then return mirrored end
 
     local pos = entityBasePos(ent)
     local ang = entityBaseAng(ent)
@@ -114,9 +112,8 @@ function geometry.localNormalFromWorld(ent, worldPos, worldNormal)
         return copyVec(normal)
     end
 
-    if M.EntityMirror and M.EntityMirror.WorldVectorToLocal then
-        return normalizedVec(M.EntityMirror.WorldVectorToLocal(ent, normal))
-    end
+    local mirrored = normalizedVec(M.EntityMirror.WorldVectorToLocal(ent, normal))
+    if mirrored then return mirrored end
 
     local localPos = geometry.localPointFromWorldPos(ent, worldPoint)
     local pos = entityBasePos(ent)
@@ -139,9 +136,8 @@ function geometry.worldNormalFromLocal(ent, localPos, localNormal)
 
     if not isvector(localPos) then return end
 
-    if M.EntityMirror and M.EntityMirror.LocalVectorToWorld then
-        return normalizedVec(M.EntityMirror.LocalVectorToWorld(ent, normal))
-    end
+    local mirrored = normalizedVec(M.EntityMirror.LocalVectorToWorld(ent, normal))
+    if mirrored then return mirrored end
 
     local worldPos = geometry.worldPosFromLocalPoint(ent, localPos)
     local pos = entityBasePos(ent)
@@ -173,7 +169,7 @@ function geometry.pointFromCandidate(candidate, keepReference)
         point.world = true
     end
 
-    if keepReference and M.SetPointReference then
+    if keepReference then
         M.SetPointReference(point, candidate.ent)
     end
 

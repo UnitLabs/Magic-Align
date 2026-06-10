@@ -33,13 +33,10 @@ local TOOL_METHODS = {
 }
 
 local function now()
-    if isfunction(SysTime) then return SysTime() end
-    if isfunction(RealTime) then return RealTime() end
-    return os.clock()
+    return SysTime()
 end
 
 local function memoryKb()
-    if not isfunction(collectgarbage) then return 0 end
     return collectgarbage("count") or 0
 end
 
@@ -88,25 +85,20 @@ local function safeName(value)
 end
 
 local function currentHookFunction(eventName, identifier)
-    if not hook or not isfunction(hook.GetTable) then return nil end
-
     local hooks = hook.GetTable()
     local bucket = hooks and hooks[eventName]
     return bucket and bucket[identifier] or nil
 end
 
 local function getControlTable(controlName)
-    if vgui and isfunction(vgui.GetControlTable) then
-        return vgui.GetControlTable(controlName)
-    end
+    local control = vgui.GetControlTable(controlName)
+    if control then return control end
 
-    if derma and isfunction(derma.GetControlList) then
-        local controls = derma.GetControlList()
-        local entry = controls and controls[controlName]
+    local controls = derma.GetControlList()
+    local entry = controls and controls[controlName]
 
-        if istable(entry) then
-            return entry.Table or entry.Base
-        end
+    if istable(entry) then
+        return entry.Table or entry.Base
     end
 end
 
@@ -298,10 +290,8 @@ function Profiler:WrapHookFunction(eventName, identifier, fn)
 
     self.restoreStack[#self.restoreStack + 1] = function()
         if currentHookFunction(eventName, identifier) == wrapper then
-            local add = self.originalHookAdd or (hook and hook.Add)
-            if isfunction(add) then
-                add(eventName, identifier, fn)
-            end
+            local add = self.originalHookAdd or hook.Add
+            add(eventName, identifier, fn)
         end
     end
 
@@ -309,8 +299,6 @@ function Profiler:WrapHookFunction(eventName, identifier, fn)
 end
 
 function Profiler:WrapExistingHooks()
-    if not hook or not isfunction(hook.GetTable) then return end
-
     local hooks = hook.GetTable()
     if not istable(hooks) then return end
 
@@ -331,7 +319,7 @@ function Profiler:WrapExistingHooks()
 end
 
 function Profiler:InstallHookAddWrapper()
-    if self.hookAddWrapper or not hook or not isfunction(hook.Add) then return end
+    if self.hookAddWrapper then return end
 
     local original = hook.Add
     local profiler = self
@@ -349,7 +337,7 @@ function Profiler:InstallHookAddWrapper()
     hook.Add = wrapper
 
     self.restoreStack[#self.restoreStack + 1] = function()
-        if hook and hook.Add == wrapper then
+        if hook.Add == wrapper then
             hook.Add = original
         end
     end
@@ -370,7 +358,7 @@ function Profiler:WrapNetReceiver(name, fn)
     local key = string.lower(tostring(name or ""))
 
     self.restoreStack[#self.restoreStack + 1] = function()
-        if net and istable(net.Receivers) and net.Receivers[key] == wrapper then
+        if istable(net.Receivers) and net.Receivers[key] == wrapper then
             net.Receivers[key] = fn
         end
     end
@@ -379,7 +367,7 @@ function Profiler:WrapNetReceiver(name, fn)
 end
 
 function Profiler:WrapExistingNetReceivers()
-    if not net or not istable(net.Receivers) then return end
+    if not istable(net.Receivers) then return end
 
     for name, fn in pairs(net.Receivers) do
         local wrapper = self:WrapNetReceiver(name, fn)
@@ -391,7 +379,7 @@ function Profiler:WrapExistingNetReceivers()
 end
 
 function Profiler:InstallNetReceiveWrapper()
-    if self.netReceiveWrapper or not net or not isfunction(net.Receive) then return end
+    if self.netReceiveWrapper then return end
 
     local original = net.Receive
     local profiler = self
@@ -409,7 +397,7 @@ function Profiler:InstallNetReceiveWrapper()
     net.Receive = wrapper
 
     self.restoreStack[#self.restoreStack + 1] = function()
-        if net and net.Receive == wrapper then
+        if net.Receive == wrapper then
             net.Receive = original
         end
     end
@@ -428,20 +416,18 @@ function Profiler:ToolCandidates()
     local seen = {}
 
     local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
-    if isfunction(LocalPlayer) and isfunction(getter) then
+    if isfunction(getter) then
         local ply = LocalPlayer()
         local tool = IsValid(ply) and getter(ply) or nil
         self:AddToolCandidate(candidates, seen, tool)
     end
 
-    if weapons and isfunction(weapons.GetStored) then
-        local stored = weapons.GetStored("gmod_tool")
-        local tools = istable(stored) and stored.Tool or nil
+    local stored = weapons.GetStored("gmod_tool")
+    local tools = istable(stored) and stored.Tool or nil
 
-        if istable(tools) then
-            self:AddToolCandidate(candidates, seen, tools.magic_align)
-            self:AddToolCandidate(candidates, seen, tools["magic_align"])
-        end
+    if istable(tools) then
+        self:AddToolCandidate(candidates, seen, tools.magic_align)
+        self:AddToolCandidate(candidates, seen, tools["magic_align"])
     end
 
     return candidates
@@ -634,9 +620,7 @@ function Profiler:Restore()
         end
     end
 
-    if hook and isfunction(hook.Remove) then
-        hook.Remove("Think", FRAME_HOOK)
-    end
+    hook.Remove("Think", FRAME_HOOK)
 
     self.restoreStack = {}
     self.wrapperLookup = {}

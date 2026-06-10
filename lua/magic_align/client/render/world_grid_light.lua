@@ -22,14 +22,7 @@ local CONFIG = {
 }
 
 local function now()
-    if isfunction(RealTime) then
-        return RealTime()
-    end
-    if isfunction(CurTime) then
-        return CurTime()
-    end
-
-    return 0
+    return RealTime()
 end
 
 local function enabled()
@@ -116,7 +109,7 @@ function client.worldGridRender.updateLightBlend(state, candidate)
             probe.lastSamplePos = pos
             probe.lastSampleNormal = normal
             probe.lastSampleOk = false
-            if pos and isfunction(render.GetLightColor) then
+            if pos then
                 local ok, lightColor = pcall(render.GetLightColor, pos)
                 local measuredLuma = ok and luma(lightColor) or nil
                 if measuredLuma then

@@ -8,7 +8,9 @@ local ENABLE_CVAR = "magic_align_highlight_context_menu"
 local MIRROR_DISABLE_ANIMATION_CVAR = "magic_mirror_disable_menu_animation"
 local SCAN_ID = "MagicAlignMenuEntryLetterOverlay"
 local TOGGLE_CALLBACK_ID = SCAN_ID .. "Toggle"
-local OVERLAY_VERSION = 11
+local OVERLAY_VERSION = 12
+local PANEL_MANAGER_FIELD = "MagicAlignMenuEntryDecorators"
+local DECORATOR_ID = "magic_align"
 local DEFAULT_CATEGORY = (TOOL and type(TOOL.Category) == "string" and TOOL.Category ~= "" and TOOL.Category)
     or "Construction"
 local colors = client.colors or {}
@@ -57,6 +59,22 @@ local TOOL_ENTRIES = {
 local TOOL_ENTRY_BY_ID = {}
 for i = 1, #TOOL_ENTRIES do
     TOOL_ENTRY_BY_ID[TOOL_ENTRIES[i].id] = TOOL_ENTRIES[i]
+end
+
+local function panelMenuEntryManager(panel)
+    return IsValid(panel) and panel[PANEL_MANAGER_FIELD] or nil
+end
+
+local function activePanelDecorator(panel)
+    local manager = panelMenuEntryManager(panel)
+    local decorators = manager and manager.decorators
+    return decorators and decorators[DECORATOR_ID] or nil
+end
+
+local function activePanelSpec(panel)
+    local decorator = activePanelDecorator(panel)
+    local specId = decorator and decorator.specId
+    return specId and TOOL_ENTRY_BY_ID[specId] or nil
 end
 
 local MIRROR_RT_PAD = 2
@@ -140,9 +158,9 @@ local function entryMatchesText(spec, text, raw)
 end
 
 local function matchingEntrySpec(panel)
-    if not IsValid(panel) or panel.MagicAlignMenuEntryOverlayPart then return nil end
+    if not IsValid(panel) then return nil end
 
-    local installed = panel.MagicAlignMenuEntrySpecId and TOOL_ENTRY_BY_ID[panel.MagicAlignMenuEntrySpecId]
+    local installed = activePanelSpec(panel)
     if installed then return installed end
 
     for i = 1, #TOOL_ENTRIES do
@@ -206,16 +224,20 @@ local function overlayTextForSpec(spec)
     return spec.mirror and spec.mirror.prefix or spec.text
 end
 
-local function restorePanelText(panel)
-    if panel.MagicAlignMenuEntryOriginalText ~= nil and panel.SetText then
-        panel:SetText(panel.MagicAlignMenuEntryOriginalText)
-    end
+local removeOverlay
 
-    panel.MagicAlignMenuEntryOriginalText = nil
-end
-
-local function removeOverlay(panel)
+local function clearLegacyOverlayState(panel)
     if not IsValid(panel) then return end
+
+    local hasLegacyState = panel.MagicAlignMenuEntryOverlay
+        or panel.MagicAlignMenuEntryOverlayVersion
+        or panel.MagicAlignMenuEntryWrappedClick
+        or panel.MagicAlignMenuEntryOriginalText ~= nil
+        or panel.MagicAlignMenuMirrorAnim ~= nil
+        or panel.MagicAlignMenuMirrorAnimRequested ~= nil
+        or panel.MagicAlignMenuEntryClips ~= nil
+        or panel.MagicAlignMenuEntryOverlayPart ~= nil
+    if not hasLegacyState then return end
 
     if panel.MagicAlignMenuEntryOverlay or panel.MagicAlignMenuEntryOverlayVersion then
         panel.PaintOver = panel.MagicAlignMenuEntryOldPaintOver
@@ -227,14 +249,17 @@ local function removeOverlay(panel)
         panel.OnCursorEntered = panel.MagicAlignMenuEntryOldOnCursorEntered
     end
 
-    local clips = panel.MagicAlignMenuEntryClips
-    for i = 1, clips and #clips or 0 do
-        if IsValid(clips[i]) then clips[i]:Remove() end
+    if panel.MagicAlignMenuEntryOriginalText ~= nil and panel.SetText then
+        panel:SetText(panel.MagicAlignMenuEntryOriginalText)
     end
 
-    restorePanelText(panel)
+    local clips = panel.MagicAlignMenuEntryClips
+    if type(clips) == "table" then
+        for i = 1, #clips do
+            if IsValid(clips[i]) then clips[i]:Remove() end
+        end
+    end
 
-    panel.MagicAlignMenuEntryClips = nil
     panel.MagicAlignMenuEntryOldPaintOver = nil
     panel.MagicAlignMenuEntryOldPerformLayout = nil
     panel.MagicAlignMenuEntryOldDoClick = nil
@@ -243,8 +268,11 @@ local function removeOverlay(panel)
     panel.MagicAlignMenuEntryOverlay = nil
     panel.MagicAlignMenuEntryOverlayVersion = nil
     panel.MagicAlignMenuEntrySpecId = nil
+    panel.MagicAlignMenuEntryOriginalText = nil
     panel.MagicAlignMenuMirrorAnim = nil
     panel.MagicAlignMenuMirrorAnimRequested = nil
+    panel.MagicAlignMenuEntryClips = nil
+    panel.MagicAlignMenuEntryOverlayPart = nil
 end
 
 local function colorKey(color)
@@ -365,12 +393,12 @@ local function drawIntoRenderTarget(rt, clearColor, callback)
     clearColor = clearColor or color_black
 
     render.PushRenderTarget(rt)
-    if render.OverrideAlphaWriteEnable then render.OverrideAlphaWriteEnable(true, true) end
+    render.OverrideAlphaWriteEnable(true, true)
     render.Clear(clearColor.r or 0, clearColor.g or 0, clearColor.b or 0, 0, true, true)
     cam.Start2D()
     callback()
     cam.End2D()
-    if render.OverrideAlphaWriteEnable then render.OverrideAlphaWriteEnable(false, false) end
+    render.OverrideAlphaWriteEnable(false, false)
     render.PopRenderTarget()
 end
 
@@ -487,20 +515,23 @@ local function mirrorSweepX(panel, wordWidth)
     local now = CurTime()
     wordWidth = math.max(math.floor(wordWidth + 0.5), 0)
 
-    local anim = panel.MagicAlignMenuMirrorAnim
+    local decorator = activePanelDecorator(panel)
+    if not decorator then return defaultMirrorSweepX(), false end
+
+    local anim = decorator.mirrorAnim
     if not anim or anim.wordWidth ~= wordWidth or not anim.defaultMirrored then
         anim = {}
         resetMirrorAnimation(anim, wordWidth)
-        panel.MagicAlignMenuMirrorAnim = anim
+        decorator.mirrorAnim = anim
     end
 
     if mirrorAnimationDisabled() then
-        panel.MagicAlignMenuMirrorAnimRequested = nil
+        decorator.mirrorAnimRequested = nil
         return resetMirrorAnimation(anim, wordWidth), false
     end
 
-    if panel.MagicAlignMenuMirrorAnimRequested then
-        panel.MagicAlignMenuMirrorAnimRequested = nil
+    if decorator.mirrorAnimRequested then
+        decorator.mirrorAnimRequested = nil
         if mirrorAnimationIdle(anim) then
             resetMirrorAnimation(anim, wordWidth)
             anim.idle = false
@@ -605,7 +636,7 @@ local function drawMirrorTextureClipped(panel, pair, material, x, y, height, fro
     to = math.floor(to + 0.5)
     if to <= from then return end
 
-    if not render.SetScissorRect or not panel.LocalToScreen then
+    if not panel.LocalToScreen then
         drawMirrorSegment(pair, material, x, y, height, from, to, flipped)
         return
     end
@@ -677,42 +708,228 @@ local function syncOverlay(panel, spec, width, height)
     drawMirrorWordOverlay(panel, spec, width, height, font, textX, enabled)
 end
 
-local function preparePanelText(panel, spec)
-    if panel.MagicAlignMenuEntryOriginalText ~= nil or not panel.SetText then return end
-
-    panel.MagicAlignMenuEntryOriginalText = (panel.GetText and panel:GetText()) or spec.text
-    panel:SetText("")
-end
-
 local function requestMirrorAnimation(panel)
+    local decorator = activePanelDecorator(panel)
+    if not decorator then return end
     if mirrorAnimationDisabled() then return end
-    if panel.MagicAlignMenuMirrorAnimRequested then return end
-    if not mirrorAnimationIdle(panel.MagicAlignMenuMirrorAnim) then return end
+    if decorator.mirrorAnimRequested then return end
+    if not mirrorAnimationIdle(decorator.mirrorAnim) then return end
 
-    panel.MagicAlignMenuMirrorAnimRequested = true
+    decorator.mirrorAnimRequested = true
 end
 
-local function wrapMirrorActions(panel)
-    if panel.MagicAlignMenuEntryWrappedClick then return end
+local function ensurePanelManager(panel)
+    local manager = panelMenuEntryManager(panel)
+    if manager then return manager end
 
-    panel.MagicAlignMenuEntryOldDoClick = panel.DoClick
-    panel.MagicAlignMenuEntryOldOnCursorEntered = panel.OnCursorEntered
-    panel.MagicAlignMenuEntryWrappedClick = true
-    panel.DoClick = function(self, ...)
-        requestMirrorAnimation(self)
+    manager = {
+        decorators = {},
+        order = {}
+    }
+    panel[PANEL_MANAGER_FIELD] = manager
+    return manager
+end
 
-        if self.MagicAlignMenuEntryOldDoClick then
-            return self.MagicAlignMenuEntryOldDoClick(self, ...)
+local function managerHasDecorators(manager)
+    return manager and manager.decorators and next(manager.decorators) ~= nil
+end
+
+local function addDecoratorOrder(manager, id)
+    local order = manager.order
+    for i = 1, #order do
+        if order[i] == id then return end
+    end
+
+    order[#order + 1] = id
+end
+
+local function removeDecoratorOrder(manager, id)
+    local order = manager.order
+    for i = #order, 1, -1 do
+        if order[i] == id then
+            table.remove(order, i)
+            return
+        end
+    end
+end
+
+local function decoratorsWantTextHidden(manager)
+    local decorators = manager and manager.decorators
+    for _, decorator in pairs(decorators or {}) do
+        if decorator.hideText then return true end
+    end
+
+    return false
+end
+
+local function decoratorsWantMirrorActions(manager)
+    local decorators = manager and manager.decorators
+    for _, decorator in pairs(decorators or {}) do
+        if decorator.mirrorActions then return true end
+    end
+
+    return false
+end
+
+local function restoreManagedPanelText(panel, manager)
+    if manager.textHidden and manager.originalText ~= nil and panel.SetText then
+        panel:SetText(manager.originalText)
+    end
+
+    manager.originalText = nil
+    manager.textHidden = nil
+end
+
+local function updateManagedPanelText(panel, manager)
+    if decoratorsWantTextHidden(manager) then
+        if manager.textHidden or not panel.SetText then return end
+
+        manager.originalText = (panel.GetText and panel:GetText()) or ""
+        panel:SetText("")
+        manager.textHidden = true
+        return
+    end
+
+    restoreManagedPanelText(panel, manager)
+end
+
+local function syncManagedOverlays(panel, width, height)
+    local manager = panelMenuEntryManager(panel)
+    if not manager then return end
+
+    local order = manager.order
+    local decorators = manager.decorators
+    for i = 1, #order do
+        local decorator = decorators[order[i]]
+        if decorator and decorator.spec then
+            syncOverlay(panel, decorator.spec, width, height)
+        end
+    end
+end
+
+local function ensurePaintHooks(panel, manager)
+    if not manager.paintOverWrapper then
+        manager.paintOverWrapper = function(self, width, height)
+            local state = panelMenuEntryManager(self)
+            if state and state.originalPaintOver then
+                state.originalPaintOver(self, width, height)
+            end
+
+            syncManagedOverlays(self, width, height)
         end
     end
 
-    panel.OnCursorEntered = function(self, ...)
-        requestMirrorAnimation(self)
+    if not manager.paintOverActive then
+        manager.originalPaintOver = panel.PaintOver
+        panel.PaintOver = manager.paintOverWrapper
+        manager.paintOverActive = true
+    end
 
-        if self.MagicAlignMenuEntryOldOnCursorEntered then
-            return self.MagicAlignMenuEntryOldOnCursorEntered(self, ...)
+    if not manager.performLayoutWrapper then
+        manager.performLayoutWrapper = function(self, width, height)
+            local state = panelMenuEntryManager(self)
+            if state and state.originalPerformLayout then
+                state.originalPerformLayout(self, width, height)
+            end
+
+            syncManagedOverlays(self, width, height)
         end
     end
+
+    if not manager.performLayoutActive then
+        manager.originalPerformLayout = panel.PerformLayout
+        panel.PerformLayout = manager.performLayoutWrapper
+        manager.performLayoutActive = true
+    end
+end
+
+local function ensureMirrorActionHooks(panel, manager)
+    if not manager.doClickWrapper then
+        manager.doClickWrapper = function(self, ...)
+            local state = panelMenuEntryManager(self)
+            if decoratorsWantMirrorActions(state) then
+                requestMirrorAnimation(self)
+            end
+
+            if state and state.originalDoClick then
+                return state.originalDoClick(self, ...)
+            end
+        end
+    end
+
+    if not manager.doClickActive then
+        manager.originalDoClick = panel.DoClick
+        panel.DoClick = manager.doClickWrapper
+        manager.doClickActive = true
+    end
+
+    if not manager.onCursorEnteredWrapper then
+        manager.onCursorEnteredWrapper = function(self, ...)
+            local state = panelMenuEntryManager(self)
+            if decoratorsWantMirrorActions(state) then
+                requestMirrorAnimation(self)
+            end
+
+            if state and state.originalOnCursorEntered then
+                return state.originalOnCursorEntered(self, ...)
+            end
+        end
+    end
+
+    if not manager.onCursorEnteredActive then
+        manager.originalOnCursorEntered = panel.OnCursorEntered
+        panel.OnCursorEntered = manager.onCursorEnteredWrapper
+        manager.onCursorEnteredActive = true
+    end
+end
+
+local function restoreManagedHook(panel, manager, panelField, wrapperField, originalField, activeField)
+    if manager[activeField] and panel[panelField] == manager[wrapperField] then
+        panel[panelField] = manager[originalField]
+        manager[activeField] = false
+        manager[originalField] = nil
+    end
+end
+
+local function updateMirrorActionHooks(panel, manager)
+    if decoratorsWantMirrorActions(manager) then
+        ensureMirrorActionHooks(panel, manager)
+        return
+    end
+
+    restoreManagedHook(panel, manager, "DoClick", "doClickWrapper", "originalDoClick", "doClickActive")
+    restoreManagedHook(panel, manager, "OnCursorEntered", "onCursorEnteredWrapper", "originalOnCursorEntered", "onCursorEnteredActive")
+end
+
+local function compactPanelManager(panel, manager)
+    if managerHasDecorators(manager) then return end
+
+    restoreManagedHook(panel, manager, "PaintOver", "paintOverWrapper", "originalPaintOver", "paintOverActive")
+    restoreManagedHook(panel, manager, "PerformLayout", "performLayoutWrapper", "originalPerformLayout", "performLayoutActive")
+    restoreManagedHook(panel, manager, "DoClick", "doClickWrapper", "originalDoClick", "doClickActive")
+    restoreManagedHook(panel, manager, "OnCursorEntered", "onCursorEnteredWrapper", "originalOnCursorEntered", "onCursorEnteredActive")
+
+    if not manager.paintOverActive
+        and not manager.performLayoutActive
+        and not manager.doClickActive
+        and not manager.onCursorEnteredActive then
+        panel[PANEL_MANAGER_FIELD] = nil
+    end
+end
+
+removeOverlay = function(panel)
+    if not IsValid(panel) then return end
+
+    clearLegacyOverlayState(panel)
+
+    local manager = panelMenuEntryManager(panel)
+    if not manager then return end
+
+    manager.decorators[DECORATOR_ID] = nil
+    removeDecoratorOrder(manager, DECORATOR_ID)
+    updateManagedPanelText(panel, manager)
+    updateMirrorActionHooks(panel, manager)
+    compactPanelManager(panel, manager)
 end
 
 local function installOverlay(panel, spec)
@@ -723,35 +940,34 @@ local function installOverlay(panel, spec)
 
     if spec and spec.mirror and not panelReadyForOverlay(panel) then return end
 
-    if not spec or panel.MagicAlignMenuEntryOverlayVersion == OVERLAY_VERSION
-        and panel.MagicAlignMenuEntrySpecId == spec.id then return end
-
-    removeOverlay(panel)
-    preparePanelText(panel, spec)
-
-    panel.MagicAlignMenuEntryOverlay = true
-    panel.MagicAlignMenuEntryOverlayVersion = OVERLAY_VERSION
-    panel.MagicAlignMenuEntrySpecId = spec.id
-    panel.MagicAlignMenuEntryOldPaintOver = panel.PaintOver
-    panel.MagicAlignMenuEntryOldPerformLayout = panel.PerformLayout
-
-    if spec.mirror then wrapMirrorActions(panel) end
-
-    panel.PaintOver = function(self, width, height)
-        if self.MagicAlignMenuEntryOldPaintOver then
-            self.MagicAlignMenuEntryOldPaintOver(self, width, height)
-        end
-
-        syncOverlay(self, spec, width, height)
+    if not spec then
+        removeOverlay(panel)
+        return
     end
 
-    panel.PerformLayout = function(self, width, height)
-        if self.MagicAlignMenuEntryOldPerformLayout then
-            self.MagicAlignMenuEntryOldPerformLayout(self, width, height)
-        end
+    clearLegacyOverlayState(panel)
 
-        syncOverlay(self, spec, width, height)
+    local decorator = activePanelDecorator(panel)
+    local manager = ensurePanelManager(panel)
+    if decorator and decorator.version == OVERLAY_VERSION and decorator.specId == spec.id then
+        ensurePaintHooks(panel, manager)
+        updateMirrorActionHooks(panel, manager)
+        updateManagedPanelText(panel, manager)
+        return
     end
+
+    manager.decorators[DECORATOR_ID] = {
+        spec = spec,
+        specId = spec.id,
+        version = OVERLAY_VERSION,
+        hideText = true,
+        mirrorActions = spec.mirror ~= nil
+    }
+    addDecoratorOrder(manager, DECORATOR_ID)
+
+    ensurePaintHooks(panel, manager)
+    updateMirrorActionHooks(panel, manager)
+    updateManagedPanelText(panel, manager)
 end
 
 local function clearPanel(panel)

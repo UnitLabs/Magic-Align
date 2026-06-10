@@ -8,7 +8,6 @@ M.Compat = Compat
 local function isPrimitiveBaseClass(class)
     if not isstring(class) or class == "" then return false end
     if class == "primitive_base" then return true end
-    if not scripted_ents or not scripted_ents.IsBasedOn then return false end
 
     local ok, basedOn = pcall(scripted_ents.IsBasedOn, class, "primitive_base")
     return ok and basedOn == true

@@ -44,7 +44,7 @@ local function cfg(tool, out)
     out.worldBspShowBlockers = clientNumber(tool, "world_bsp_show_blockers", 0) == 1
     out.worldBspFullGrid = clientNumber(tool, "world_bsp_full_grid", 1) == 1
     local activeSpace = tool and tool.GetClientInfo and tool:GetClientInfo("space") or nil
-    out.alt = not (M.IsMirrorMode and M.IsMirrorMode(activeSpace)) and (input.IsKeyDown(KEY_LALT) or input.IsKeyDown(KEY_RALT))
+    out.alt = not M.IsMirrorMode(activeSpace) and (input.IsKeyDown(KEY_LALT) or input.IsKeyDown(KEY_RALT))
     out.shift = input.IsKeyDown(KEY_LSHIFT) or input.IsKeyDown(KEY_RSHIFT)
 
     return out
@@ -103,7 +103,7 @@ local function registerOffsetChangeCallbacks()
 end
 
 local function currentFrameNumber()
-    return isfunction(FrameNumber) and FrameNumber() or nil
+    return FrameNumber()
 end
 
 local function pointWorldCache(state)
@@ -1064,11 +1064,11 @@ end
 
 function client.isWorldBspTraceBlocker(ent)
     if not IsValid(ent) then return false end
-    if M.IsWorldTarget and M.IsWorldTarget(ent) then return false end
+    if M.IsWorldTarget(ent) then return false end
     if isfunction(ent.IsPlayer) and ent:IsPlayer() then return false end
     if isfunction(ent.IsNPC) and ent:IsNPC() then return false end
     if isfunction(ent.IsWeapon) and ent:IsWeapon() then return false end
-    if M.IsProp and M.IsProp(ent) then return false end
+    if M.IsProp(ent) then return false end
 
     local class = client.worldBspBlockerClass(ent)
     if class == "" then return false end

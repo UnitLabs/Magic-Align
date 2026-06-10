@@ -242,8 +242,6 @@ local function updateHover(tool, state)
 end
 
 local function buildSessionSnapshot(state)
-    if not M.CreateSessionSnapshot then return end
-
     return M.CreateSessionSnapshot(state, {
         activeSpace = M.MIRROR_SPACE,
         lastNonMirrorTab = M.ClientLastNonMirrorSpace,
@@ -352,7 +350,7 @@ local function consumeQueuedClick(tool, state)
 
     if not queued then return end
     if core.uiBlocked and core.uiBlocked() then
-        playFeedback(tool, "fail", false, trace, { direct = false })
+        playFeedback(tool, "fail", false, trace)
         return
     end
 

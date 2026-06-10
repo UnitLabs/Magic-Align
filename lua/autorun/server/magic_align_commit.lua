@@ -71,9 +71,8 @@ end
 local function asGModVector(v)
     if not hasFiniteVectorFields(v) then return end
 
-    local converted = isfunction(toVector) and toVector(v) or nil
+    local converted = toVector(v)
     if converted ~= nil then return converted end
-    if not isfunction(Vector) then return end
 
     return Vector(v.x, v.y, v.z)
 end
@@ -81,31 +80,18 @@ end
 local function asGModAngle(a)
     if not hasFiniteAngleFields(a) then return end
 
-    local converted = isfunction(toAngle) and toAngle(a) or nil
+    local converted = toAngle(a)
     if converted ~= nil then return converted end
-    if not isfunction(Angle) then return end
 
     return Angle(a.p, a.y, a.r)
 end
 
 local function preciseVector(x, y, z)
-    local maker = M.VectorP or VectorP
-    if isfunction(maker) then
-        return maker(x, y, z)
-    end
-    if isfunction(Vector) then
-        return Vector(x, y, z)
-    end
+    return VectorP(x, y, z)
 end
 
 local function preciseAngle(p, y, r)
-    local maker = M.AngleP or AngleP
-    if isfunction(maker) then
-        return maker(p, y, r)
-    end
-    if isfunction(Angle) then
-        return Angle(p, y, r)
-    end
+    return AngleP(p, y, r)
 end
 
 local function cloneVec(v)
@@ -151,9 +137,6 @@ end
 
 local function applyAdvResizerData(ply, src, ent)
     if not IsValid(src) or not IsValid(ent) then return end
-    if not duplicator or not isfunction(duplicator.StoreEntityModifier) or not isfunction(duplicator.ApplyEntityModifiers) then
-        return
-    end
 
     local data = advResizerData(src)
     if not istable(data) then return end
@@ -308,22 +291,16 @@ local function applyDuplicatorData(ply, src, ent, data)
         ent.PhysicsObjects = table.Copy(data.PhysicsObjects)
     end
 
-    if not (istable(data.EntityMods) and istable(data.EntityMods.advr))
-        and duplicator
-        and isfunction(duplicator.StoreEntityModifier) then
+    if not (istable(data.EntityMods) and istable(data.EntityMods.advr)) then
         local advrData = advResizerData(src)
         if istable(advrData) then
             duplicator.StoreEntityModifier(ent, "advr", advrData)
         end
     end
 
-    if duplicator and isfunction(duplicator.ApplyEntityModifiers) then
-        duplicator.ApplyEntityModifiers(ply, ent)
-    end
+    duplicator.ApplyEntityModifiers(ply, ent)
 
-    if duplicator and isfunction(duplicator.ApplyBoneModifiers) then
-        duplicator.ApplyBoneModifiers(ply, ent)
-    end
+    duplicator.ApplyBoneModifiers(ply, ent)
 
     if isfunction(ent.PostEntityPaste) then
         local created = IsValid(src) and { [src:EntIndex()] = ent } or { ent }
@@ -332,12 +309,6 @@ local function applyDuplicatorData(ply, src, ent, data)
 end
 
 local function cloneViaDuplicator(ply, src, pos, ang)
-    if not duplicator
-        or not isfunction(duplicator.CopyEntTable)
-        or not isfunction(duplicator.CreateEntityFromTable) then
-        return
-    end
-
     local okCopy, data = pcall(duplicator.CopyEntTable, src)
     if not okCopy or not istable(data) then return end
 
@@ -419,7 +390,7 @@ local function captureEntityState(ent)
         ent = ent,
         pos = cloneVec(pos),
         ang = cloneAng(ang),
-        entityMirror = M.EntityMirror and M.EntityMirror.Capture and M.EntityMirror.Capture(ent) or nil,
+        entityMirror = M.EntityMirror.Capture(ent),
         parent = IsValid(ent:GetParent()) and ent:GetParent() or nil,
         motionEnabled = physicsMotionEnabled(ent)
     }
@@ -428,7 +399,7 @@ end
 local function canUse(ply, ent, toolMode)
     if not M.IsProp(ent) then return false end
 
-    toolMode = M.IsMagicAlignToolMode and M.IsMagicAlignToolMode(toolMode) and toolMode or M.TOOL_MODE_MAGIC_ALIGN
+    toolMode = M.IsMagicAlignToolMode(toolMode) and toolMode or M.TOOL_MODE_MAGIC_ALIGN
 
     if ent.CPPICanTool and ent:CPPICanTool(ply, toolMode) == false then
         return false
@@ -540,8 +511,6 @@ local function toolClientBool(tool, name)
 end
 
 local function applyEntityMirrorStateFromStart(ent, startState, deltaAxis, options)
-    if not (M.EntityMirror and M.EntityMirror.ApplyFromBaseState) then return false end
-
     return M.EntityMirror.ApplyFromBaseState(
         ent,
         startState,
@@ -552,17 +521,16 @@ local function applyEntityMirrorStateFromStart(ent, startState, deltaAxis, optio
 end
 
 local function debugCommitEntity(label, ent, spec, entityMirrorAxis)
-    if not (M.EntityMirror and M.EntityMirror.DebugEntity) then return end
     if not IsValid(ent) or not istable(spec) then return end
 
     local start = spec.start or {}
     M.EntityMirror.DebugEntity(label, ent, {
-        requestedDeltaAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(entityMirrorAxis) or tostring(entityMirrorAxis),
+        requestedDeltaAxis = M.EntityMirror.AxisLabel(entityMirrorAxis),
         startPos = start.pos,
         startAng = start.ang,
         targetPos = spec.targetPos,
         targetAng = spec.targetAng,
-        startMirrorAxis = istable(start.entityMirror) and (M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(start.entityMirror.axis) or tostring(start.entityMirror.axis)) or "nil"
+        startMirrorAxis = istable(start.entityMirror) and M.EntityMirror.AxisLabel(start.entityMirror.axis) or "nil"
     })
 end
 
@@ -587,7 +555,7 @@ end
 
 local function undoRestoreEntry(state)
     local ent = state and state.ent or nil
-    if not IsValid(ent) or not (M.IsPrimitive and M.IsPrimitive(ent)) then return end
+    if not IsValid(ent) or not M.IsPrimitive(ent) then return end
     if not hasFiniteVectorFields(state.pos) or not hasFiniteAngleFields(state.ang) then return end
 
     local fromPos = cloneVec(ent:GetPos())
@@ -618,11 +586,7 @@ local function sendUndoRestore(ply, entries, sessionSnapshot)
             net.WritePreciseVector(entry.toPos)
             net.WritePreciseAngle(entry.toAng)
         end
-        if M.WriteSessionSnapshot then
-            M.WriteSessionSnapshot(sessionSnapshot)
-        else
-            net.WriteBool(false)
-        end
+        M.WriteSessionSnapshot(sessionSnapshot)
     net.Send(ply)
 end
 
@@ -665,9 +629,7 @@ local function restoreCommitStep(_, props, created, undoPly, sessionSnapshot)
                 ent:SetPos(pos)
                 ent:SetAngles(ang)
             end
-            if M.EntityMirror and M.EntityMirror.Restore then
-                M.EntityMirror.Restore(ent, state.entityMirror)
-            end
+            M.EntityMirror.Restore(ent, state.entityMirror)
         end
     end
 
@@ -733,11 +695,9 @@ local function toolLocalBounds(ent)
     local mins, maxs = M.GetLocalBounds(ent)
     if not hasFiniteVectorFields(mins) or not hasFiniteVectorFields(maxs) then return end
 
-    if M.EntityMirror and M.EntityMirror.BoundsInBaseSpace then
-        local baseMins, baseMaxs = M.EntityMirror.BoundsInBaseSpace(ent, mins, maxs)
-        if hasFiniteVectorFields(baseMins) and hasFiniteVectorFields(baseMaxs) then
-            return baseMins, baseMaxs
-        end
+    local baseMins, baseMaxs = M.EntityMirror.BoundsInBaseSpace(ent, mins, maxs)
+    if hasFiniteVectorFields(baseMins) and hasFiniteVectorFields(baseMaxs) then
+        return baseMins, baseMaxs
     end
 
     return mins, maxs
@@ -849,7 +809,7 @@ function runCommit(task)
     local parent = task.parent
     local mode = task.mode
     local entityMirrorAxis = tonumber(task.entityMirrorAxis) or M.ENTITY_MIRROR_NONE
-    local toolMode = M.IsMagicAlignToolMode and M.IsMagicAlignToolMode(task.toolMode)
+    local toolMode = M.IsMagicAlignToolMode(task.toolMode)
         and task.toolMode
         or M.TOOL_MODE_MAGIC_ALIGN
     local isMirrorAction = toolMode == M.TOOL_MODE_MAGIC_MIRROR
@@ -1172,7 +1132,7 @@ net.Receive(M.NET_VIEW_ANGLES, function(_, ply)
     if not IsValid(weapon) or weapon:GetClass() ~= "gmod_tool" then return end
 
     local tool = ply:GetTool()
-    if not tool or not (M.IsMagicAlignToolMode and M.IsMagicAlignToolMode(tool.Mode)) then return end
+    if not tool or not M.IsMagicAlignToolMode(tool.Mode) then return end
 
     local eyeAng = asGModAngle(ang)
     if eyeAng then
@@ -1203,7 +1163,7 @@ net.Receive(M.NET, function(_, ply)
     local mode = net.ReadUInt(2)
     local absoluteLinked = net.ReadBool()
     local entityMirrorAxis = net.ReadUInt(2)
-    local sessionSnapshot = M.ReadSessionSnapshot and M.ReadSessionSnapshot() or nil
+    local sessionSnapshot = M.ReadSessionSnapshot()
 
     local pending = PENDING_COMMITS[ply]
     if pending and RealTime() < (pending.expiresAt or 0) then

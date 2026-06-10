@@ -299,12 +299,10 @@ local function collapseAllFloatingTextOwners()
     end
 end
 
-if hook and hook.Add then
-    hook.Remove("OnContextMenuClose", "MagicAlignCollapseFloatingTextFields")
-    hook.Add("OnContextMenuClose", "MagicAlignCollapseFloatingTextFields", collapseAllFloatingTextOwners)
-    hook.Remove("OnSpawnMenuClose", "MagicAlignCollapseFloatingTextFields")
-    hook.Add("OnSpawnMenuClose", "MagicAlignCollapseFloatingTextFields", collapseAllFloatingTextOwners)
-end
+hook.Remove("OnContextMenuClose", "MagicAlignCollapseFloatingTextFields")
+hook.Add("OnContextMenuClose", "MagicAlignCollapseFloatingTextFields", collapseAllFloatingTextOwners)
+hook.Remove("OnSpawnMenuClose", "MagicAlignCollapseFloatingTextFields")
+hook.Add("OnSpawnMenuClose", "MagicAlignCollapseFloatingTextFields", collapseAllFloatingTextOwners)
 
 local function nearlyEqual(a, b)
     return math.abs((tonumber(a) or 0) - (tonumber(b) or 0)) <= M.CONVAR_ROUNDTRIP_EPSILON

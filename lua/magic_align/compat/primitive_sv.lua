@@ -11,11 +11,6 @@ M.Compat = Compat
 
 local function clonePrimitiveEntity(ply, src, pos, ang)
     if not Compat.IsPrimitive(src) then return false end
-    if not duplicator
-        or not isfunction(duplicator.CopyEntTable)
-        or not isfunction(duplicator.CreateEntityFromTable) then
-        return true
-    end
 
     -- Legacy fallback: the main commit path now prefers the stock duplicator
     -- first, but primitives still keep this narrower rescue path.

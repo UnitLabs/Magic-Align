@@ -150,11 +150,7 @@ local function localToWorldPosInto(out, localPos, originPos, originAng)
 end
 
 local function resolvedReference(point, fallbackEnt)
-    if M.ResolvePointReference then
-        return M.ResolvePointReference(point, fallbackEnt)
-    end
-
-    return fallbackEnt
+    return M.ResolvePointReference(point, fallbackEnt)
 end
 
 local function resolvePointWorldInto(point, fallbackEnt, out, options)
@@ -165,31 +161,22 @@ local function resolvePointWorldInto(point, fallbackEnt, out, options)
     end
 
     local ent = resolvedReference(point, fallbackEnt)
-    if M.IsWorldTarget and M.IsWorldTarget(ent) then
+    if M.IsWorldTarget(ent) then
         return copyVecInto(out, point), ent, nil, nil, M.ENTITY_MIRROR_NONE or 0
     end
 
     if IsValid(ent) then
-        if M.ResolvePointWorldPositionInto then
-            local world, ref, refPos, refAng, refMirrorAxis = M.ResolvePointWorldPositionInto(out, point, fallbackEnt)
-            if isvector(world) then
-                return world, ref or ent, refPos, refAng, refMirrorAxis
-            end
+        local world, ref, refPos, refAng, refMirrorAxis = M.ResolvePointWorldPositionInto(out, point, fallbackEnt)
+        if isvector(world) then
+            return world, ref or ent, refPos, refAng, refMirrorAxis
         end
 
         local pos = ent:GetPos()
         local ang = ent:GetAngles()
-        local mirrorAxis = M.ENTITY_MIRROR_NONE or 0
-        if M.EntityMirror and M.EntityMirror.AxisForEntity then
-            mirrorAxis = M.EntityMirror.AxisForEntity(ent)
-        elseif M.EntityMirror and M.EntityMirror.GetAxis then
-            mirrorAxis = M.EntityMirror.GetAxis(ent)
-        end
-        if M.EntityMirror and M.EntityMirror.LocalPointToWorld then
-            local world = M.EntityMirror.LocalPointToWorld(ent, point, out)
-            if isvector(world) then
-                return world, ent, pos, ang, mirrorAxis
-            end
+        local mirrorAxis = M.EntityMirror.AxisForEntity(ent)
+        local world = M.EntityMirror.LocalPointToWorld(ent, point, out)
+        if isvector(world) then
+            return world, ent, pos, ang, mirrorAxis
         end
 
         return localToWorldPosInto(out, point, pos, ang), ent, pos, ang, mirrorAxis
@@ -655,34 +642,16 @@ end
 
 local function entityMirrorAxis(ent)
     if not IsValid(ent) then return M.ENTITY_MIRROR_NONE or 0 end
-    if M.EntityMirror and M.EntityMirror.AxisForEntity then
-        return M.EntityMirror.AxisForEntity(ent)
-    elseif M.EntityMirror and M.EntityMirror.GetAxis then
-        return M.EntityMirror.GetAxis(ent)
-    end
 
-    return M.ENTITY_MIRROR_NONE or 0
+    return M.EntityMirror.AxisForEntity(ent)
 end
 
 local function referenceMirrorAxis(reference)
-    if M.EntityMirror and M.EntityMirror.AxisForMirrorReference then
-        return M.EntityMirror.AxisForMirrorReference(reference)
-    end
-
-    return M.ENTITY_MIRROR_NONE or 0
+    return M.EntityMirror.AxisForMirrorReference(reference)
 end
 
 local function composeEntityMirrorAxis(currentAxis, deltaAxis)
-    if M.EntityMirror and M.EntityMirror.ComposeAxis then
-        return M.EntityMirror.ComposeAxis(currentAxis, deltaAxis)
-    end
-
-    currentAxis = math.Clamp(math.floor(tonumber(currentAxis) or (M.ENTITY_MIRROR_NONE or 0)), M.ENTITY_MIRROR_NONE or 0, M.ENTITY_MIRROR_Z or 3)
-    deltaAxis = math.Clamp(math.floor(tonumber(deltaAxis) or (M.ENTITY_MIRROR_NONE or 0)), M.ENTITY_MIRROR_NONE or 0, M.ENTITY_MIRROR_Z or 3)
-    if deltaAxis == (M.ENTITY_MIRROR_NONE or 0) then return currentAxis end
-    if currentAxis == (M.ENTITY_MIRROR_NONE or 0) then return deltaAxis end
-    if currentAxis == deltaAxis then return M.ENTITY_MIRROR_NONE or 0 end
-    return M.ENTITY_MIRROR_NONE or 0
+    return M.EntityMirror.ComposeAxis(currentAxis, deltaAxis)
 end
 
 local function remainingMirrorAxis(a, b)
@@ -703,11 +672,11 @@ end
 local function angleLocalAxisWorld(ang, axis)
     if not isangle(ang) then return end
 
-    if axis == M.ENTITY_MIRROR_X and M.AngleForwardPrecise then
+    if axis == M.ENTITY_MIRROR_X then
         return M.AngleForwardPrecise(ang)
-    elseif axis == M.ENTITY_MIRROR_Y and M.AngleRightPrecise then
+    elseif axis == M.ENTITY_MIRROR_Y then
         return M.AngleRightPrecise(ang)
-    elseif axis == M.ENTITY_MIRROR_Z and M.AngleUpPrecise then
+    elseif axis == M.ENTITY_MIRROR_Z then
         return M.AngleUpPrecise(ang)
     end
 end
@@ -720,7 +689,7 @@ local function bakeEntityMirrorComposition(ang, currentAxis, deltaAxis)
     end
 
     local worldAxis = angleLocalAxisWorld(ang, rotationAxis)
-    if not isvector(worldAxis) or not M.RotateAngleAroundAxisPrecise then
+    if not isvector(worldAxis) then
         return ang, targetAxis, rotationAxis, false
     end
 
@@ -785,21 +754,19 @@ function M.ApplyTransformModeToPropSet(mode, prop1, linked, data, out)
 
     local pos, ang, targetAxis, currentAxis, deltaAxis, rotationAxis, bakedRotation = M.MirrorEntityPose(prop1, reference)
     if not isvector(pos) or not isangle(ang) then return end
-    if M.EntityMirror and M.EntityMirror.DebugEntity then
-        M.EntityMirror.DebugEntity("mirror-pose-prop1", prop1, {
-            referenceKind = reference.kind,
-            referencePoint = reference.point,
-            referenceAxis = reference.axis,
-            referenceNormal = reference.normal,
-            targetPos = pos,
-            targetAng = ang,
-            currentAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(currentAxis) or tostring(currentAxis),
-            deltaAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(deltaAxis) or tostring(deltaAxis),
-            previewAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(targetAxis) or tostring(targetAxis),
-            bakedRotationAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(rotationAxis) or tostring(rotationAxis),
-            bakedRotation = bakedRotation == true
-        })
-    end
+    M.EntityMirror.DebugEntity("mirror-pose-prop1", prop1, {
+        referenceKind = reference.kind,
+        referencePoint = reference.point,
+        referenceAxis = reference.axis,
+        referenceNormal = reference.normal,
+        targetPos = pos,
+        targetAng = ang,
+        currentAxis = M.EntityMirror.AxisLabel(currentAxis),
+        deltaAxis = M.EntityMirror.AxisLabel(deltaAxis),
+        previewAxis = M.EntityMirror.AxisLabel(targetAxis),
+        bakedRotationAxis = M.EntityMirror.AxisLabel(rotationAxis),
+        bakedRotation = bakedRotation == true
+    })
 
     out.pos = pos
     out.ang = ang
@@ -813,18 +780,16 @@ function M.ApplyTransformModeToPropSet(mode, prop1, linked, data, out)
         if IsValid(ent) and ent ~= prop1 and M.IsProp(ent) then
             local linkedPos, linkedAng, linkedTargetAxis, linkedCurrentAxis, linkedDeltaAxis, linkedRotationAxis, linkedBakedRotation = M.MirrorEntityPose(ent, reference)
             if isvector(linkedPos) and isangle(linkedAng) then
-                if M.EntityMirror and M.EntityMirror.DebugEntity then
-                    M.EntityMirror.DebugEntity("mirror-pose-linked", ent, {
-                        referenceKind = reference.kind,
-                        targetPos = linkedPos,
-                        targetAng = linkedAng,
-                        currentAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(linkedCurrentAxis) or tostring(linkedCurrentAxis),
-                        deltaAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(linkedDeltaAxis) or tostring(linkedDeltaAxis),
-                        previewAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(linkedTargetAxis) or tostring(linkedTargetAxis),
-                        bakedRotationAxis = M.EntityMirror.AxisLabel and M.EntityMirror.AxisLabel(linkedRotationAxis) or tostring(linkedRotationAxis),
-                        bakedRotation = linkedBakedRotation == true
-                    })
-                end
+                M.EntityMirror.DebugEntity("mirror-pose-linked", ent, {
+                    referenceKind = reference.kind,
+                    targetPos = linkedPos,
+                    targetAng = linkedAng,
+                    currentAxis = M.EntityMirror.AxisLabel(linkedCurrentAxis),
+                    deltaAxis = M.EntityMirror.AxisLabel(linkedDeltaAxis),
+                    previewAxis = M.EntityMirror.AxisLabel(linkedTargetAxis),
+                    bakedRotationAxis = M.EntityMirror.AxisLabel(linkedRotationAxis),
+                    bakedRotation = linkedBakedRotation == true
+                })
 
                 linkedCount = linkedCount + 1
                 local entry = linkedOut[linkedCount]

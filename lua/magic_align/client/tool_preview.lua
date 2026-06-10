@@ -136,7 +136,7 @@ local function markPoseSnapshot(cache, prefix, ent)
 
     local pos = ent:GetPos()
     local ang = ent:GetAngles()
-    local mirrorAxis = M.EntityMirror and M.EntityMirror.GetAxis and M.EntityMirror.GetAxis(ent) or nil
+    local mirrorAxis = M.EntityMirror.GetAxis(ent)
     local changed = cache[prefix .. "Ent"] ~= ent
         or cache[prefix .. "px"] ~= pos.x or cache[prefix .. "py"] ~= pos.y or cache[prefix .. "pz"] ~= pos.z
         or cache[prefix .. "ap"] ~= ang.p or cache[prefix .. "ay"] ~= ang.y or cache[prefix .. "ar"] ~= ang.r
@@ -176,7 +176,7 @@ function client.markMirrorSnapshot(cache, state)
     local mirror = state.mirror or {}
     local changed = false
 
-    local active = M.IsMirrorMode and M.IsMirrorMode(state)
+    local active = M.IsMirrorMode(state)
     if cache.mirrorActive ~= active then
         cache.mirrorActive = active
         changed = true
@@ -221,7 +221,7 @@ function client.markTargetReferenceSnapshot(cache, state, pointsOverride)
     local refCount = 0
 
     for i = 1, #points do
-        local ref = M.ResolvePointReference and M.ResolvePointReference(points[i], state.prop2) or state.prop2
+        local ref = M.ResolvePointReference(points[i], state.prop2)
         if IsValid(ref) and ref ~= state.prop2 and not seenRefs[ref] then
             seenRefs[ref] = true
             refCount = refCount + 1
@@ -398,7 +398,7 @@ function client.Mirror.isActive(tool, state)
         activeSpace = client.activeSpaceForTool(tool)
     end
 
-    return M.IsMirrorMode and M.IsMirrorMode(activeSpace) or activeSpace == M.MIRROR_SPACE
+    return M.IsMirrorMode(activeSpace) or activeSpace == M.MIRROR_SPACE
 end
 
 function client.Mirror.syncEnabled(tool, state)
@@ -409,14 +409,7 @@ function client.Mirror.syncEnabled(tool, state)
 end
 
 function client.Mirror.cache(state, key)
-    if M.GetMirrorStateCache then
-        return M.GetMirrorStateCache(state, key)
-    end
-
-    local mirror = client.Mirror.state(state)
-    key = key or "_magicAlignMirrorCache"
-    mirror[key] = mirror[key] or {}
-    return mirror[key]
+    return M.GetMirrorStateCache(state, key)
 end
 
 function client.Mirror.resolve(state, pointsOverride, key)
@@ -431,10 +424,10 @@ function client.Mirror.resolve(state, pointsOverride, key)
         return state._magicAlignMirrorResolveState
     end
 
-    local resolved = M.ResolveMirrorState and M.ResolveMirrorState(mirror, cache, {
+    local resolved = M.ResolveMirrorState(mirror, cache, {
         activeSpace = activeSpace,
         points = pointsOverride
-    }) or nil
+    })
 
     if frame ~= nil then
         state._magicAlignMirrorResolveFrame = frame
@@ -477,16 +470,12 @@ end
 function client.Mirror.entityMirrorAxis(reference)
     local enabled = GetConVar("magic_align_mirror_entity_mirror")
     if not (enabled and enabled:GetBool()) then return M.ENTITY_MIRROR_NONE end
-    if not (M.EntityMirror and M.EntityMirror.AxisForMirrorReference) then return M.ENTITY_MIRROR_NONE end
 
     return M.EntityMirror.AxisForMirrorReference(reference)
 end
 
 function client.Mirror.previewEntityMirrorAxis(ent, deltaAxis)
     deltaAxis = tonumber(deltaAxis) or M.ENTITY_MIRROR_NONE
-    if not (M.EntityMirror and M.EntityMirror.ComposeAxis and M.EntityMirror.GetAxis) then
-        return deltaAxis
-    end
 
     return M.EntityMirror.ComposeAxis(M.EntityMirror.GetAxis(ent), deltaAxis)
 end
@@ -508,15 +497,11 @@ end
 local function pointReferenceEntity(point, fallbackEnt)
     if not isvector(point) or point.world == true then return end
 
-    if M.ResolvePointReference then
-        return M.ResolvePointReference(point, fallbackEnt)
-    end
-
-    return fallbackEnt
+    return M.ResolvePointReference(point, fallbackEnt)
 end
 
 local function mirrorWorldPoint(worldPos, reference)
-    if not isvector(worldPos) or not istable(reference) or not M.MirrorPose then return end
+    if not isvector(worldPos) or not istable(reference) then return end
 
     local mirroredPos = M.MirrorPose(worldPos, ZERO_ANG, reference)
     return isvector(mirroredPos) and mirroredPos or nil
@@ -645,8 +630,7 @@ function client.Mirror.sourceAnchorLocal(state, deltaAxis, selected, priority, a
 
     local mirroredWorld
     if isvector(anchor) and IsValid(state.prop1) and istable(reference) then
-        local sourceWorld = M.EntityMirror and M.EntityMirror.LocalPointToWorld
-            and M.EntityMirror.LocalPointToWorld(state.prop1, anchor)
+        local sourceWorld = M.EntityMirror.LocalPointToWorld(state.prop1, anchor)
         mirroredWorld = mirrorWorldPoint(sourceWorld, reference)
     end
 
@@ -1061,7 +1045,7 @@ local function hoverState(tool, state)
     hover.worldBspCandidateCache = candidateCache
     hover.worldBspStableCandidateCache = stableCandidateCache
     local activeSpace = client.activeSpaceForTool(tool)
-    local mirrorActive = M.IsMirrorMode and M.IsMirrorMode(activeSpace)
+    local mirrorActive = M.IsMirrorMode(activeSpace)
     local side, ent, points = editable(state, tr.Entity, tr, activeSpace)
     local pointCache = pointWorldCache(state)
 
@@ -1196,7 +1180,7 @@ local function pointFromCandidateInto(candidate, out, keepReference)
     end
 
     out.world = geometry.isWorldTarget(candidate.ent) or nil
-    if keepReference and M.SetPointReference then
+    if keepReference then
         M.SetPointReference(out, candidate.ent)
     else
         out.reference = nil
@@ -1221,7 +1205,7 @@ local function copyPointIntoPendingScratch(out, point)
     end
 
     out.world = point.world == true or nil
-    out.reference = M.CopyPointReference and M.CopyPointReference(point.reference) or nil
+    out.reference = M.CopyPointReference(point.reference)
 
     return out
 end

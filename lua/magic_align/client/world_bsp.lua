@@ -116,11 +116,11 @@ local traceScratch = worldBSP.traceScratch or {}
 worldBSP.traceScratch = traceScratch
 
 local function now()
-    return SysTime and SysTime() or RealTime()
+    return SysTime()
 end
 
 local function currentMap()
-    return game and game.GetMap and game.GetMap() or ""
+    return game.GetMap()
 end
 
 local function resetCache(status)
@@ -1785,7 +1785,7 @@ local function entityModel(ent)
 end
 
 local function isWorldBrushEntity(ent)
-    if game and isfunction(game.GetWorld) and ent == game.GetWorld() then
+    if ent == game.GetWorld() then
         return true
     end
 
@@ -1822,18 +1822,12 @@ local function readWorldBrushSurfaceSources()
         candidates[count] = ent
     end
 
-    if game and isfunction(game.GetWorld) then
-        addCandidate(game.GetWorld())
-    end
-    if isfunction(Entity) then
-        addCandidate(Entity(0))
-    end
-    if ents and isfunction(ents.GetAll) then
-        local all = ents.GetAll()
-        if istable(all) then
-            for i = 1, #all do
-                addCandidate(all[i])
-            end
+    addCandidate(game.GetWorld())
+    addCandidate(Entity(0))
+    local all = ents.GetAll()
+    if istable(all) then
+        for i = 1, #all do
+            addCandidate(all[i])
         end
     end
 
@@ -1947,10 +1941,6 @@ local function bspReadCString(data, offset, maxLength)
 end
 
 local function readCurrentMapBspData()
-    if not (file and isfunction(file.Read)) then
-        return nil, "file.Read unavailable"
-    end
-
     local map = currentMap()
     if map == "" then
         return nil, "map name unavailable"
@@ -2365,7 +2355,7 @@ local function appendDisplacementSurfacesForInfo(data, header, info, surfaceId)
 
     local materialName = readBspTextureName(data, header, face and face.texInfo) or "**displacement**"
     local source = {
-        ent = game and isfunction(game.GetWorld) and game.GetWorld() or nil,
+        ent = game.GetWorld(),
         identity = "world:0",
         entityIndex = 0,
         class = "worldspawn",
@@ -4577,14 +4567,10 @@ function worldBSP.traceBrushEntity(tr)
     end
 
     if tr and tr.HitWorld == true then
-        if game and isfunction(game.GetWorld) then
-            ent = game.GetWorld()
-            if ent and isfunction(ent.GetBrushSurfaces) then return ent end
-        end
-        if isfunction(Entity) then
-            ent = Entity(0)
-            if ent and isfunction(ent.GetBrushSurfaces) then return ent end
-        end
+        ent = game.GetWorld()
+        if ent and isfunction(ent.GetBrushSurfaces) then return ent end
+        ent = Entity(0)
+        if ent and isfunction(ent.GetBrushSurfaces) then return ent end
     end
 end
 
@@ -4983,18 +4969,14 @@ function worldBSP.debugCache()
     ))
 end
 
-if concommand and isfunction(concommand.Add) then
-    if isfunction(concommand.Remove) then
-        concommand.Remove("magic_align_world_bsp_debug_trace")
-        concommand.Remove("magic_align_world_bsp_debug_cache")
-    end
+concommand.Remove("magic_align_world_bsp_debug_trace")
+concommand.Remove("magic_align_world_bsp_debug_cache")
 
-    concommand.Add("magic_align_world_bsp_debug_trace", function()
-        worldBSP.debugTrace()
-    end)
-    concommand.Add("magic_align_world_bsp_debug_cache", function()
-        worldBSP.debugCache()
-    end)
-end
+concommand.Add("magic_align_world_bsp_debug_trace", function()
+    worldBSP.debugTrace()
+end)
+concommand.Add("magic_align_world_bsp_debug_cache", function()
+    worldBSP.debugCache()
+end)
 
 return worldBSP

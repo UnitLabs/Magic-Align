@@ -36,8 +36,7 @@ end
 local function worldPoint(ent, localPos)
     if not IsValid(ent) or not isvector(localPos) then return end
 
-    local world = M.EntityMirror and M.EntityMirror.LocalPointToWorld
-        and M.EntityMirror.LocalPointToWorld(ent, localPos)
+    local world = M.EntityMirror.LocalPointToWorld(ent, localPos)
     return world and toVector(world)
 end
 

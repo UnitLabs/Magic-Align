@@ -10,17 +10,10 @@ local FormulaManager = M.FormulaManager or include("magic_align/client/formula_m
 
 M.FormulaManager = FormulaManager
 
-client.getFormulaEnvironment = client.getFormulaEnvironment or function()
-    return {}
-end
-
-M.GetFormulaEnvironment = M.GetFormulaEnvironment or function(_, slider, cvarName)
-    local provider = client.getFormulaEnvironment
-    if isfunction(provider) then
-        local ok, value = pcall(provider, slider, cvarName)
-        if ok and istable(value) then
-            return value
-        end
+M.GetFormulaEnvironment = function(_, slider, cvarName)
+    local ok, value = pcall(client.getFormulaEnvironment, slider, cvarName)
+    if ok and istable(value) then
+        return value
     end
 
     return {}
@@ -852,7 +845,7 @@ local function currentRotationSnapStep()
 end
 
 local function resetInterpolationPercentages(side)
-    local value = tostring(M.ClampAnchorPercent and M.ClampAnchorPercent(50) or 50)
+    local value = tostring(M.ClampAnchorPercent(50))
 
     for _, anchorId in ipairs(M.ANCHOR_PERCENT_KEYS or {}) do
         setStringConVar(("magic_align_%s_%s_pct"):format(side, anchorId), value)
