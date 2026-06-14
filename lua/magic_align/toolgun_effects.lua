@@ -143,76 +143,6 @@ local function storedToolgun()
     if istable(toolgun) then return toolgun end
 end
 
--- Hot-reload cleanup for versions that replaced gmod_tool:DoShootEffect globally.
-local function previousMagicAlignPatch(callback, owner)
-    if not isfunction(callback) then return false end
-    if owner and callback == owner._magicAlignToolgunEffectsPatchedDoShootEffect then return true end
-
-    local callbacks = toolgunEffects.patchedDoShootEffectCallbacks
-    if istable(callbacks) and callbacks[callback] then return true end
-
-    if not debug or not isfunction(debug.getinfo) then return false end
-
-    local info = debug.getinfo(callback, "S")
-    local source = info and tostring(info.source or "") or ""
-    return source:find("magic_align/toolgun_effects.lua", 1, true) ~= nil
-        or source:find("magic_align\\toolgun_effects.lua", 1, true) ~= nil
-end
-
-local function savedOriginalDoShootEffect(owner)
-    local saved = owner and owner._magicAlignToolgunEffectsOriginalDoShootEffect
-    if isfunction(saved) and not previousMagicAlignPatch(saved, owner) then return saved end
-
-    local chain = toolgunEffects.originalDoShootEffects
-    if istable(chain) then
-        for i = 1, #chain do
-            saved = chain[i]
-            if isfunction(saved) and not previousMagicAlignPatch(saved, owner) then return saved end
-        end
-    end
-
-    saved = toolgunEffects.originalDoShootEffect
-    if isfunction(saved) and not previousMagicAlignPatch(saved, owner) then return saved end
-end
-
-local function restorePreviousPatch(owner)
-    if not owner or not previousMagicAlignPatch(owner.DoShootEffect, owner) then return false end
-
-    local original = savedOriginalDoShootEffect(owner)
-    if not isfunction(original) then return false end
-
-    owner.DoShootEffect = original
-    owner._magicAlignToolgunEffectsOriginalDoShootEffect = nil
-    owner._magicAlignToolgunEffectsPatchedDoShootEffect = nil
-    owner._magicAlignToolgunEffectsInstalled = nil
-    return true
-end
-
-local function removePreviousGlobalPatch()
-    restorePreviousPatch(storedToolgun())
-
-    if ents and isfunction(ents.FindByClass) then
-        for _, weapon in ipairs(ents.FindByClass("gmod_tool")) do
-            restorePreviousPatch(weapon)
-        end
-    end
-
-    if hook then
-        hook.Remove("OnEntityCreated", "MagicAlignToolgunEffectsInstallWeapon")
-        hook.Remove("Initialize", "MagicAlignToolgunEffectsInstall")
-    end
-
-    toolgunEffects.pendingActions = nil
-    toolgunEffects.originalCallDepth = nil
-    toolgunEffects.patchedDoShootEffectCallbacks = nil
-    toolgunEffects.originalDoShootEffects = nil
-    toolgunEffects.originalDoShootEffect = nil
-    toolgunEffects.Install = nil
-    toolgunEffects.weaponLifecycleHookVersion = nil
-end
-
-removePreviousGlobalPatch()
-
 local function effectKind(kind)
     kind = ALIASES[kind] or kind
     return PRESETS[kind] and kind or "click"
@@ -483,9 +413,6 @@ if CLIENT then
         render.DrawQuadEasy(pos, normal, size, size, color)
     end
 
-    hook.Remove("EntityEmitSound", "MagicAlignToolgunSoundMuzzleFeedback")
-    hook.Remove("PostDrawTranslucentRenderables", "MagicAlignToolgunLocalMuzzleRings")
-    hook.Remove("PostDrawViewModel", "MagicAlignToolgunMuzzleCache")
     hook.Add("PostDrawViewModel", "MagicAlignToolgunMuzzleCache", function(viewModel, ply, weapon)
         if not IsValid(viewModel) or not IsValid(ply) or not IsValid(weapon) or weapon:GetClass() ~= "gmod_tool" then return end
 

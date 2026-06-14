@@ -39,7 +39,7 @@ local function cfg(tool, out)
         out.worldBspGridMode = "global"
     end
     out.worldBspGridSize = math.Clamp(clientNumber(tool, "world_bsp_grid_size", 16), 0.125, 512)
-    out.worldBspBudgetMs = math.Clamp(clientNumber(tool, "world_bsp_budget_ms", 2.5), 0.1, 8)
+    out.worldBspBudgetMs = math.Clamp(clientNumber(tool, "world_bsp_budget_ms", 2.5), 0.1, 50)
     out.worldBspIgnoreBrushBlockers = true
     out.worldBspShowBlockers = clientNumber(tool, "world_bsp_show_blockers", 0) == 1
     out.worldBspFullGrid = clientNumber(tool, "world_bsp_full_grid", 1) == 1

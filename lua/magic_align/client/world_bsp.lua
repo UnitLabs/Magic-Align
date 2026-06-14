@@ -75,7 +75,7 @@ local CONFIG = {
     progressSnapshotInterval = 1,
     defaultBudgetMs = 2.5,
     minBudgetMs = 0.1,
-    maxBudgetMs = 8
+    maxBudgetMs = 50
 }
 
 local BSP = {
@@ -151,6 +151,8 @@ local function resetCache(status)
     cache.displacements = 0
     cache.displacementTotal = 0
     cache.displacementProcessed = 0
+    cache.displacementLinkTotal = 0
+    cache.displacementLinkProcessed = 0
     cache.displacementSurfaces = 0
     cache.displacementSkipped = 0
     cache.displacementError = nil
@@ -171,6 +173,12 @@ local function resetCache(status)
     cache.startedAt = nil
     cache.readyAt = nil
     cache.worker = nil
+    cache.workerKind = nil
+    cache.activity = nil
+    cache.readySource = nil
+    cache.cacheFilePath = nil
+    cache.cacheFileStatus = nil
+    cache.cacheFileWriteMode = nil
     cache.error = nil
     worldBSP.lastTraceSurface = nil
 end
@@ -495,6 +503,102 @@ function worldBSP.shouldBuildCache(settings)
         and settings.worldTarget ~= false
         and settings.worldBspSnap == true
         and usesGlobalGrid(settings)
+end
+
+local BACKGROUND_CACHE_HOOK = "MagicAlignWorldBspCacheBackgroundUpdate"
+
+local function cvarBool(name, fallback)
+    local cvar = GetConVar(name)
+    if not cvar then return fallback == true end
+    return cvar:GetBool()
+end
+
+local function cvarNumber(name, fallback)
+    local cvar = GetConVar(name)
+    if not cvar then return fallback end
+    return tonumber(cvar:GetString()) or fallback
+end
+
+local function cvarString(name, fallback)
+    local cvar = GetConVar(name)
+    if not cvar then return fallback end
+    return tostring(cvar:GetString() or fallback)
+end
+
+function worldBSP.currentClientSettings()
+    local mode = string.lower(cvarString("magic_align_world_bsp_grid_mode", "global"))
+    if mode ~= "global" and mode ~= "global_units" then
+        mode = "per_surface"
+    else
+        mode = "global"
+    end
+
+    return {
+        worldTarget = cvarBool("magic_align_world_target", true),
+        worldBspSnap = cvarBool("magic_align_world_bsp_snap", true),
+        worldBspGridMode = mode,
+        worldBspGridSize = clampWorldGridStep(cvarNumber("magic_align_world_bsp_grid_size", WORLD_GRID.defaultStep)),
+        worldBspBudgetMs = math.Clamp(cvarNumber("magic_align_world_bsp_budget_ms", CONFIG.defaultBudgetMs), CONFIG.minBudgetMs, CONFIG.maxBudgetMs),
+        worldBspIgnoreBrushBlockers = true,
+        worldBspShowBlockers = cvarBool("magic_align_world_bsp_show_blockers", false),
+        worldBspFullGrid = cvarBool("magic_align_world_bsp_full_grid", true)
+    }
+end
+
+local function stopBackgroundUpdate()
+    if hook and hook.Remove then
+        hook.Remove("Think", BACKGROUND_CACHE_HOOK)
+    end
+
+    worldBSP.backgroundUpdateActive = false
+    worldBSP.backgroundUpdateRunning = false
+end
+
+function worldBSP.ensureBackgroundUpdate()
+    if worldBSP.backgroundUpdateActive then return true end
+    if not hook or not hook.Add then return false end
+
+    worldBSP.backgroundUpdateActive = true
+    hook.Add("Think", BACKGROUND_CACHE_HOOK, function()
+        if worldBSP.backgroundUpdateRunning then return end
+
+        local settings = worldBSP.currentClientSettings()
+        local cacheEnabled = worldBSP.shouldBuildCache(settings)
+        local rebuildRequested = worldBSP.forceRebuildRequested == true
+        local shouldTick = cache.status == cache.STATUS.BUILDING
+            or (rebuildRequested and cacheEnabled)
+            or (cache.status == cache.STATUS.IDLE and cacheEnabled)
+
+        if rebuildRequested and not cacheEnabled and cache.status ~= cache.STATUS.BUILDING then
+            cache.cacheFileStatus = "manual rebuild queued; enable World Units to build"
+        end
+
+        if not shouldTick then
+            stopBackgroundUpdate()
+            return
+        end
+
+        worldBSP.backgroundUpdateRunning = true
+        local ok, err = pcall(worldBSP.update, settings)
+        worldBSP.backgroundUpdateRunning = false
+
+        if not ok then
+            cache.status = cache.STATUS.ERROR
+            cache.error = tostring(err)
+            cache.worker = nil
+            cache.workerKind = nil
+            worldBSP.refreshCacheProgressSnapshot(true)
+            print("Magic Align: World BSP snapping failed: " .. cache.error)
+            stopBackgroundUpdate()
+            return
+        end
+
+        if cache.status ~= cache.STATUS.BUILDING and worldBSP.forceRebuildRequested ~= true then
+            stopBackgroundUpdate()
+        end
+    end)
+
+    return true
 end
 
 local function buildGlobalFamilies(surfaceData)
@@ -1335,6 +1439,14 @@ function worldBSP.cacheOverallProgress()
         done = done + math.Clamp(displacementProcessed, 0, displacementTotal)
     end
 
+    local displacementLinkTotal = tonumber(cache.displacementLinkTotal) or 0
+    local displacementLinkProcessed = tonumber(cache.displacementLinkProcessed) or 0
+    if displacementLinkTotal > 0 or displacementLinkProcessed > 0 then
+        displacementLinkTotal = math.max(displacementLinkTotal, displacementLinkProcessed)
+        total = total + displacementLinkTotal
+        done = done + math.Clamp(displacementLinkProcessed, 0, displacementLinkTotal)
+    end
+
     local neighborTotal = tonumber(cache.neighborTotal) or 0
     local neighborProcessed = tonumber(cache.neighborProcessed) or 0
     if neighborTotal > 0 or neighborProcessed > 0 then
@@ -1430,6 +1542,10 @@ function worldBSP.cacheProgress()
 
     return {
         status = currentStatus,
+        activity = cache.activity,
+        readySource = cache.readySource,
+        cacheFilePath = cache.cacheFilePath,
+        cacheFileStatus = cache.cacheFileStatus,
         stage = cache.stage,
         percent = fraction and fraction * 100 or nil,
         fraction = fraction,
@@ -1731,10 +1847,12 @@ local function buildDirectNeighborCache()
     end
 end
 
-local function finishBuild()
+local function finishBuild(readySource)
     cache.status = cache.STATUS.READY
     cache.readyAt = now()
     cache.worker = nil
+    cache.workerKind = nil
+    cache.readySource = readySource or cache.readySource or cache.activity or "built"
     cache.stage = "ready"
     cache.stageProcessed = cache.stageTotal
 
@@ -1760,7 +1878,7 @@ local function finishBuild()
     worldBSP.refreshCacheProgressSnapshot(true)
 end
 
-local function entityIndex(ent)
+function worldBSP.entityIndex(ent)
     local entIndex = ent and ent.EntIndex
     if not isfunction(entIndex) then return end
 
@@ -1768,7 +1886,7 @@ local function entityIndex(ent)
     if ok then return tonumber(index) end
 end
 
-local function entityClass(ent)
+function worldBSP.entityClass(ent)
     local getClass = ent and ent.GetClass
     if not isfunction(getClass) then return end
 
@@ -1776,7 +1894,7 @@ local function entityClass(ent)
     if ok and class ~= nil then return tostring(class) end
 end
 
-local function entityModel(ent)
+function worldBSP.entityModel(ent)
     local getModel = ent and ent.GetModel
     if not isfunction(getModel) then return end
 
@@ -1784,25 +1902,54 @@ local function entityModel(ent)
     if ok and model ~= nil then return tostring(model) end
 end
 
-local function isWorldBrushEntity(ent)
+function worldBSP.isWorldBrushEntity(ent)
     if ent == game.GetWorld() then
         return true
     end
 
-    return entityIndex(ent) == 0
+    return worldBSP.entityIndex(ent) == 0
 end
 
-local function entityIdentity(ent)
-    if isWorldBrushEntity(ent) then
+function worldBSP.entityIdentity(ent)
+    if worldBSP.isWorldBrushEntity(ent) then
         return "world:0"
     end
 
     return ("%s:%s:%s"):format(
-        tostring(entityIndex(ent) or "nil"),
-        tostring(entityClass(ent) or ""),
-        tostring(entityModel(ent) or "")
+        tostring(worldBSP.entityIndex(ent) or "nil"),
+        tostring(worldBSP.entityClass(ent) or ""),
+        tostring(worldBSP.entityModel(ent) or "")
     )
 end
+
+local installWorldBspRecords = include("magic_align/client/world_bsp_records.lua")
+if isfunction(installWorldBspRecords) then
+    installWorldBspRecords(worldBSP, {
+        M = M,
+        VectorP = VectorP,
+        isvector = isvector,
+        normalizedVec = normalizedVec,
+        dot = dot,
+        surfaceUv = surfaceUv,
+        expandBounds = expandBounds,
+        buildGlobalFamilies = buildGlobalFamilies,
+        entityIdentity = worldBSP.entityIdentity
+    })
+else
+    print("Magic Align: World BSP persistent-cache records failed to load.")
+end
+
+worldBSP.cacheInternals = worldBSP.cacheInternals or {}
+worldBSP.cacheInternals.cacheVersion = CACHE_VERSION
+worldBSP.cacheInternals.resetCache = resetCache
+worldBSP.cacheInternals.indexSurface = indexSurface
+worldBSP.cacheInternals.indexSurfacePlane = indexSurfacePlane
+worldBSP.cacheInternals.addSurfaceNeighbor = addSurfaceNeighbor
+worldBSP.cacheInternals.markCachedSurface = worldBSP.markCachedSurface
+worldBSP.cacheInternals.finishBuild = finishBuild
+worldBSP.cacheInternals.maybeYield = maybeYield
+worldBSP.cacheInternals.now = now
+worldBSP.cacheInternals.currentMap = currentMap
 
 local function readWorldBrushSurfaceSources()
     local candidates = {}
@@ -1812,7 +1959,7 @@ local function readWorldBrushSurfaceSources()
     local function addCandidate(ent)
         if ent == nil then return end
 
-        local key = entityIndex(ent) or tostring(ent)
+        local key = worldBSP.entityIndex(ent) or tostring(ent)
         if seen[key] then
             return
         end
@@ -1841,11 +1988,11 @@ local function readWorldBrushSurfaceSources()
                 local sourceIndex = #sources + 1
                 sources[sourceIndex] = {
                     ent = ent,
-                    identity = entityIdentity(ent),
-                    entityIndex = entityIndex(ent),
-                    class = entityClass(ent),
-                    model = entityModel(ent),
-                    isWorld = isWorldBrushEntity(ent),
+                    identity = worldBSP.entityIdentity(ent),
+                    entityIndex = worldBSP.entityIndex(ent),
+                    class = worldBSP.entityClass(ent),
+                    model = worldBSP.entityModel(ent),
+                    isWorld = worldBSP.isWorldBrushEntity(ent),
                     surfaces = surfaces,
                     surfaceCount = #surfaces
                 }
@@ -1857,289 +2004,12 @@ local function readWorldBrushSurfaceSources()
     return sources
 end
 
-local function bspCanRead(data, offset, length)
-    return isstring(data)
-        and offset
-        and length
-        and offset >= 0
-        and length >= 0
-        and offset + length <= #data
-end
-
-local function bspByte(data, offset)
-    return string.byte(data, offset + 1, offset + 1) or 0
-end
-
-local function bspReadUInt16(data, offset)
-    if not bspCanRead(data, offset, 2) then return 0 end
-
-    return bspByte(data, offset) + bspByte(data, offset + 1) * 256
-end
-
-local function bspReadInt16(data, offset)
-    local value = bspReadUInt16(data, offset)
-    if value >= 0x8000 then value = value - 0x10000 end
-    return value
-end
-
-local function bspReadUInt32(data, offset)
-    if not bspCanRead(data, offset, 4) then return 0 end
-
-    return bspByte(data, offset)
-        + bspByte(data, offset + 1) * 0x100
-        + bspByte(data, offset + 2) * 0x10000
-        + bspByte(data, offset + 3) * 0x1000000
-end
-
-local function bspReadInt32(data, offset)
-    local value = bspReadUInt32(data, offset)
-    if value >= 0x80000000 then value = value - 0x100000000 end
-    return value
-end
-
-local function bspReadFloat(data, offset)
-    local value = bspReadUInt32(data, offset)
-    local sign = 1
-    if value >= 0x80000000 then
-        sign = -1
-        value = value - 0x80000000
-    end
-
-    local exponent = math.floor(value / 0x800000)
-    local mantissa = value - exponent * 0x800000
-    if exponent == 255 then
-        return sign * math.huge
-    elseif exponent == 0 then
-        return sign * (mantissa / 0x800000) * 2 ^ (-126)
-    end
-
-    return sign * (1 + mantissa / 0x800000) * 2 ^ (exponent - 127)
-end
-
-local function bspReadVector(data, offset)
-    if not bspCanRead(data, offset, 12) then return end
-
-    return VectorP(
-        bspReadFloat(data, offset),
-        bspReadFloat(data, offset + 4),
-        bspReadFloat(data, offset + 8)
-    )
-end
-
-local function bspReadCString(data, offset, maxLength)
-    if not bspCanRead(data, offset, 1) then return end
-
-    local limit = math.min(#data, offset + (tonumber(maxLength) or 256))
-    local first = offset + 1
-    for i = first, limit do
-        if string.byte(data, i, i) == 0 then
-            return string.sub(data, first, i - 1)
-        end
-    end
-
-    return string.sub(data, first, limit)
-end
-
-local function readCurrentMapBspData()
-    local map = currentMap()
-    if map == "" then
-        return nil, "map name unavailable"
-    end
-
-    local path = "maps/" .. map .. ".bsp"
-    local data = file.Read(path, "GAME")
-    if not isstring(data) or #data == 0 then
-        return nil, "could not read " .. path
-    end
-
-    return data
-end
-
-local function readBspHeader(data)
-    if not bspCanRead(data, 0, BSP.headerSize) then
-        return nil, "BSP header is incomplete"
-    end
-    if string.sub(data, 1, 4) ~= BSP.ident then
-        return nil, "BSP header magic is not VBSP"
-    end
-
-    local header = {
-        version = bspReadInt32(data, 4),
-        lumps = {},
-        mapRevision = bspReadInt32(data, 8 + BSP.headerLumps * 16)
-    }
-
-    for i = 0, BSP.headerLumps - 1 do
-        local offset = 8 + i * 16
-        header.lumps[i] = {
-            fileofs = bspReadInt32(data, offset),
-            filelen = bspReadInt32(data, offset + 4),
-            version = bspReadInt32(data, offset + 8),
-            fourCC = bspReadUInt32(data, offset + 12)
-        }
-    end
-
-    return header
-end
-
-local function bspLump(header, id)
-    return header and header.lumps and header.lumps[id]
-end
-
-local function bspLumpCount(header, id, stride)
-    local lump = bspLump(header, id)
-    if not lump or (lump.filelen or 0) <= 0 or (stride or 0) <= 0 then return 0 end
-
-    return math.floor(lump.filelen / stride)
-end
-
-local function bspLumpIsReadable(data, lump)
-    return lump and lump.fileofs and lump.filelen and lump.filelen > 0
-        and bspCanRead(data, lump.fileofs, lump.filelen)
-end
-
-local function bspLumpIsCompressed(data, lump)
-    if not bspLumpIsReadable(data, lump) then return false end
-    if (tonumber(lump.fourCC) or 0) ~= 0 then return true end
-
-    return string.sub(data, lump.fileofs + 1, lump.fileofs + 4) == BSP.compressedLumpId
-end
-
-local function requiredBspDisplacementLumpsReadable(data, header)
-    local required = {
-        BSP.lumpFaces,
-        BSP.lumpVertexes,
-        BSP.lumpSurfEdges,
-        BSP.lumpEdges,
-        BSP.lumpDispInfo,
-        BSP.lumpDispVerts
-    }
-
-    for i = 1, #required do
-        local id = required[i]
-        local lump = bspLump(header, id)
-        if not bspLumpIsReadable(data, lump) then
-            return false, "required lump " .. tostring(id) .. " is missing"
-        end
-        if bspLumpIsCompressed(data, lump) then
-            return false, "required lump " .. tostring(id) .. " is LZMA-compressed"
-        end
-    end
-
-    return true
-end
-
-local function readBspVertex(data, header, index)
-    local lump = bspLump(header, BSP.lumpVertexes)
-    local count = bspLumpCount(header, BSP.lumpVertexes, BSP.vertexSize)
-    index = tonumber(index) or -1
-    if index < 0 or index >= count then return end
-
-    return bspReadVector(data, lump.fileofs + index * BSP.vertexSize)
-end
-
-local function readBspFace(data, header, index)
-    local lump = bspLump(header, BSP.lumpFaces)
-    local count = bspLumpCount(header, BSP.lumpFaces, BSP.faceSize)
-    index = tonumber(index) or -1
-    if index < 0 or index >= count then return end
-
-    local offset = lump.fileofs + index * BSP.faceSize
-    return {
-        index = index,
-        firstEdge = bspReadInt32(data, offset + 4),
-        numEdges = bspReadInt16(data, offset + 8),
-        texInfo = bspReadInt16(data, offset + 10),
-        dispInfo = bspReadInt16(data, offset + 12)
-    }
-end
-
-local function readBspFaceVertices(data, header, face)
-    if not face or not face.firstEdge or not face.numEdges or face.numEdges < 3 then return end
-
-    local surfEdgeLump = bspLump(header, BSP.lumpSurfEdges)
-    local edgeLump = bspLump(header, BSP.lumpEdges)
-    local surfEdgeCount = bspLumpCount(header, BSP.lumpSurfEdges, BSP.surfEdgeSize)
-    local edgeCount = bspLumpCount(header, BSP.lumpEdges, BSP.edgeSize)
-    if not surfEdgeLump or not edgeLump then return end
-
-    local vertices = {}
-    for i = 0, face.numEdges - 1 do
-        local surfEdgeIndex = face.firstEdge + i
-        if surfEdgeIndex < 0 or surfEdgeIndex >= surfEdgeCount then return end
-
-        local surfEdge = bspReadInt32(data, surfEdgeLump.fileofs + surfEdgeIndex * BSP.surfEdgeSize)
-        local edgeIndex = math.abs(surfEdge)
-        if edgeIndex < 0 or edgeIndex >= edgeCount then return end
-
-        local edgeOffset = edgeLump.fileofs + edgeIndex * BSP.edgeSize
-        local vertexIndex = surfEdge >= 0
-            and bspReadUInt16(data, edgeOffset)
-            or bspReadUInt16(data, edgeOffset + 2)
-        local vertex = readBspVertex(data, header, vertexIndex)
-        if not vertex then return end
-
-        vertices[#vertices + 1] = vertex
-    end
-
-    return vertices
-end
-
-local function readBspTextureName(data, header, texInfoIndex)
-    texInfoIndex = tonumber(texInfoIndex) or -1
-    if texInfoIndex < 0 then return end
-
-    local texInfoLump = bspLump(header, BSP.lumpTexInfo)
-    local texDataLump = bspLump(header, BSP.lumpTexData)
-    local stringTableLump = bspLump(header, BSP.lumpTexDataStringTable)
-    local stringDataLump = bspLump(header, BSP.lumpTexDataStringData)
-    if not (bspLumpIsReadable(data, texInfoLump)
-        and bspLumpIsReadable(data, texDataLump)
-        and bspLumpIsReadable(data, stringTableLump)
-        and bspLumpIsReadable(data, stringDataLump)) then
-        return
-    end
-    if bspLumpIsCompressed(data, texInfoLump)
-        or bspLumpIsCompressed(data, texDataLump)
-        or bspLumpIsCompressed(data, stringTableLump)
-        or bspLumpIsCompressed(data, stringDataLump) then
-        return
-    end
-
-    local texInfoCount = bspLumpCount(header, BSP.lumpTexInfo, BSP.texInfoSize)
-    if texInfoIndex >= texInfoCount then return end
-
-    local texInfoOffset = texInfoLump.fileofs + texInfoIndex * BSP.texInfoSize
-    local texDataIndex = bspReadInt32(data, texInfoOffset + 68)
-    local texDataCount = bspLumpCount(header, BSP.lumpTexData, BSP.texDataSize)
-    if texDataIndex < 0 or texDataIndex >= texDataCount then return end
-
-    local texDataOffset = texDataLump.fileofs + texDataIndex * BSP.texDataSize
-    local nameIndex = bspReadInt32(data, texDataOffset + 12)
-    local nameCount = math.floor((stringTableLump.filelen or 0) / 4)
-    if nameIndex < 0 or nameIndex >= nameCount then return end
-
-    local stringOffset = bspReadInt32(data, stringTableLump.fileofs + nameIndex * 4)
-    if stringOffset < 0 or stringOffset >= stringDataLump.filelen then return end
-
-    return bspReadCString(data, stringDataLump.fileofs + stringOffset, 256)
-end
-
-local function readBspDispInfo(data, header, index)
-    local lump = bspLump(header, BSP.lumpDispInfo)
-    local count = bspLumpCount(header, BSP.lumpDispInfo, BSP.dispInfoSize)
-    index = tonumber(index) or -1
-    if index < 0 or index >= count then return end
-
-    local offset = lump.fileofs + index * BSP.dispInfoSize
-    return {
-        index = index,
-        startPosition = bspReadVector(data, offset),
-        dispVertStart = bspReadInt32(data, offset + 12),
-        power = bspReadInt32(data, offset + 20),
-        mapFace = bspReadUInt16(data, offset + 36)
-    }
-end
+local bspReader = include("magic_align/client/world_bsp_reader.lua")
+bspReader = isfunction(bspReader) and bspReader({
+    BSP = BSP,
+    VectorP = VectorP,
+    currentMap = currentMap
+}) or {}
 
 local function nearestDisplacementStartCorner(vertices, startPosition)
     if not istable(vertices) or not isvector(startPosition) then return end
@@ -2202,15 +2072,15 @@ local function displacementBasePoint(corners, s, t)
 end
 
 local function displacementVertexPosition(data, header, info, corners, side, row, col)
-    local dispVertsLump = bspLump(header, BSP.lumpDispVerts)
-    local dispVertCount = bspLumpCount(header, BSP.lumpDispVerts, BSP.dispVertSize)
+    local dispVertsLump = bspReader.lump(header, BSP.lumpDispVerts)
+    local dispVertCount = bspReader.lumpCount(header, BSP.lumpDispVerts, BSP.dispVertSize)
     local gridSize = side + 1
     local dispVertIndex = (info.dispVertStart or -1) + row * gridSize + col
     if dispVertIndex < 0 or dispVertIndex >= dispVertCount then return end
 
     local offset = dispVertsLump.fileofs + dispVertIndex * BSP.dispVertSize
-    local dispVector = bspReadVector(data, offset)
-    local dispDistance = bspReadFloat(data, offset + 12)
+    local dispVector = bspReader.readVector(data, offset)
+    local dispDistance = bspReader.readFloat(data, offset + 12)
     if not dispVector or not dispDistance then return end
 
     local base = displacementBasePoint(corners, col / side, row / side)
@@ -2341,8 +2211,8 @@ local function addSourceDisplacementQuadTriangles(source, group, materialName, g
 end
 
 local function appendDisplacementSurfacesForInfo(data, header, info, surfaceId)
-    local face = readBspFace(data, header, info.mapFace)
-    local faceVertices = readBspFaceVertices(data, header, face)
+    local face = bspReader.readFace(data, header, info.mapFace)
+    local faceVertices = bspReader.readFaceVertices(data, header, face)
     local corners, cornerErr = orderedDisplacementCorners(faceVertices, info.startPosition)
     if not corners then
         return surfaceId, cornerErr
@@ -2353,7 +2223,7 @@ local function appendDisplacementSurfacesForInfo(data, header, info, surfaceId)
         return surfaceId, side
     end
 
-    local materialName = readBspTextureName(data, header, face and face.texInfo) or "**displacement**"
+    local materialName = bspReader.readTextureName(data, header, face and face.texInfo) or "**displacement**"
     local source = {
         ent = game.GetWorld(),
         identity = "world:0",
@@ -2399,33 +2269,50 @@ local function appendDisplacementSurfacesForInfo(data, header, info, surfaceId)
 end
 
 local function appendBspDisplacementSurfaces(surfaceId)
-    local data, readErr = readCurrentMapBspData()
+    if not (isfunction(bspReader.readCurrentMapData)
+        and isfunction(bspReader.readHeader)
+        and isfunction(bspReader.lump)
+        and isfunction(bspReader.lumpIsReadable)
+        and isfunction(bspReader.requiredDisplacementLumpsReadable)
+        and isfunction(bspReader.lumpCount)
+        and isfunction(bspReader.readDispInfo)
+        and isfunction(bspReader.readVector)
+        and isfunction(bspReader.readFloat)
+        and isfunction(bspReader.readFace)
+        and isfunction(bspReader.readFaceVertices)
+        and isfunction(bspReader.readTextureName)) then
+        cache.displacementError = "BSP reader unavailable"
+        print("Magic Align: BSP displacement parser skipped: " .. cache.displacementError)
+        return surfaceId
+    end
+
+    local data, readErr = bspReader.readCurrentMapData()
     if not data then
         cache.displacementError = readErr
         print("Magic Align: BSP displacement parser skipped: " .. tostring(readErr))
         return surfaceId
     end
 
-    local header, headerErr = readBspHeader(data)
+    local header, headerErr = bspReader.readHeader(data)
     if not header then
         cache.displacementError = headerErr
         print("Magic Align: BSP displacement parser skipped: " .. tostring(headerErr))
         return surfaceId
     end
 
-    local dispInfoLump = bspLump(header, BSP.lumpDispInfo)
-    if not bspLumpIsReadable(data, dispInfoLump) then
+    local dispInfoLump = bspReader.lump(header, BSP.lumpDispInfo)
+    if not bspReader.lumpIsReadable(data, dispInfoLump) then
         return surfaceId
     end
 
-    local ok, lumpErr = requiredBspDisplacementLumpsReadable(data, header)
+    local ok, lumpErr = bspReader.requiredDisplacementLumpsReadable(data, header)
     if not ok then
         cache.displacementError = lumpErr
         print("Magic Align: BSP displacement parser skipped: " .. tostring(lumpErr))
         return surfaceId
     end
 
-    local dispInfoCount = bspLumpCount(header, BSP.lumpDispInfo, BSP.dispInfoSize)
+    local dispInfoCount = bspReader.lumpCount(header, BSP.lumpDispInfo, BSP.dispInfoSize)
     if dispInfoCount <= 0 then return surfaceId end
 
     cache.displacementTotal = dispInfoCount
@@ -2433,7 +2320,7 @@ local function appendBspDisplacementSurfaces(surfaceId)
     worldBSP.setBuildStage("displacements", dispInfoCount, 0)
 
     for i = 0, dispInfoCount - 1 do
-        local info = readBspDispInfo(data, header, i)
+        local info = bspReader.readDispInfo(data, header, i)
         if info then
             local err
             surfaceId, err = appendDisplacementSurfacesForInfo(data, header, info, surfaceId)
@@ -2509,11 +2396,28 @@ local function buildWorker()
 
     surfaceId = appendBspDisplacementSurfaces(surfaceId)
     buildDirectNeighborCache()
+    cache.readySource = "built"
+    if worldBSP.PersistentCache and isfunction(worldBSP.PersistentCache.saveCurrent) then
+        local saved, saveErr = worldBSP.PersistentCache.saveCurrent()
+        if saved == false then
+            cache.cacheFileStatus = "save failed: " .. tostring(saveErr)
+            print("Magic Align: World BSP cache save failed: " .. tostring(saveErr))
+        end
+    end
     finishBuild()
 end
 
-local function startBuild()
+local function startBuild(settings, forceRebuild)
+    if not forceRebuild
+        and worldBSP.PersistentCache
+        and isfunction(worldBSP.PersistentCache.startLoad)
+        and worldBSP.PersistentCache.startLoad(settings) then
+        return
+    end
+
     resetCache(cache.STATUS.BUILDING)
+    cache.activity = "caching"
+    cache.workerKind = "build"
     cache.startedAt = now()
     cache.worker = coroutine.create(buildWorker)
     worldBSP.setBuildStage("starting", 0, 0)
@@ -2523,18 +2427,22 @@ local function startBuild()
 end
 
 function worldBSP.update(settings)
+    local forceRebuild = worldBSP.forceRebuildRequested == true
+
     if not worldBSP.shouldBuildCache(settings) then
         if cache.status == cache.STATUS.BUILDING then
             print("Magic Align: World BSP snapping cache build cancelled; global units grid is not active.")
-            resetCache(cache.STATUS.IDLE)
-        elseif cache.status == cache.STATUS.READY then
             resetCache(cache.STATUS.IDLE)
         end
         return
     end
 
-    if cache.version ~= CACHE_VERSION or cache.map ~= currentMap() or cache.status == cache.STATUS.IDLE then
-        startBuild()
+    if forceRebuild then
+        worldBSP.forceRebuildRequested = false
+    end
+
+    if forceRebuild or cache.version ~= CACHE_VERSION or cache.map ~= currentMap() or cache.status == cache.STATUS.IDLE then
+        startBuild(settings, forceRebuild)
     end
 
     if cache.status ~= cache.STATUS.BUILDING or not cache.worker then return end
@@ -2543,17 +2451,24 @@ function worldBSP.update(settings)
     cache.frameBudgetMs = readBudgetMs(settings)
 
     local worker = cache.worker
-    local ok, err = coroutine.resume(worker)
+    local ok, result, err = coroutine.resume(worker)
     if not ok then
         cache.status = cache.STATUS.ERROR
-        cache.error = tostring(err)
+        cache.error = tostring(result)
         cache.worker = nil
+        cache.workerKind = nil
         worldBSP.refreshCacheProgressSnapshot(true)
         print("Magic Align: World BSP snapping failed: " .. cache.error)
         return
     end
 
     if coroutine.status(worker) == "dead" and cache.status == cache.STATUS.BUILDING then
+        if result == false then
+            local reason = tostring(err or cache.cacheFileStatus or "persistent cache load failed")
+            print("Magic Align: World BSP persistent cache load failed; rebuilding: " .. reason)
+            startBuild(settings, true)
+            return
+        end
         finishBuild()
     elseif cache.status == cache.STATUS.BUILDING then
         worldBSP.refreshCacheProgressSnapshot(false)
@@ -2562,6 +2477,57 @@ end
 
 function worldBSP.isReady()
     return cache.status == cache.STATUS.READY
+end
+
+function worldBSP.requestManualRebuild()
+    worldBSP.forceRebuildRequested = true
+    cache.cacheFileStatus = "manual rebuild queued"
+
+    if cache.status ~= cache.STATUS.BUILDING then
+        resetCache(cache.STATUS.IDLE)
+        cache.cacheFileStatus = "manual rebuild queued"
+    end
+
+    worldBSP.ensureBackgroundUpdate()
+
+    return true
+end
+
+function worldBSP.cacheStatusSummary()
+    local status = tostring(cache.status or cache.STATUS.IDLE)
+    if cache.status == cache.STATUS.READY then
+        local source = cache.readySource == "loaded" and "loaded" or "built"
+        return ("Status: ready (%s, %d surfaces, %d displacement surfaces)."):format(
+            source,
+            tonumber(cache.cached) or #(cache.surfaces or {}),
+            tonumber(cache.displacementSurfaces) or 0
+        )
+    end
+
+    if cache.status == cache.STATUS.BUILDING then
+        local label = cache.activity == "loading" and "loading" or "building"
+        local progress = worldBSP.cacheProgress()
+        return ("Status: %s %s, %s."):format(
+            label,
+            tostring(progress.stage or "cache"),
+            worldBSP.formatProgressPercent(progress.percent)
+        )
+    end
+
+    if cache.status == cache.STATUS.ERROR then
+        return "Status: error (" .. tostring(cache.error or "unknown") .. ")."
+    end
+
+    if cache.status == cache.STATUS.UNAVAILABLE then
+        return "Status: unavailable (" .. tostring(cache.error or "no surfaces") .. ")."
+    end
+
+    local fileStatus = cache.cacheFileStatus
+    if fileStatus then
+        return ("Status: %s (%s)."):format(status, tostring(fileStatus))
+    end
+
+    return "Status: " .. status .. "."
 end
 
 local function addQueriedSurface(surfaces, count, seen, planeSet, surfaceData)
@@ -3875,7 +3841,7 @@ function worldBSP.surfaceSourceIdentity(surfaceData)
 
     local sourceEnt = surfaceData.sourceEnt
     if IsValid(sourceEnt) then
-        return entityIdentity(sourceEnt)
+        return worldBSP.entityIdentity(sourceEnt)
     end
 
     return surfaceData.sourceIdentity or ("%s:%s:%s"):format(
@@ -4267,11 +4233,11 @@ function worldBSP.surfaceTraceEntryIsCurrent(entry, ent)
 
     local source = entry.source
     if source and source.isWorld == true then
-        return isWorldBrushEntity(ent) and entry.identity == "world:0"
+        return worldBSP.isWorldBrushEntity(ent) and entry.identity == "world:0"
     end
 
     if entry.ent ~= ent or not IsValid(ent) then return false end
-    return entry.identity == entityIdentity(ent)
+    return entry.identity == worldBSP.entityIdentity(ent)
 end
 
 function worldBSP.surfaceTraceCacheStatusToken()
@@ -4331,7 +4297,7 @@ function worldBSP.traceMatchesSurfaceSource(tr, surfaceData)
     if not tr or not surfaceData then return false end
 
     if surfaceData.sourceIsWorld == true then
-        return tr.HitWorld == true or isWorldBrushEntity(tr.Entity)
+        return tr.HitWorld == true or worldBSP.isWorldBrushEntity(tr.Entity)
     end
 
     local sourceEnt = surfaceData.sourceEnt
@@ -4339,7 +4305,7 @@ function worldBSP.traceMatchesSurfaceSource(tr, surfaceData)
     if tr.Entity == sourceEnt then return true end
 
     local sourceIndex = surfaceData.sourceEntityIndex
-    return sourceIndex ~= nil and entityIndex(tr.Entity) == sourceIndex
+    return sourceIndex ~= nil and worldBSP.entityIndex(tr.Entity) == sourceIndex
 end
 
 function worldBSP.perSurfaceSameSurfaceFastMatchFromTrace(tr)
@@ -4581,7 +4547,7 @@ function worldBSP.traceBrushSurfaceEntry(tr)
     if not ent then return end
 
     local surfaceTraceCache = worldBSP.surfaceTraceCache
-    local identity = entityIdentity(ent)
+    local identity = worldBSP.entityIdentity(ent)
     local key = identity
     local entries = surfaceTraceCache.entries
     if not istable(entries) then
@@ -4610,10 +4576,10 @@ function worldBSP.traceBrushSurfaceEntry(tr)
     local source = {
         ent = ent,
         identity = identity,
-        entityIndex = entityIndex(ent),
-        class = entityClass(ent),
-        model = entityModel(ent),
-        isWorld = isWorldBrushEntity(ent),
+        entityIndex = worldBSP.entityIndex(ent),
+        class = worldBSP.entityClass(ent),
+        model = worldBSP.entityModel(ent),
+        isWorld = worldBSP.isWorldBrushEntity(ent),
         surfaceCount = #surfaces
     }
 

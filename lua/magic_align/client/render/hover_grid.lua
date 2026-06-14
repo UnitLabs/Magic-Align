@@ -535,7 +535,7 @@ function hoverRender.drawFaceOutline(state, candidate)
     end
 end
 
-function hoverRender.drawGrid(state, candidate)
+function hoverRender.drawGrid(state, candidate, options)
     if not shouldRenderGrid(state, candidate) then return end
 
     local face = candidate.face
@@ -543,7 +543,11 @@ function hoverRender.drawGrid(state, candidate)
     if face.worldBSP and face.globalGrid then
         local previousCursorLineColor = client.worldGridRender.cursorLineColor
         client.worldGridRender.cursorLineColor = cursorLineColor(state, candidate, GRID_CONFIG.snapLineAlpha)
-        client.worldGridRender.drawWorldBspGlobalGrid(face)
+        if istable(options) and options.depthTested and isfunction(client.worldGridRender.drawWorldBspGlobalGridDepthTested) then
+            client.worldGridRender.drawWorldBspGlobalGridDepthTested(face)
+        else
+            client.worldGridRender.drawWorldBspGlobalGrid(face)
+        end
         client.worldGridRender.cursorLineColor = previousCursorLineColor
         return
     end

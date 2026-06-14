@@ -2304,9 +2304,9 @@ function client.prepareWorldBspRenderCandidate(candidate)
     end
 end
 
-function client.worldGridRender.drawWorldBspGlobalGrid(face)
+function client.worldGridRender.drawWorldBspGlobalGridSurface(face)
     local job = face and face._magicAlignWorldGridJob
-    if not job then return end
+    if not job then return false end
 
     local surfaceData = face.surface
     local visibleNeighbors = face._magicAlignWorldGridVisibleNeighborSet
@@ -2328,6 +2328,19 @@ function client.worldGridRender.drawWorldBspGlobalGrid(face)
             client.worldGridRender.drawWorldGridSurfaceBatch(primary[i])
         end
     end
+
+    return true
+end
+
+function client.worldGridRender.drawWorldBspGlobalGridDepthTested(face)
+    if not client.worldGridRender.drawWorldBspGlobalGridSurface(face) then return end
+
+    client.worldGridRender.drawWorldGridSnapCross(face)
+    cam.IgnoreZ(false)
+end
+
+function client.worldGridRender.drawWorldBspGlobalGrid(face)
+    if not client.worldGridRender.drawWorldBspGlobalGridSurface(face) then return end
 
     cam.IgnoreZ(true)
     client.worldGridRender.drawWorldGridSnapCross(face)
@@ -4564,10 +4577,6 @@ local function drawInteractionOverlay(tool, state)
     state._magicAlignPointWorldCache = pointCache
 
     cam.IgnoreZ(true)
-    client.HoverRender.drawFaceOutline(state, hoverCandidate)
-    client.HoverRender.drawWorldBspBlockers(tool, state)
-    client.HoverRender.drawGrid(state, hoverCandidate)
-
     drawPointSet(state.prop1, state.source, colors.source, nil, nil, 0, nil, sourceAnchorOptions, spriteSettings, viewerPos, nil, pointCache)
     if not mirrorActive then
         drawPointSet(state.prop2, state.target, colors.target, nil, nil, 0.5, nil, targetAnchorOptions, spriteSettings, viewerPos, nil, pointCache)
@@ -4674,6 +4683,20 @@ local function drawInteractionOverlay(tool, state)
     cam.IgnoreZ(false)
 end
 
+local depthTestedGridOptions = { depthTested = true }
+
+local function drawInteractionSurfaceOverlay(tool, state)
+    if not istable(state) then return end
+
+    local hoverCandidate = state.hover and (state.hover.candidate or state.hover.overlay)
+
+    cam.IgnoreZ(false)
+    client.HoverRender.drawFaceOutline(state, hoverCandidate)
+    client.HoverRender.drawWorldBspBlockers(tool, state)
+    client.HoverRender.drawGrid(state, hoverCandidate, depthTestedGridOptions)
+    cam.IgnoreZ(false)
+end
+
 function TOOL:DrawHUD()
     local tool, state = client.activeTool()
     if tool ~= self then return end
@@ -4720,23 +4743,28 @@ end
 
 hook.Add("PostDrawOpaqueRenderables", "magic_align_draw", function(bDrawingDepth, bDrawingSkybox)
     if bDrawingDepth or bDrawingSkybox then return end
-    if not shouldDrawOpaqueGhostPass() then return end
 
     local tool, state = client.activeTool()
     if not tool then
-        if M.ClientState and IsValid(M.ClientState.ghost) then
-            M.ClientState.ghost:SetNoDraw(true)
-        end
-        if M.ClientState and istable(M.ClientState.linkedGhosts) then
-            for _, ghost in pairs(M.ClientState.linkedGhosts) do
-                if IsValid(ghost) then
-                    ghost:SetNoDraw(true)
+        if shouldDrawOpaqueGhostPass() then
+            if M.ClientState and IsValid(M.ClientState.ghost) then
+                M.ClientState.ghost:SetNoDraw(true)
+            end
+            if M.ClientState and istable(M.ClientState.linkedGhosts) then
+                for _, ghost in pairs(M.ClientState.linkedGhosts) do
+                    if IsValid(ghost) then
+                        ghost:SetNoDraw(true)
+                    end
                 end
             end
         end
         return
     end
     if not client.validateState(tool, state) then return end
+
+    drawInteractionSurfaceOverlay(tool, state)
+
+    if not shouldDrawOpaqueGhostPass() then return end
 
     local ghostEntries = shapeMetricCache.renderPerf.reusableGhostEntries or {}
     shapeMetricCache.renderPerf.reusableGhostEntries = ghostEntries

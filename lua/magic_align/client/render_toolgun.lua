@@ -22,8 +22,9 @@ local COMPASS_RING_RT_HALF = COMPASS_RING_RT_SIZE * 0.5
 local COMPASS_RING_RT_NAME = "magic_align_toolgun_compass_ring_48_v1"
 local COMPASS_RING_MATERIAL_NAME = "magic_align_toolgun_compass_ring_48_mat_v1"
 local COMPASS_RING_REBUILD_HOOK = "MagicAlignToolgunCompassRingRebuild"
-local WORLDGRID_CACHE_LABEL = "LOADING GRID"
-local WORLDGRID_CACHE_PHASE_COUNT = 5
+local WORLDGRID_CACHE_LABEL_LOADING = "LOADING GRID"
+local WORLDGRID_CACHE_LABEL_CACHING = "CACHING GRID"
+local WORLDGRID_CACHE_PHASE_COUNT = 6
 local WORLDGRID_CACHE_OVERALL_TRACK = Color(34, 40, 50)
 local WORLDGRID_CACHE_OVERALL_FILL = Color(76, 96, 124)
 local TAU = math.pi * 2
@@ -831,6 +832,11 @@ end
 
 local function worldGridCacheAccent(progress)
     local stage = progress and progress.stage
+    if stage == "load_surfaces" then return panelAccent.prop1 or palette.idle end
+    if stage == "load_displacement_groups" then return panelAccent.prop2 or palette.idle end
+    if stage == "load_displacement_group_links" then return footerTabAccent.points or palette.idle end
+    if stage == "load_neighbor_links" then return footerTabAccent.mirror or palette.idle end
+    if stage == "save_cache" then return footerTabAccent.points or palette.idle end
     if stage == "displacements" then return panelAccent.prop2 or palette.idle end
     if stage == "neighbor_index" then return footerTabAccent.points or palette.idle end
     if stage == "neighbor_count" then return footerTabAccent.world or palette.idle end
@@ -841,12 +847,24 @@ end
 
 local function worldGridCachePhaseIndex(progress)
     local stage = progress and progress.stage
+    if stage == "load_displacement_groups" then return 2 end
+    if stage == "load_displacement_group_links" then return 3 end
+    if stage == "load_neighbor_links" then return 4 end
+    if stage == "save_cache" then return 6 end
     if stage == "displacements" then return 2 end
     if stage == "neighbor_index" then return 3 end
     if stage == "neighbor_count" then return 4 end
     if stage == "neighbor_links" then return 5 end
 
     return 1
+end
+
+local function worldGridCachePhaseCount(progress)
+    if progress and progress.activity == "loading" then
+        return 4
+    end
+
+    return WORLDGRID_CACHE_PHASE_COUNT
 end
 
 local function stageProgressFraction(progress)
@@ -866,8 +884,9 @@ end
 local function overallProgressFraction(progress)
     local phaseIndex = worldGridCachePhaseIndex(progress)
     local phaseFraction = stageProgressFraction(progress)
+    local phaseCount = worldGridCachePhaseCount(progress)
 
-    return math.Clamp((phaseIndex - 1 + phaseFraction) / WORLDGRID_CACHE_PHASE_COUNT, 0, 1)
+    return math.Clamp((phaseIndex - 1 + phaseFraction) / phaseCount, 0, 1)
 end
 
 local function formatEtaClock(seconds)
@@ -883,9 +902,12 @@ end
 local function drawWorldGridCacheHeader(width, progress, accent)
     local etaText = formatEtaClock(progress and (progress.eta or progress.stageEta))
     local font = "MagicAlignToolgunBrand"
+    local label = progress and progress.activity == "loading"
+        and WORLDGRID_CACHE_LABEL_LOADING
+        or WORLDGRID_CACHE_LABEL_CACHING
     accent = accent or worldGridCacheAccent(progress)
 
-    draw.SimpleText(WORLDGRID_CACHE_LABEL, font, 24, 30, palette.text, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
+    draw.SimpleText(label, font, 24, 30, palette.text, TEXT_ALIGN_LEFT, TEXT_ALIGN_TOP)
     draw.SimpleText(etaText, font, width - 24, 30, palette.text, TEXT_ALIGN_RIGHT, TEXT_ALIGN_TOP)
 
     local x = 20

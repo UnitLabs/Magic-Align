@@ -119,6 +119,16 @@ if CLIENT then
         1
     )
 
+    CreateClientConVar(
+        "magic_align_hide_expensive_quality_chat_warning",
+        "0",
+        true,
+        false,
+        "Hide the once-per-spawn Magic Align expensive gizmo quality chat warning.",
+        0,
+        1
+    )
+
     language.Add("tool.magic_align.name", "Magic Align")
     language.Add("tool.magic_align.desc", TOOL_UI.defaultDescription)
     language.Add("tool.magic_align.left", "Place & Move Points | Manipulate Gizmo")

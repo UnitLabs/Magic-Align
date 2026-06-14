@@ -149,6 +149,51 @@ local function ringQualityInfo(index)
     return index, ringQualityPresets[index] or ringQualityPresets[defaultRingQualityIndex]
 end
 
+local function ringQualityDisplayName(index)
+    local _, preset = ringQualityInfo(index)
+    if not preset then return "High" end
+
+    if preset.realtime then
+        return ("Expensive %s"):format(preset.label or "")
+    end
+
+    return tostring(preset.label or "")
+end
+
+local function recommendedRingQualityIndex()
+    local targetLabel = isfunction(ScrH) and ScrH() > 1080 and "Ultra" or "High"
+
+    for i = 1, #ringQualityPresets do
+        local preset = ringQualityPresets[i]
+        if preset and not preset.realtime and preset.label == targetLabel then
+            return i
+        end
+    end
+
+    return clampRingQualityIndex(targetLabel == "Ultra" and 4 or 3)
+end
+
+local function recommendedRingQualityDisplayName()
+    return ringQualityDisplayName(recommendedRingQualityIndex())
+end
+
+local function ringQualityTooltipText(index)
+    local _, preset = ringQualityInfo(index)
+    local displayName = ringQualityDisplayName(index)
+    local lines = { "Current: " .. displayName .. "." }
+
+    if preset and preset.realtime then
+        lines[#lines + 1] = "Expensive presets improve distant gizmo ring visibility and add extra quality headroom, but can heavily reduce FPS."
+    else
+        lines[#lines + 1] = "Standard presets are for general use."
+    end
+
+    lines[#lines + 1] = "High is recommended up to 1080p. Ultra is recommended above 1080p."
+    lines[#lines + 1] = "Recommended for your resolution: " .. recommendedRingQualityDisplayName() .. "."
+
+    return table.concat(lines, "\n")
+end
+
 local persistedMenuConVars = {
     "magic_align_rotation_snap",
     "magic_align_translation_snap",
@@ -171,6 +216,7 @@ local persistedMenuConVars = {
     "magic_align_preview_occluded_b",
     "magic_align_preview_occluded_a",
     "magic_align_ring_quality",
+    "magic_align_hide_expensive_quality_chat_warning",
     "magic_align_toolgun_sound_volume",
     "magic_align_highlight_context_menu",
     "magic_align_disable_smartsnap_active",
@@ -306,6 +352,13 @@ end
 local function setWorldGridMode(mode)
     mode = (mode == "global" or mode == "global_units") and "global" or "per_surface"
     setStringConVar("magic_align_world_bsp_grid_mode", mode)
+
+    if mode == "global" then
+        local worldBSP = M.Client and M.Client.WorldBSP
+        if worldBSP and isfunction(worldBSP.ensureBackgroundUpdate) then
+            worldBSP.ensureBackgroundUpdate()
+        end
+    end
 end
 
 local function worldGridPresetFraction(value)
@@ -528,6 +581,10 @@ local menuAccentColors = {
     mirror = solidColor(clientColors.mirror, Color(176, 112, 235)),
     world = Color(128, 134, 144)
 }
+local ringQualityRecommendationColor = Color(72, 190, 104, 255)
+local ringQualityRecommendationFill = Color(72, 190, 104, 34)
+local ringQualityExpensiveColor = Color(210, 64, 64, 110)
+local ringQualityExpensiveFill = Color(210, 64, 64, 20)
 
 local spaceTabAccent = {
     prop1 = menuAccentColors.source,
@@ -536,6 +593,75 @@ local spaceTabAccent = {
     world = menuAccentColors.world,
     mirror = menuAccentColors.mirror
 }
+
+local expensiveQualityWarningState = client.expensiveQualityWarningState or {}
+client.expensiveQualityWarningState = expensiveQualityWarningState
+
+local function expensiveQualityWarningHidden()
+    local cvar = GetConVar("magic_align_hide_expensive_quality_chat_warning")
+    return cvar and cvar:GetBool()
+end
+
+local function expensiveRingQualityEnabled()
+    local _, preset = ringQualityInfo(currentRingQualityIndex())
+    return preset and preset.realtime == true
+end
+
+local function addMagicAlignExpensiveQualityWarning()
+    if not chat or not isfunction(chat.AddText) then return end
+
+    local body = Color(232, 232, 232)
+
+    chat.AddText(
+        body, "[",
+        menuAccentColors.source, "M",
+        body, "agic ",
+        menuAccentColors.target, "A",
+        body, "lign] Expensive gizmo quality is enabled. This can heavily reduce FPS. Recommended: ",
+        ringQualityRecommendationColor, recommendedRingQualityDisplayName(),
+        body, " for your resolution. You can disable this warning in Magic Align Options under Performance."
+    )
+end
+
+local function resetExpensiveQualityWarningForSpawn()
+    expensiveQualityWarningState.checkedThisSpawn = false
+end
+
+hook.Remove("PlayerSpawn", "MagicAlignExpensiveQualityWarningReset")
+hook.Add("PlayerSpawn", "MagicAlignExpensiveQualityWarningReset", function(ply)
+    if IsValid(ply) and ply == LocalPlayer() then
+        resetExpensiveQualityWarningForSpawn()
+    end
+end)
+
+hook.Remove("Think", "MagicAlignExpensiveQualityWarning")
+hook.Add("Think", "MagicAlignExpensiveQualityWarning", function()
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
+
+    if isfunction(ply.Alive) and not ply:Alive() then
+        expensiveQualityWarningState.wasAlive = false
+        resetExpensiveQualityWarningForSpawn()
+        return
+    end
+
+    if expensiveQualityWarningState.wasAlive == false then
+        resetExpensiveQualityWarningForSpawn()
+    end
+    expensiveQualityWarningState.wasAlive = true
+
+    local getter = M.GetActiveClassicMagicAlignTool or M.GetActiveMagicAlignTool
+    local activeTool = getter and getter(ply) or nil
+    if not activeTool then return end
+
+    if expensiveQualityWarningState.checkedThisSpawn then return end
+
+    expensiveQualityWarningState.checkedThisSpawn = true
+
+    if expensiveQualityWarningHidden() or not expensiveRingQualityEnabled() then return end
+
+    addMagicAlignExpensiveQualityWarning()
+end)
 
 local function wrapLabelText(text, font, maxWidth)
     text = tostring(text or "")
@@ -994,6 +1120,78 @@ local function stylePanelSlider(slider, options)
     slider:InvalidateLayout(true)
 end
 
+local function installRingQualityRecommendationMarker(slider)
+    if not IsValid(slider) or not IsValid(slider.Slider) then return end
+
+    local innerSlider = slider.Slider
+    local originalPaintOver = innerSlider.PaintOver
+
+    innerSlider.PaintOver = function(self, w, h)
+        if isfunction(originalPaintOver) then
+            originalPaintOver(self, w, h)
+        end
+
+        local minValue = isfunction(slider.GetMin) and tonumber(slider:GetMin()) or 1
+        local maxValue = isfunction(slider.GetMax) and tonumber(slider:GetMax()) or #ringQualityPresets
+        local range = math.max(maxValue - minValue, 1)
+        local markerWidth = 16
+        local markerHeight = math.max(h - 2, 10)
+        local markerHalf = markerWidth * 0.5
+        local trackLeft = markerHalf + 1
+        local trackRight = math.max(w - markerHalf - 1, trackLeft + 1)
+        local trackWidth = math.max(trackRight - trackLeft, 1)
+        local y = math.floor((h - markerHeight) * 0.5)
+        local expensiveStart
+        local expensiveEnd
+
+        for i = 1, #ringQualityPresets do
+            local preset = ringQualityPresets[i]
+            if preset and preset.realtime then
+                expensiveStart = math.min(expensiveStart or i, i)
+                expensiveEnd = math.max(expensiveEnd or i, i)
+            end
+        end
+
+        if expensiveStart and expensiveEnd then
+            local startFraction = math.Clamp((expensiveStart - minValue) / range, 0, 1)
+            local endFraction = math.Clamp((expensiveEnd - minValue) / range, 0, 1)
+            local startX = math.floor(startFraction * trackWidth + trackLeft - markerHalf + 0.5)
+            local endX = math.floor(endFraction * trackWidth + trackLeft + markerHalf + 0.5)
+            startX = math.Clamp(startX, 0, math.max(w - markerWidth, 0))
+            endX = math.Clamp(endX, math.min(startX + markerWidth, w), w)
+            local width = math.max(endX - startX, markerWidth)
+
+            draw.RoundedBox(4, startX, y, width, markerHeight, ringQualityExpensiveFill)
+            surface.SetDrawColor(ringQualityExpensiveColor)
+            surface.DrawOutlinedRect(startX, y, width, markerHeight, 1)
+        end
+
+        local recommended = recommendedRingQualityIndex()
+        local fraction = math.Clamp((recommended - minValue) / range, 0, 1)
+        local x = math.floor(fraction * trackWidth + trackLeft + 0.5)
+        local markerX = math.Clamp(math.floor(x - markerHalf + 0.5), 0, math.max(w - markerWidth, 0))
+
+        draw.RoundedBox(4, markerX, y, markerWidth, markerHeight, ringQualityRecommendationFill)
+        surface.SetDrawColor(ringQualityRecommendationColor)
+        surface.DrawOutlinedRect(markerX, y, markerWidth, markerHeight, 1)
+    end
+
+    if IsValid(innerSlider.Knob) then
+        local originalKnobPaint = innerSlider.Knob.Paint
+
+        innerSlider.Knob.Paint = function(self, w, h)
+            if isfunction(originalKnobPaint) then
+                originalKnobPaint(self, w, h)
+            end
+
+            if currentRingQualityIndex() ~= recommendedRingQualityIndex() then return end
+
+            surface.SetDrawColor(ringQualityRecommendationColor)
+            surface.DrawOutlinedRect(0, 0, w, h, 2)
+        end
+    end
+end
+
 local function styleFlatButton(button, text)
     button.displayText = text or button:GetText()
     button:SetText("")
@@ -1010,6 +1208,23 @@ local function styleFlatButton(button, text)
         surface.SetDrawColor(menuColors.border)
         surface.DrawOutlinedRect(0, 0, w, h, 1)
         draw.SimpleText(self.displayText, "DermaDefaultBold", w * 0.5, h * 0.5, menuColors.text, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+    end
+end
+
+local function styleSubtleButton(button, text)
+    button.displayText = text or button:GetText()
+    button:SetText("")
+
+    button.Paint = function(self, w, h)
+        local bg = self:IsHovered() and menuColors.buttonHover or menuColors.panelSoft
+        if self:IsDown() then
+            bg = menuColors.buttonDown
+        end
+
+        draw.RoundedBox(4, 0, 0, w, h, bg)
+        surface.SetDrawColor(menuColors.inputBorder)
+        surface.DrawOutlinedRect(0, 0, w, h, 1)
+        draw.SimpleText(self.displayText, "DermaDefault", w * 0.5, h * 0.5, menuColors.textMuted, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
     end
 end
 
@@ -1987,6 +2202,114 @@ local function createInterpolationBoard(parent)
     return board
 end
 
+local function setSnapTitleText(label, text)
+    if not IsValid(label) then
+        return
+    end
+
+    text = tostring(text or "")
+    if label:GetText() == text then
+        return
+    end
+
+    label:SetText(text)
+    label:SetTall(18)
+    label:InvalidateLayout(true)
+
+    local parent = label:GetParent()
+    if IsValid(parent) then
+        parent:InvalidateLayout(true)
+    end
+end
+
+local function createRingQualityControls(parent)
+    local ringQualityTitle = vgui.Create("DLabel", parent)
+    ringQualityTitle:SetText("")
+    ringQualityTitle:SetFont("DermaDefaultBold")
+    styleOutlinedLabel(ringQualityTitle, menuColors.text)
+    ringQualityTitle:SetDark(true)
+    ringQualityTitle:SetTall(18)
+    parent:AddItem(ringQualityTitle, 0)
+
+    local ringQualitySlider = vgui.Create("DNumSlider", parent)
+    ringQualitySlider:SetText("Preset")
+    ringQualitySlider:SetMinMax(1, #ringQualityPresets)
+    ringQualitySlider:SetDecimals(0)
+    stylePanelSlider(ringQualitySlider, {
+        labelWide = 44,
+        textWide = 56,
+        tall = 30,
+        textColor = menuColors.text,
+        outlineLabel = true
+    })
+    installSliderDisplayRounding(ringQualitySlider, 0)
+    installRingQualityRecommendationMarker(ringQualitySlider)
+    parent:AddItem(ringQualitySlider, 8)
+
+    local updatingRingQuality = false
+    local function updateRingQualityUi(value)
+        local index, preset = ringQualityInfo(value)
+        local recommendedIndex = recommendedRingQualityIndex()
+        local recommendedName = ringQualityDisplayName(recommendedIndex)
+        local text = preset and preset.realtime
+            and ("Quality: Expensive %s. Rec: %s"):format(
+                preset.label,
+                recommendedName
+            )
+            or (index == recommendedIndex
+                and ("Quality: %s"):format(preset.label)
+                or ("Quality: %s. Rec: %s"):format(
+                preset.label,
+                recommendedName
+            ))
+        local tooltip = ringQualityTooltipText(index)
+
+        setSnapTitleText(ringQualityTitle, text)
+        ringQualityTitle:SetTooltip(tooltip)
+        ringQualitySlider:SetTooltip(tooltip)
+        if IsValid(ringQualitySlider.Label) then
+            ringQualitySlider.Label:SetTooltip(tooltip)
+        end
+        if IsValid(ringQualitySlider.Slider) then
+            ringQualitySlider.Slider:SetTooltip(tooltip)
+        end
+        if IsValid(ringQualitySlider.TextArea) then
+            ringQualitySlider.TextArea:SetTooltip(tooltip)
+        end
+
+        if not updatingRingQuality and math.abs((tonumber(ringQualitySlider:GetValue()) or index) - index) > 1e-4 then
+            updatingRingQuality = true
+            ringQualitySlider:SetValue(index)
+            updatingRingQuality = false
+        end
+    end
+
+    ringQualitySlider.OnValueChanged = function(self, value)
+        if updatingRingQuality then return end
+        local index = clampRingQualityIndex(value)
+        if math.abs((tonumber(value) or index) - index) > 1e-4 then
+            updatingRingQuality = true
+            self:SetValue(index)
+            updatingRingQuality = false
+        end
+        setRingQualityIndex(index)
+        updateRingQualityUi(index)
+    end
+
+    local initialRingQuality = currentRingQualityIndex()
+    setRingQualityIndex(initialRingQuality)
+    ringQualitySlider:SetValue(initialRingQuality)
+    updateRingQualityUi(initialRingQuality)
+
+    local expensiveQualityWarningCheckBox = addStyledCheckBox(parent, "Hide Expensive quality chat warning", "magic_align_hide_expensive_quality_chat_warning")
+    expensiveQualityWarningCheckBox:SetTooltip("Only hides the once-per-spawn chat warning. Slider recommendations and tooltips stay visible.")
+
+    return function()
+        if not IsValid(ringQualitySlider) or ringQualitySlider:IsEditing() then return end
+        updateRingQualityUi(currentRingQualityIndex())
+    end
+end
+
 function TOOL.BuildCPanel(panel)
     applyPersistedMenuConVars()
     registerSessionTabCallbacks()
@@ -2156,26 +2479,6 @@ function TOOL.BuildCPanel(panel)
     local snapCategoryContent = createStackPanel(panel, {
         spacing = 6
     })
-
-    local function setSnapTitleText(label, text)
-        if not IsValid(label) then
-            return
-        end
-
-        text = tostring(text or "")
-        if label:GetText() == text then
-            return
-        end
-
-        label:SetText(text)
-        label:SetTall(18)
-        label:InvalidateLayout(true)
-
-        local parent = label:GetParent()
-        if IsValid(parent) then
-            parent:InvalidateLayout(true)
-        end
-    end
 
     local rotationSnapTitle = vgui.Create("DLabel", snapCategoryContent)
     rotationSnapTitle:SetText("")
@@ -2402,8 +2705,8 @@ function TOOL.BuildCPanel(panel)
     addStyledCheckBox(worldGridCategoryContent, "Show Portal-Entities on Hover", "magic_align_world_bsp_show_blockers")
 
     local worldGridChoices = {
-        { label = "Per Surface", value = "per_surface" },
-        { label = "Global Units", value = "global" }
+        { label = "A/B Grid", value = "per_surface" },
+        { label = "World Grid", value = "global" }
     }
     local worldGridModeCombo = createStyledModeCombo(
         worldGridCategoryContent,
@@ -2414,7 +2717,7 @@ function TOOL.BuildCPanel(panel)
     worldGridCategoryContent:AddItem(worldGridModeCombo, 4)
 
     local worldGridSizeSlider = vgui.Create(magicSliderClass, worldGridCategoryContent)
-    worldGridSizeSlider:SetText("Global Units")
+    worldGridSizeSlider:SetText("World Grid")
     worldGridSizeSlider:SetMinMax(worldGridUnitPresets[1], worldGridUnitPresets[#worldGridUnitPresets])
     worldGridSizeSlider:SetDecimals(3)
     worldGridSizeSlider:SetConVar("magic_align_world_bsp_grid_size")
@@ -2486,64 +2789,7 @@ function TOOL.BuildCPanel(panel)
         spacing = 6
     })
 
-    local ringQualityTitle = vgui.Create("DLabel", performanceCategoryContent)
-    ringQualityTitle:SetText("")
-    ringQualityTitle:SetFont("DermaDefaultBold")
-    styleOutlinedLabel(ringQualityTitle, menuColors.text)
-    ringQualityTitle:SetDark(true)
-    ringQualityTitle:SetTall(18)
-    performanceCategoryContent:AddItem(ringQualityTitle, 0)
-
-    local ringQualitySlider = vgui.Create("DNumSlider", performanceCategoryContent)
-    ringQualitySlider:SetText("Preset")
-    ringQualitySlider:SetMinMax(1, #ringQualityPresets)
-    ringQualitySlider:SetDecimals(0)
-    stylePanelSlider(ringQualitySlider, {
-        labelWide = 44,
-        textWide = 56,
-        tall = 30,
-        textColor = menuColors.text,
-        outlineLabel = true
-    })
-    installSliderDisplayRounding(ringQualitySlider, 0)
-    performanceCategoryContent:AddItem(ringQualitySlider, 8)
-
-    local updatingRingQuality = false
-    local function updateRingQualityUi(value)
-        local index, preset = ringQualityInfo(value)
-        local text = preset and preset.realtime
-            and ("Quality: Expensive %s. Costs more CPU."):format(
-                preset.label
-            )
-            or ("Quality: Cheap %s. Costs more VRAM."):format(
-                preset.label
-            )
-
-        setSnapTitleText(ringQualityTitle, text)
-
-        if not updatingRingQuality and math.abs((tonumber(ringQualitySlider:GetValue()) or index) - index) > 1e-4 then
-            updatingRingQuality = true
-            ringQualitySlider:SetValue(index)
-            updatingRingQuality = false
-        end
-    end
-
-    ringQualitySlider.OnValueChanged = function(self, value)
-        if updatingRingQuality then return end
-        local index = clampRingQualityIndex(value)
-        if math.abs((tonumber(value) or index) - index) > 1e-4 then
-            updatingRingQuality = true
-            self:SetValue(index)
-            updatingRingQuality = false
-        end
-        setRingQualityIndex(index)
-        updateRingQualityUi(index)
-    end
-
-    local initialRingQuality = currentRingQualityIndex()
-    setRingQualityIndex(initialRingQuality)
-    ringQualitySlider:SetValue(initialRingQuality)
-    updateRingQualityUi(initialRingQuality)
+    local updateRingQualityControls = createRingQualityControls(performanceCategoryContent)
 
     addStyledCheckBox(performanceCategoryContent, "Show Hidden Preview", "magic_align_preview_occluded")
     performanceCategoryContent:AddItem(createPreviewOccludedColorPicker(performanceCategoryContent), 8)
@@ -2552,9 +2798,9 @@ function TOOL.BuildCPanel(panel)
         "World Caching Budget MS",
         "magic_align_world_bsp_budget_ms",
         0.1,
-        8,
+        50,
         1,
-        { labelWide = 152, textWide = 56, tall = 30 }
+        { labelWide = 128, textWide = 56, tall = 30 }
     )
     performanceCategoryContent:AddItem(createHelpLabel(
         performanceCategoryContent,
@@ -2562,10 +2808,37 @@ function TOOL.BuildCPanel(panel)
         nil,
         true
     ), 0)
+    local worldCacheWarning = createHelpLabel(
+        performanceCategoryContent,
+        "Manual rebuild ignores the saved World BSP cache and scans map geometry again.",
+        nil,
+        true
+    )
+    performanceCategoryContent:AddItem(worldCacheWarning, 0)
+
+    local worldCacheRebuildButton = vgui.Create("DButton", performanceCategoryContent)
+    styleSubtleButton(worldCacheRebuildButton, "Rebuild Cache")
+    worldCacheRebuildButton:SetTall(18)
+    worldCacheRebuildButton:SetTooltip("Force a fresh World BSP cache build and overwrite the saved cache.")
+    worldCacheRebuildButton.DoClick = function()
+        local worldBSP = M.Client and M.Client.WorldBSP
+        if worldBSP and isfunction(worldBSP.requestManualRebuild) then
+            worldBSP.requestManualRebuild()
+        end
+    end
+    performanceCategoryContent:AddItem(worldCacheRebuildButton, 2)
+
+    local worldCacheStatusLabel = createHelpLabel(performanceCategoryContent, "", nil, true)
+    performanceCategoryContent:AddItem(worldCacheStatusLabel, 0)
 
     performanceCategoryContent.Think = function()
-        if not ringQualitySlider:IsEditing() then
-            updateRingQualityUi(currentRingQualityIndex())
+        if updateRingQualityControls then
+            updateRingQualityControls()
+        end
+        local worldBSP = M.Client and M.Client.WorldBSP
+        if IsValid(worldCacheStatusLabel) and worldBSP and isfunction(worldBSP.cacheStatusSummary) then
+            worldCacheStatusLabel:SetText(worldBSP.cacheStatusSummary())
+            worldCacheStatusLabel:SizeToContentsY()
         end
     end
 
