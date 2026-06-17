@@ -13,12 +13,12 @@ return function(worldBSP, deps)
     local surfaceUv = deps.surfaceUv
     local expandBounds = deps.expandBounds
     local buildGlobalFamilies = deps.buildGlobalFamilies
-    local BINARY_MAGIC = "MAWBCV06"
+    local BINARY_MAGIC = "MAWBCV07"
     local BINARY_PREHEADER_SIZE = 64
     local BINARY_MAIN_HEADER_SIZE = 4096
     local BINARY_SECTION_ENTRY_SIZE = 24
-    local BINARY_COORD_SCALE = 1000
-    local BINARY_AXIS_SCALE = 1000000
+    local BINARY_GEOMETRY_FORMAT_FLOAT32_LE = 1
+    local BINARY_GEOMETRY_FORMAT_VERSION = 1
     local BINARY_SURFACE_BASE_INTS = 30
     local BINARY_SURFACE_BASE_RECORD_SIZE = BINARY_SURFACE_BASE_INTS * 4
     local BINARY_VERTEX_RECORD_SIZE = 3 * 4
@@ -92,34 +92,79 @@ return function(worldBSP, deps)
         return value, nextOffset
     end
 
-    local function readInt32Value(data, offset)
-        if not offset then return end
+    -- IEEE754 Float32 logic adapted from StarfallEx bit.lua:
+    -- https://github.com/thegrb93/StarfallEx/blob/a888f0fe05c9dd29940018114b1fc163fd580ea8/lua/starfall/libs_sh/bit.lua
+    -- StarfallEx credits the original float routine to rpfeltz.
+    local function packFloat32(value)
+        value = tonumber(value) or 0
 
-        local b1, b2, b3, b4 = string.byte(data, offset, offset + 3)
-        if not b4 then return end
-
-        local value = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
-        if value >= INT32_SIGN then
-            value = value - UINT32_RANGE
+        if value == 0 then
+            return "\0\0\0\0"
+        elseif value == math.huge then
+            return string.char(0x00, 0x00, 0x80, 0x7F)
+        elseif value == -math.huge then
+            return string.char(0x00, 0x00, 0x80, 0xFF)
+        elseif value ~= value then
+            return string.char(0x00, 0x00, 0xC0, 0xFF)
         end
 
-        return value
-    end
-
-    local function quantize(value, scale)
-        value = finiteNumber(value)
-        if value == nil then return end
-
-        local scaled = value * scale
-        if scaled >= 0 then
-            return clampInt32(scaled + 0.5)
+        local sign = 0x00
+        if value < 0 then
+            sign = 0x80
+            value = -value
         end
 
-        return clampInt32(scaled - 0.5)
+        local mantissa, exponent = math.frexp(value)
+        exponent = exponent + 0x7F
+        if exponent <= 0 then
+            mantissa = math.ldexp(mantissa, exponent - 1)
+            exponent = 0
+        elseif exponent >= 0xFF then
+            return string.char(0x00, 0x00, 0x80, sign + 0x7F)
+        elseif exponent == 1 then
+            exponent = 0
+        else
+            mantissa = mantissa * 2 - 1
+            exponent = exponent - 1
+        end
+
+        mantissa = math.floor(math.ldexp(mantissa, 23) + 0.5)
+        if mantissa >= 0x800000 then
+            mantissa = 0
+            exponent = exponent + 1
+            if exponent >= 0xFF then
+                return string.char(0x00, 0x00, 0x80, sign + 0x7F)
+            end
+        end
+
+        return string.char(
+            mantissa % 0x100,
+            math.floor(mantissa / 0x100) % 0x100,
+            (exponent % 2) * 0x80 + math.floor(mantissa / 0x10000),
+            sign + math.floor(exponent / 2)
+        )
     end
 
-    local function dequantize(value, scale)
-        return (tonumber(value) or 0) / scale
+    local function unpackFloat32(b1, b2, b3, b4)
+        local exponent = (b4 % 0x80) * 0x02 + math.floor(b3 / 0x80)
+        local mantissa = math.ldexp(((b3 % 0x80) * 0x100 + b2) * 0x100 + b1, -23)
+        if exponent == 0xFF then
+            if mantissa > 0 then
+                return 0 / 0
+            end
+            if b4 >= 0x80 then
+                return -math.huge
+            end
+            return math.huge
+        elseif exponent > 0 then
+            mantissa = mantissa + 1
+        else
+            exponent = exponent + 1
+        end
+        if b4 >= 0x80 then
+            mantissa = -mantissa
+        end
+        return math.ldexp(mantissa, exponent - 0x7F)
     end
 
     local function appendInt32(parts, value)
@@ -130,43 +175,40 @@ return function(worldBSP, deps)
         parts[#parts + 1] = packUInt32(value)
     end
 
-    local function appendQuantized(parts, value, scale)
-        local encoded = quantize(value, scale)
-        if encoded == nil then return false end
+    local function appendFloat32(parts, value)
+        value = finiteNumber(value)
+        if value == nil then return false end
 
-        appendInt32(parts, encoded)
+        parts[#parts + 1] = packFloat32(value)
         return true
     end
 
-    local function appendRecordVector(parts, record, scale)
-        return appendQuantized(parts, record and record[1], scale)
-            and appendQuantized(parts, record and record[2], scale)
-            and appendQuantized(parts, record and record[3], scale)
+    local function appendRecordVector(parts, record)
+        return appendFloat32(parts, record and record[1])
+            and appendFloat32(parts, record and record[2])
+            and appendFloat32(parts, record and record[3])
     end
 
-    local function readQuantized(data, offset, scale)
-        local value, nextOffset = readInt32(data, offset)
-        if value == nil then return end
+    local function readFloat32(data, offset)
+        if not offset then return end
 
-        return dequantize(value, scale), nextOffset
+        local b1, b2, b3, b4 = string.byte(data, offset, offset + 3)
+        if not b4 then return end
+
+        local value = unpackFloat32(b1, b2, b3, b4)
+        if value ~= value or value == math.huge or value == -math.huge then return end
+
+        return value, offset + 4
     end
 
-    local function readRecordVector(data, offset, scale)
-        local x = readInt32Value(data, offset)
-        local y = readInt32Value(data, offset and offset + 4)
-        local z = readInt32Value(data, offset and offset + 8)
+    local function readVectorP(data, offset)
+        local x, y, z
+        x, offset = readFloat32(data, offset)
+        y, offset = readFloat32(data, offset)
+        z, offset = readFloat32(data, offset)
         if z == nil then return end
 
-        return { x / scale, y / scale, z / scale }, offset + 12
-    end
-
-    local function readVectorP(data, offset, scale)
-        local x = readInt32Value(data, offset)
-        local y = readInt32Value(data, offset and offset + 4)
-        local z = readInt32Value(data, offset and offset + 8)
-        if z == nil then return end
-
-        return VectorP(x / scale, y / scale, z / scale), offset + 12
+        return VectorP(x, y, z), offset
     end
 
     local function displacementHalfCode(value)
@@ -204,8 +246,8 @@ return function(worldBSP, deps)
         preHeaderSize = BINARY_PREHEADER_SIZE,
         mainHeaderSize = BINARY_MAIN_HEADER_SIZE,
         sectionEntrySize = BINARY_SECTION_ENTRY_SIZE,
-        coordScale = BINARY_COORD_SCALE,
-        axisScale = BINARY_AXIS_SCALE,
+        geometryFormat = BINARY_GEOMETRY_FORMAT_FLOAT32_LE,
+        geometryFormatVersion = BINARY_GEOMETRY_FORMAT_VERSION,
         surfaceBaseRecordSize = BINARY_SURFACE_BASE_RECORD_SIZE,
         vertexRecordSize = BINARY_VERTEX_RECORD_SIZE,
         groupRecordSize = BINARY_GROUP_RECORD_SIZE,
@@ -217,8 +259,10 @@ return function(worldBSP, deps)
         sectionNeighborLinks = 5,
         packUInt32 = packUInt32,
         packInt32 = packInt32,
+        packFloat32 = packFloat32,
         readUInt32 = readUInt32,
-        readInt32 = readInt32
+        readInt32 = readInt32,
+        readFloat32 = readFloat32
     }
 
     local function vectorFromRecord(record)
@@ -366,21 +410,21 @@ return function(worldBSP, deps)
         appendInt32(surfaceParts, flags == 1 and displacementHalfCode(displacement[6]) or 0)
         appendInt32(surfaceParts, flags == 1 and displacementDiagonalCode(displacement[7]) or 0)
 
-        if not (appendRecordVector(surfaceParts, record[3], BINARY_COORD_SCALE)
-            and appendRecordVector(surfaceParts, record[4], BINARY_AXIS_SCALE)
-            and appendRecordVector(surfaceParts, record[5], BINARY_AXIS_SCALE)
-            and appendRecordVector(surfaceParts, record[6], BINARY_AXIS_SCALE)
-            and appendQuantized(surfaceParts, record[7][1], BINARY_COORD_SCALE)
-            and appendQuantized(surfaceParts, record[7][2], BINARY_COORD_SCALE)
-            and appendQuantized(surfaceParts, record[7][3], BINARY_COORD_SCALE)
-            and appendQuantized(surfaceParts, record[7][4], BINARY_COORD_SCALE)
-            and appendRecordVector(surfaceParts, record[8], BINARY_COORD_SCALE)
-            and appendRecordVector(surfaceParts, record[9], BINARY_COORD_SCALE)) then
+        if not (appendRecordVector(surfaceParts, record[3])
+            and appendRecordVector(surfaceParts, record[4])
+            and appendRecordVector(surfaceParts, record[5])
+            and appendRecordVector(surfaceParts, record[6])
+            and appendFloat32(surfaceParts, record[7][1])
+            and appendFloat32(surfaceParts, record[7][2])
+            and appendFloat32(surfaceParts, record[7][3])
+            and appendFloat32(surfaceParts, record[7][4])
+            and appendRecordVector(surfaceParts, record[8])
+            and appendRecordVector(surfaceParts, record[9])) then
             return nil, nil, nil, "failed to encode required surface values"
         end
 
         for i = 1, vertexCount do
-            if not appendRecordVector(vertexParts, vertices[i], BINARY_COORD_SCALE) then
+            if not appendRecordVector(vertexParts, vertices[i]) then
                 return nil, nil, nil, "failed to encode surface vertex"
             end
         end
@@ -444,13 +488,13 @@ return function(worldBSP, deps)
         end
 
         local origin
-        origin, offset = readVectorP(data, offset, BINARY_COORD_SCALE)
+        origin, offset = readVectorP(data, offset)
         local normalRecord
-        normalRecord, offset = readVectorP(data, offset, BINARY_AXIS_SCALE)
+        normalRecord, offset = readVectorP(data, offset)
         local uAxisRecord
-        uAxisRecord, offset = readVectorP(data, offset, BINARY_AXIS_SCALE)
+        uAxisRecord, offset = readVectorP(data, offset)
         local vAxisRecord
-        vAxisRecord, offset = readVectorP(data, offset, BINARY_AXIS_SCALE)
+        vAxisRecord, offset = readVectorP(data, offset)
         if not (origin and normalRecord and uAxisRecord and vAxisRecord) then
             return nil, offset, "invalid surface basis"
         end
@@ -463,21 +507,21 @@ return function(worldBSP, deps)
         end
 
         local uMin
-        uMin, offset = readQuantized(data, offset, BINARY_COORD_SCALE)
+        uMin, offset = readFloat32(data, offset)
         local uMax
-        uMax, offset = readQuantized(data, offset, BINARY_COORD_SCALE)
+        uMax, offset = readFloat32(data, offset)
         local vMin
-        vMin, offset = readQuantized(data, offset, BINARY_COORD_SCALE)
+        vMin, offset = readFloat32(data, offset)
         local vMax
-        vMax, offset = readQuantized(data, offset, BINARY_COORD_SCALE)
+        vMax, offset = readFloat32(data, offset)
         if uMin == nil or uMax == nil or vMin == nil or vMax == nil then
             return nil, offset, "invalid surface uv bounds"
         end
 
         local mins
-        mins, offset = readVectorP(data, offset, BINARY_COORD_SCALE)
+        mins, offset = readVectorP(data, offset)
         local maxs
-        maxs, offset = readVectorP(data, offset, BINARY_COORD_SCALE)
+        maxs, offset = readVectorP(data, offset)
         if not (mins and maxs) then
             return nil, offset, "invalid surface bounds"
         end
@@ -491,7 +535,7 @@ return function(worldBSP, deps)
         local vertexReadOffset = tonumber(vertexSection.offset) + vertexOffset * BINARY_VERTEX_RECORD_SIZE
         for i = 1, vertexCount do
             local vertex
-            vertex, vertexReadOffset = readVectorP(data, vertexReadOffset, BINARY_COORD_SCALE)
+            vertex, vertexReadOffset = readVectorP(data, vertexReadOffset)
             if not vertex then
                 return nil, offset, "invalid surface vertex"
             end

@@ -809,6 +809,9 @@ function EntityMirror.DebugEntity(label, ent, extra, force)
 
     local axis = EntityMirror.GetAxis(ent)
     local flags = EntityMirror.GetFlags(ent)
+    local nwAxis = ent.GetNWInt and ent:GetNWInt(NW_AXIS, M.ENTITY_MIRROR_NONE) or M.ENTITY_MIRROR_NONE
+    local nwFlags = ent.GetNWInt and ent:GetNWInt(NW_FLAGS, M.ENTITY_MIRROR_DEFAULT_FLAGS) or M.ENTITY_MIRROR_DEFAULT_FLAGS
+    local nwRevision = ent.GetNWInt and ent:GetNWInt(NW_REVISION, -1) or -1
     local clientAxis = CLIENT and ent._magicAlignEntityMirrorAxis or nil
     local previewAxis = CLIENT and ent._magicAlignEntityMirrorPreviewAxis or nil
     local phys = ent:GetPhysicsObject()
@@ -820,8 +823,16 @@ function EntityMirror.DebugEntity(label, ent, extra, force)
         ("ent=%s#%s"):format(ent:GetClass(), ent:EntIndex()),
         ("primitive=%s"):format(M.IsPrimitive(ent) and "true" or "false"),
         ("axis=%s"):format(EntityMirror.AxisLabel(axis)),
+        ("nwAxis=%s"):format(EntityMirror.AxisLabel(nwAxis)),
+        ("nwFlags=%s"):format(nwFlags),
+        ("nwRevision=%s"):format(nwRevision),
         ("clientAxis=%s"):format(clientAxis ~= nil and EntityMirror.AxisLabel(clientAxis) or "nil"),
         ("previewAxis=%s"):format(previewAxis ~= nil and EntityMirror.AxisLabel(previewAxis) or "nil"),
+        ("renderOverrideActive=%s"):format(CLIENT and tostring(
+            ent._magicAlignEntityMirrorRenderOverride ~= nil
+                and ent.RenderOverride == ent._magicAlignEntityMirrorRenderOverride
+        ) or "nil"),
+        ("hasRenderMatrix=%s"):format(CLIENT and tostring(ent._magicAlignEntityMirrorMatrix ~= nil) or "nil"),
         ("flags=%s"):format(flags),
         ("pos=%s"):format(debugVector(ent:GetPos())),
         ("ang=%s"):format(debugAngle(ent:GetAngles())),
@@ -1237,9 +1248,17 @@ if SERVER then
     local function networkState(ent, axis, flags)
         if not IsValid(ent) then return end
 
-        ent:SetNWInt(NW_AXIS, validAxis(axis))
-        ent:SetNWInt(NW_FLAGS, validFlags(flags))
+        axis = validAxis(axis)
+        flags = validFlags(flags)
+
+        ent:SetNWInt(NW_AXIS, axis)
+        ent:SetNWInt(NW_FLAGS, flags)
         ent:SetNWInt(NW_REVISION, (ent:GetNWInt(NW_REVISION, 0) + 1) % 65536)
+        EntityMirror.DebugEntity("server-network-state", ent, {
+            networkAxis = EntityMirror.AxisLabel(axis),
+            networkFlags = flags,
+            networkRevision = ent:GetNWInt(NW_REVISION, -1)
+        })
     end
 
     local function storeState(ent, data)
@@ -1431,7 +1450,12 @@ if CLIENT then
     local VISUAL_PREDICTIONS = setmetatable({}, { __mode = "k" })
     local VISUAL_PREDICTIONS_BY_COMMIT = {}
     local VISUAL_PREDICTION_TIMEOUT = 8
+    local VISUAL_PREDICTION_TOKEN = 0
+    local INITIAL_RECONCILE_DELAYS = { 0, 0.05, 0.25, 1 }
+    local INITIAL_RECONCILE_ATTEMPTS = setmetatable({}, { __mode = "k" })
+    local SIZE_HANDLER_REFRESH_ATTEMPTS = setmetatable({}, { __mode = "k" })
     local reconcileEntity
+    local scheduleVisualPredictionExpiry
     local releaseOwnedClientPhysics
 
     local function stateFor(ent)
@@ -1568,6 +1592,46 @@ if CLIENT then
         if not IsValid(ent) then return end
 
         EntityMirror.DebugEntity(label, ent, clientStateExtra(ent, state, extra), force)
+    end
+
+    local function hasBootstrapNetworkState(ent)
+        if not IsValid(ent) or not ent.GetNWInt then return false end
+
+        return ent:GetNWInt(NW_REVISION, -1) >= 0
+            or ent:GetNWInt(NW_AXIS, M.ENTITY_MIRROR_NONE) ~= M.ENTITY_MIRROR_NONE
+            or ent:GetNWInt(NW_FLAGS, M.ENTITY_MIRROR_DEFAULT_FLAGS) ~= M.ENTITY_MIRROR_DEFAULT_FLAGS
+    end
+
+    local function scheduleInitialReconcile(ent, reason, attempt)
+        if not IsValid(ent) then return end
+
+        attempt = math.floor(tonumber(attempt) or 1)
+        if attempt < 1 or attempt > #INITIAL_RECONCILE_DELAYS then return end
+
+        local queuedAttempt = INITIAL_RECONCILE_ATTEMPTS[ent]
+        if queuedAttempt and queuedAttempt >= attempt then return end
+
+        INITIAL_RECONCILE_ATTEMPTS[ent] = attempt
+        timer.Simple(INITIAL_RECONCILE_DELAYS[attempt] or 0, function()
+            if not IsValid(ent) then return end
+            if INITIAL_RECONCILE_ATTEMPTS[ent] ~= attempt then return end
+
+            debugClientEntity("client-init-reconcile", ent, CLIENT_ENTITY_STATE[ent], {
+                reason = reason,
+                attempt = attempt,
+                bootstrapNetworkState = hasBootstrapNetworkState(ent)
+            })
+            reconcileEntity(ent, reason)
+            if hasBootstrapNetworkState(ent)
+                or CLIENT_ENTITY_STATE[ent] ~= nil
+                or attempt >= #INITIAL_RECONCILE_DELAYS then
+                INITIAL_RECONCILE_ATTEMPTS[ent] = nil
+                return
+            end
+
+            INITIAL_RECONCILE_ATTEMPTS[ent] = nil
+            scheduleInitialReconcile(ent, reason, attempt + 1)
+        end)
     end
 
     local function clientPhysicsScratch(ent)
@@ -2083,9 +2147,13 @@ if CLIENT then
     end
 
     local function enableRenderOverride(ent)
-        if ent.RenderOverride == mirrorRenderOverride then return end
+        if ent.RenderOverride == mirrorRenderOverride then
+            ent._magicAlignEntityMirrorRenderOverride = mirrorRenderOverride
+            return
+        end
 
         ent._magicAlignEntityMirrorOldRenderOverride = ent.RenderOverride
+        ent._magicAlignEntityMirrorRenderOverride = mirrorRenderOverride
         ent.RenderOverride = mirrorRenderOverride
     end
 
@@ -2094,6 +2162,7 @@ if CLIENT then
 
         ent.RenderOverride = ent._magicAlignEntityMirrorOldRenderOverride
         ent._magicAlignEntityMirrorOldRenderOverride = nil
+        ent._magicAlignEntityMirrorRenderOverride = nil
     end
 
     local function renderMatrixNeedsSync(ent, axis, currentAxis)
@@ -2180,7 +2249,14 @@ if CLIENT then
 
     local function applyVisualState(ent, desiredVisualAxis, state)
         state.desiredVisualAxis = validAxis(desiredVisualAxis)
-        if visualNeedsSync(ent, state.desiredVisualAxis) then
+        local needsSync = visualNeedsSync(ent, state.desiredVisualAxis)
+        debugClientEntity(needsSync and "client-visual-sync" or "client-visual-stable", ent, state, {
+            desiredVisualAxisNow = EntityMirror.AxisLabel(state.desiredVisualAxis),
+            currentClientAxis = EntityMirror.AxisLabel(ent._magicAlignEntityMirrorAxis),
+            hasRenderMatrix = ent._magicAlignEntityMirrorMatrix ~= nil,
+            renderOverrideActive = ent.RenderOverride == mirrorRenderOverride
+        })
+        if needsSync then
             EntityMirror.ApplyVisual(ent, state.desiredVisualAxis)
         end
     end
@@ -2193,27 +2269,6 @@ if CLIENT then
         return validAxis(prediction.axis)
     end
 
-    local function forceApplyVisualState(ent, reason)
-        if not IsValid(ent) then return false end
-
-        local desiredVisualAxis = desiredAxes(ent)
-        local visualAxis = predictionVisualAxis(ent) or desiredVisualAxis
-        if visualAxis == M.ENTITY_MIRROR_NONE
-            and validAxis(ent._magicAlignEntityMirrorAxis) == M.ENTITY_MIRROR_NONE then
-            return false
-        end
-
-        local state = stateFor(ent)
-        state.currentRevision = ent.GetNWInt and ent:GetNWInt(NW_REVISION, -1) or -1
-        state.desiredVisualAxis = visualAxis
-        EntityMirror.ApplyVisual(ent, visualAxis)
-        debugClientEntity("client-visual-force", ent, state, {
-            reason = reason,
-            visualAxis = EntityMirror.AxisLabel(visualAxis)
-        })
-        return true
-    end
-
     local function sizeHandlerParent(handler)
         if not IsValid(handler) or handler:GetClass() ~= "sizehandler" then return end
         if not isfunction(handler.GetParent) then return end
@@ -2222,16 +2277,44 @@ if CLIENT then
         if IsValid(parent) then return parent end
     end
 
-    local function scheduleSizeHandlerVisualRefresh(handler, reason)
+    local function scheduleSizeHandlerVisualRefresh(handler, reason, attempt)
+        attempt = math.floor(tonumber(attempt) or 1)
+        if attempt < 1 then attempt = 1 end
+
         local parent = sizeHandlerParent(handler)
-        if not IsValid(parent) then return end
+        if not IsValid(parent) then
+            local nextAttempt = attempt + 1
+            if nextAttempt > #INITIAL_RECONCILE_DELAYS then return end
+
+            local queuedAttempt = SIZE_HANDLER_REFRESH_ATTEMPTS[handler]
+            if queuedAttempt and queuedAttempt >= nextAttempt then return end
+
+            SIZE_HANDLER_REFRESH_ATTEMPTS[handler] = nextAttempt
+            timer.Simple(INITIAL_RECONCILE_DELAYS[nextAttempt] or 0, function()
+                if not IsValid(handler) then return end
+                if SIZE_HANDLER_REFRESH_ATTEMPTS[handler] ~= nextAttempt then return end
+
+                SIZE_HANDLER_REFRESH_ATTEMPTS[handler] = nil
+                scheduleSizeHandlerVisualRefresh(handler, reason, nextAttempt)
+            end)
+            return
+        end
+
+        SIZE_HANDLER_REFRESH_ATTEMPTS[handler] = nil
         if parent._magicAlignEntityMirrorVisualRefreshQueued then return end
 
-        local desiredVisualAxis = desiredAxes(parent)
+        local desiredVisualAxis, desiredPhysicsAxis = desiredAxes(parent)
         local predictedAxis = predictionVisualAxis(parent)
+        local state = CLIENT_ENTITY_STATE[parent]
         if validAxis(desiredVisualAxis) == M.ENTITY_MIRROR_NONE
+            and validAxis(desiredPhysicsAxis) == M.ENTITY_MIRROR_NONE
             and validAxis(predictedAxis) == M.ENTITY_MIRROR_NONE
-            and validAxis(parent._magicAlignEntityMirrorAxis) == M.ENTITY_MIRROR_NONE then
+            and validAxis(parent._magicAlignEntityMirrorAxis) == M.ENTITY_MIRROR_NONE
+            and not (state and (
+                state.ownsPhysics == true
+                or state.pendingPhysicsAxis ~= nil
+                or validAxis(state.desiredPhysicsAxis) ~= M.ENTITY_MIRROR_NONE
+            )) then
             return
         end
 
@@ -2240,7 +2323,7 @@ if CLIENT then
             if not IsValid(parent) then return end
 
             parent._magicAlignEntityMirrorVisualRefreshQueued = nil
-            forceApplyVisualState(parent, reason)
+            reconcileEntity(parent, reason)
         end)
     end
 
@@ -2275,6 +2358,25 @@ if CLIENT then
         VISUAL_PREDICTIONS[ent] = nil
     end
 
+    scheduleVisualPredictionExpiry = function(ent, prediction)
+        if not IsValid(ent) or not istable(prediction) then return end
+
+        VISUAL_PREDICTION_TOKEN = VISUAL_PREDICTION_TOKEN + 1
+        local token = VISUAL_PREDICTION_TOKEN
+        prediction.expiryToken = token
+
+        local delay = math.max((tonumber(prediction.expiresAt) or RealTime()) - RealTime(), 0)
+        timer.Simple(delay, function()
+            if VISUAL_PREDICTIONS[ent] ~= prediction or prediction.expiryToken ~= token then return end
+            if not IsValid(ent) then
+                clearVisualPrediction(ent)
+                return
+            end
+
+            reconcileEntity(ent, "prediction_expired")
+        end)
+    end
+
     function EntityMirror.PredictVisual(ent, axis, timeout, commitId)
         if not IsValid(ent) then return false end
 
@@ -2282,12 +2384,13 @@ if CLIENT then
         commitId = normalizedCommitId(commitId)
         clearVisualPrediction(ent)
 
-        VISUAL_PREDICTIONS[ent] = {
+        local prediction = {
             axis = axis,
             commitId = commitId,
             revision = ent.GetNWInt and ent:GetNWInt(NW_REVISION, -1) or -1,
             expiresAt = RealTime() + math.max(tonumber(timeout) or VISUAL_PREDICTION_TIMEOUT, 0.1)
         }
+        VISUAL_PREDICTIONS[ent] = prediction
 
         if commitId then
             local byCommit = VISUAL_PREDICTIONS_BY_COMMIT[commitId]
@@ -2298,6 +2401,7 @@ if CLIENT then
             byCommit[ent] = true
         end
 
+        scheduleVisualPredictionExpiry(ent, prediction)
         EntityMirror.ApplyVisual(ent, axis)
 
         return true
@@ -2319,6 +2423,7 @@ if CLIENT then
                 if accepted then
                     prediction.acknowledged = true
                     prediction.expiresAt = math.max(tonumber(prediction.expiresAt) or 0, now + 1)
+                    scheduleVisualPredictionExpiry(ent, prediction)
                 else
                     clearVisualPrediction(ent)
                     if reconcileEntity then
@@ -2425,6 +2530,7 @@ if CLIENT then
                 clearVisualPrediction(ent)
             elseif serverAdvanced then
                 prediction.expiresAt = math.min(tonumber(prediction.expiresAt) or 0, RealTime() + 0.25)
+                scheduleVisualPredictionExpiry(ent, prediction)
                 visualAxis = predictedAxis
             else
                 visualAxis = predictedAxis
@@ -2445,6 +2551,53 @@ if CLIENT then
         })
     end
 
+    local function maintainActiveVisual(ent)
+        if not IsValid(ent) then
+            ACTIVE_VISUALS[ent] = nil
+            return
+        end
+
+        local desiredVisualAxis = predictionVisualAxis(ent) or desiredAxes(ent)
+        local currentClientAxis = validAxis(ent._magicAlignEntityMirrorAxis)
+        if desiredVisualAxis == M.ENTITY_MIRROR_NONE
+            and currentClientAxis == M.ENTITY_MIRROR_NONE
+            and not VISUAL_PREDICTIONS[ent] then
+            ACTIVE_VISUALS[ent] = nil
+            return
+        end
+
+        if not visualNeedsSync(ent, desiredVisualAxis) then return end
+
+        debugClientEntity("client-active-visual-resync", ent, CLIENT_ENTITY_STATE[ent], {
+            desiredVisualAxisNow = EntityMirror.AxisLabel(desiredVisualAxis),
+            currentClientAxis = EntityMirror.AxisLabel(currentClientAxis),
+            hasRenderMatrix = ent._magicAlignEntityMirrorMatrix ~= nil,
+            renderOverrideActive = ent.RenderOverride == mirrorRenderOverride
+        })
+        EntityMirror.ApplyVisual(ent, desiredVisualAxis)
+    end
+
+    local function queueEntityNetworkInit(ent, reason)
+        if not IsValid(ent) then return end
+
+        if ent:GetClass() == "sizehandler" then
+            scheduleSizeHandlerVisualRefresh(ent, reason)
+            return
+        end
+
+        debugClientEntity("client-init-queued", ent, CLIENT_ENTITY_STATE[ent], {
+            reason = reason,
+            bootstrapNetworkState = hasBootstrapNetworkState(ent)
+        })
+        scheduleInitialReconcile(ent, reason, 1)
+    end
+
+    local function bootstrapKnownEntities(reason)
+        for _, ent in ipairs(ents.GetAll()) do
+            queueEntityNetworkInit(ent, reason)
+        end
+    end
+
     hook.Add("EntityNetworkedVarChanged", "MagicAlignEntityMirrorNetworked", function(ent, name)
         if IsValid(ent) and ent:GetClass() == "sizehandler" then
             scheduleSizeHandlerVisualRefresh(ent, "sizehandler_var")
@@ -2452,19 +2605,64 @@ if CLIENT then
         end
 
         if name ~= NW_AXIS and name ~= NW_FLAGS and name ~= NW_REVISION then return end
+        debugClientEntity("client-network-var", ent, CLIENT_ENTITY_STATE[ent], {
+            networkVar = name,
+            bootstrapNetworkState = hasBootstrapNetworkState(ent)
+        })
         reconcileEntity(ent, "network_var")
+        if hasBootstrapNetworkState(ent) or CLIENT_ENTITY_STATE[ent] ~= nil then
+            INITIAL_RECONCILE_ATTEMPTS[ent] = nil
+        end
     end)
 
     hook.Add("NetworkEntityCreated", "MagicAlignEntityMirrorCreated", function(ent)
-        if IsValid(ent) and ent:GetClass() == "sizehandler" then
-            scheduleSizeHandlerVisualRefresh(ent, "sizehandler_created")
-        end
-
-        reconcileEntity(ent, "created")
+        queueEntityNetworkInit(ent, "created")
     end)
 
-    local nextScan = 0
-    hook.Add("Think", "MagicAlignEntityMirrorVisuals", function()
+    hook.Add("NotifyShouldTransmit", "MagicAlignEntityMirrorTransmit", function(ent, shouldTransmit)
+        if shouldTransmit then
+            queueEntityNetworkInit(ent, "transmit")
+        end
+    end)
+
+    hook.Add("InitPostEntity", "MagicAlignEntityMirrorInitialState", function()
+        bootstrapKnownEntities("init_post_entity")
+    end)
+
+    timer.Simple(0, function()
+        bootstrapKnownEntities("load")
+    end)
+
+    hook.Add("EntityRemoved", "MagicAlignEntityMirrorRemoved", function(ent)
+        INITIAL_RECONCILE_ATTEMPTS[ent] = nil
+        SIZE_HANDLER_REFRESH_ATTEMPTS[ent] = nil
+        ACTIVE_VISUALS[ent] = nil
+        ACTIVE_CLIENT_PHYSICS[ent] = nil
+        CLIENT_ENTITY_STATE[ent] = nil
+        CLIENT_PHYS_SCRATCH[ent] = nil
+        clearVisualPrediction(ent)
+    end)
+
+    hook.Add("Primitive_PostRebuildPhysics", "MagicAlignEntityMirrorClientPrimitivePhysics", function(ent)
+        timer.Simple(0, function()
+            if not IsValid(ent) then return end
+
+            local state = CLIENT_ENTITY_STATE[ent]
+            if not state then return end
+            if state.ownsPhysics ~= true and state.pendingPhysicsAxis == nil then return end
+
+            markPhysicsPending(ent, state, state.desiredPhysicsAxis)
+            reconcileEntity(ent, "primitive_rebuild")
+        end)
+    end)
+
+    hook.Remove("Think", "MagicAlignEntityMirrorVisuals")
+    hook.Remove("Think", "MagicAlignEntityMirrorActivePhysics")
+    hook.Add("Think", "MagicAlignEntityMirrorActiveState", function()
+        for ent in pairs(ACTIVE_VISUALS) do
+            maintainActiveVisual(ent)
+        end
+
         for ent in pairs(ACTIVE_CLIENT_PHYSICS) do
             local state = CLIENT_ENTITY_STATE[ent]
             if not IsValid(ent) or not state then
@@ -2474,29 +2672,15 @@ if CLIENT then
                     markPhysicsPending(ent, state, state.desiredPhysicsAxis)
                 end
 
-                if state.pendingPhysicsAxis ~= nil then
-                    reconcileEntity(ent, "think")
+                if state.ownsPhysics == true
+                    and M.IsPrimitive(ent)
+                    and state.primitiveResult ~= primitiveResult(ent) then
+                    markPhysicsPending(ent, state, state.desiredPhysicsAxis)
                 end
-            end
-        end
 
-        local now = RealTime()
-        if now < nextScan then return end
-        nextScan = now + 0.5
-
-        for _, ent in ipairs(ents.GetAll()) do
-            local state = CLIENT_ENTITY_STATE[ent]
-            if EntityMirror.GetAxis(ent) ~= M.ENTITY_MIRROR_NONE
-                or ACTIVE_VISUALS[ent]
-                or ACTIVE_CLIENT_PHYSICS[ent]
-                or VISUAL_PREDICTIONS[ent]
-                or (state and (
-                    state.ownsPhysics == true
-                    or state.pendingPhysicsAxis ~= nil
-                    or validAxis(state.desiredVisualAxis) ~= M.ENTITY_MIRROR_NONE
-                    or validAxis(state.desiredPhysicsAxis) ~= M.ENTITY_MIRROR_NONE
-                )) then
-                reconcileEntity(ent, "think")
+                if state.pendingPhysicsAxis ~= nil then
+                    reconcileEntity(ent, "active_physics")
+                end
             end
         end
     end)
@@ -2617,16 +2801,40 @@ if CLIENT then
         debugTrace(args)
     end)
 
+    local function debugCommandEntity(args)
+        local entIndex = math.floor(tonumber(args and args[1]) or -1)
+        if entIndex >= 0 then
+            local ent = Entity(entIndex)
+            if IsValid(ent) then return ent end
+        end
+
+        local ply = LocalPlayer()
+        local trace = IsValid(ply) and ply:GetEyeTrace() or nil
+        local ent = trace and trace.Entity or nil
+        if IsValid(ent) then return ent end
+    end
+
     concommand.Remove("magic_align_mirror_debug_ent")
     concommand.Add("magic_align_mirror_debug_ent", function(_, _, args)
-        local entIndex = math.floor(tonumber(args and args[1]) or -1)
-        local ent = entIndex >= 0 and Entity(entIndex) or nil
+        local ent = debugCommandEntity(args)
         if not IsValid(ent) then
-            print("[Magic Align mirror debug] usage: magic_align_mirror_debug_ent <entindex>")
+            print("[Magic Align mirror debug] look at an entity or use: magic_align_mirror_debug_ent <entindex>")
             return
         end
 
         debugClientEntity("client-ent-dump", ent, CLIENT_ENTITY_STATE[ent], nil, true)
+    end)
+
+    concommand.Remove("magic_align_mirror_debug_refresh_ent")
+    concommand.Add("magic_align_mirror_debug_refresh_ent", function(_, _, args)
+        local ent = debugCommandEntity(args)
+        if not IsValid(ent) then
+            print("[Magic Align mirror debug] look at an entity or use: magic_align_mirror_debug_refresh_ent <entindex>")
+            return
+        end
+
+        reconcileEntity(ent, "debug_refresh")
+        debugClientEntity("client-debug-refresh", ent, CLIENT_ENTITY_STATE[ent], nil, true)
     end)
 
     local function mirroredEditor(panel)

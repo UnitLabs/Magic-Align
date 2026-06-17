@@ -23,7 +23,7 @@ worldBSP.PersistentCache = persistent
 local cache = worldBSP.cache or {}
 local internals = worldBSP.cacheInternals or {}
 
-local CACHE_FORMAT_VERSION = 6
+local CACHE_FORMAT_VERSION = 7
 local CACHE_DIR = "magic_align/world_bsp_cache"
 local HEADER_BYTES = 1036
 local REQUIRED_SECTION_COUNT = 5
@@ -57,6 +57,8 @@ local function cacheBinary()
         or not tonumber(binary.preHeaderSize)
         or not tonumber(binary.mainHeaderSize)
         or not tonumber(binary.sectionEntrySize)
+        or not tonumber(binary.geometryFormat)
+        or not tonumber(binary.geometryFormatVersion)
         or not tonumber(binary.surfaceBaseRecordSize)
         or not tonumber(binary.vertexRecordSize)
         or not tonumber(binary.groupRecordSize)
@@ -220,8 +222,8 @@ local function buildPreHeader(binary, mainHeaderUsed, sectionCount, fileSize, bo
     appendUInt32(parts, binary, 0)
     appendUInt32(parts, binary, bodyOffset)
     appendUInt32(parts, binary, bodySize)
-    appendUInt32(parts, binary, binary.coordScale)
-    appendUInt32(parts, binary, binary.axisScale)
+    appendUInt32(parts, binary, binary.geometryFormat)
+    appendUInt32(parts, binary, binary.geometryFormatVersion)
     appendUInt32(parts, binary, internals.cacheVersion)
 
     local header = table.concat(parts)
@@ -251,8 +253,8 @@ local function readPreHeader(binary, data)
     preHeader.flags, offset = binary.readUInt32(data, offset)
     preHeader.bodyOffset, offset = binary.readUInt32(data, offset)
     preHeader.bodySize, offset = binary.readUInt32(data, offset)
-    preHeader.coordScale, offset = binary.readUInt32(data, offset)
-    preHeader.axisScale, offset = binary.readUInt32(data, offset)
+    preHeader.geometryFormat, offset = binary.readUInt32(data, offset)
+    preHeader.geometryFormatVersion, offset = binary.readUInt32(data, offset)
     preHeader.cacheVersion, offset = binary.readUInt32(data, offset)
 
     if not (preHeader.formatVersion
@@ -266,8 +268,8 @@ local function readPreHeader(binary, data)
         and preHeader.flags
         and preHeader.bodyOffset
         and preHeader.bodySize
-        and preHeader.coordScale
-        and preHeader.axisScale
+        and preHeader.geometryFormat
+        and preHeader.geometryFormatVersion
         and preHeader.cacheVersion) then
         return nil, "invalid cache preheader"
     end
@@ -282,8 +284,9 @@ local function readPreHeader(binary, data)
     if preHeader.flags ~= 0 then return nil, "unsupported cache flags" end
     if preHeader.fileSize ~= #data then return nil, "cache file size mismatch" end
     if preHeader.cacheVersion ~= tonumber(internals.cacheVersion) then return nil, "cache version changed" end
-    if preHeader.coordScale ~= binary.coordScale or preHeader.axisScale ~= binary.axisScale then
-        return nil, "surface quantization changed"
+    if preHeader.geometryFormat ~= binary.geometryFormat
+        or preHeader.geometryFormatVersion ~= binary.geometryFormatVersion then
+        return nil, "geometry numeric format changed"
     end
     if preHeader.mainHeaderUsed > preHeader.mainHeaderSize then return nil, "invalid main header size" end
     if preHeader.sectionTableOffset ~= preHeader.preHeaderSize + preHeader.mainHeaderSize + 1 then
@@ -309,8 +312,8 @@ local function readMainHeader(binary, data, preHeader)
     local header = {
         formatVersion = preHeader.formatVersion,
         cacheVersion = preHeader.cacheVersion,
-        coordScale = preHeader.coordScale,
-        axisScale = preHeader.axisScale
+        geometryFormat = preHeader.geometryFormat,
+        geometryFormatVersion = preHeader.geometryFormatVersion
     }
 
     header.surfaceBaseRecordSize, offset = binary.readUInt32(data, offset)
