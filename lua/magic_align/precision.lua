@@ -80,6 +80,7 @@ local function parseTripleString(value)
     return out[1], out[2], out[3]
 end
 
+-- @mcm:8237cffaa03e {"color":"#f5c542","text":"Test"}
 local function VectorP(x, y, z)
     if y == nil and z == nil then
         if isVectorLike(x) then

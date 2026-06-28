@@ -4693,6 +4693,15 @@ local function drawInteractionSurfaceOverlay(tool, state)
     cam.IgnoreZ(false)
     client.HoverRender.drawFaceOutline(state, hoverCandidate)
     client.HoverRender.drawWorldBspBlockers(tool, state)
+    cam.IgnoreZ(false)
+end
+
+local function drawInteractionLateSurfaceGrid(tool, state)
+    if not istable(state) then return end
+
+    local hoverCandidate = state.hover and (state.hover.candidate or state.hover.overlay)
+
+    cam.IgnoreZ(false)
     client.HoverRender.drawGrid(state, hoverCandidate, depthTestedGridOptions)
     cam.IgnoreZ(false)
 end
@@ -4819,5 +4828,6 @@ hook.Add("PostDrawTranslucentRenderables", "magic_align_draw_overlay", function(
     if not tool then return end
     if not client.validateState(tool, state) then return end
 
+    drawInteractionLateSurfaceGrid(tool, state)
     drawInteractionOverlay(tool, state)
 end)

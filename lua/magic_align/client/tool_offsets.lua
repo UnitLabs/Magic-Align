@@ -935,6 +935,7 @@ function client.worldBspCandidateCacheMatches(entry, tr, settings)
         and entry.entityModel == client.worldBspTraceEntityModel(tr.Entity)
         and entry.hitWorld == tr.HitWorld
         and entry.hitSky == tr.HitSky
+        and entry.hitBox == tr.HitBox
         and entry.surfaceProps == tr.SurfaceProps
         and entry.hitTexture == tr.HitTexture
         and entry.matType == tr.MatType
@@ -979,6 +980,7 @@ function client.storeWorldBspCandidateCacheEntry(cache, tr, settings, candidate)
     entry.entityModel = client.worldBspTraceEntityModel(tr.Entity)
     entry.hitWorld = tr.HitWorld
     entry.hitSky = tr.HitSky
+    entry.hitBox = tr.HitBox
     entry.surfaceProps = tr.SurfaceProps
     entry.hitTexture = tr.HitTexture
     entry.matType = tr.MatType
@@ -1011,6 +1013,12 @@ function client.clearWorldBspCandidateCache(cache)
     end
 end
 
+local function worldBspTraceHitsStaticProp(tr)
+    return tr
+        and tr.HitWorld == true
+        and tostring(tr.HitTexture or "") == "**studio**"
+end
+
 local function worldCandidateFromTrace(tr, settings, resultCache, stableCache)
     local worldBSP = client.WorldBSP
     local canUseWorldBsp = settings
@@ -1036,7 +1044,7 @@ local function worldCandidateFromTrace(tr, settings, resultCache, stableCache)
     end
 
     local candidate
-    if canUseWorldBsp then
+    if canUseWorldBsp and not worldBspTraceHitsStaticProp(tr) then
         candidate = worldBSP.candidateFromTrace(tr, settings)
         if candidate then
             client.storeWorldBspCandidateCacheEntry(resultCache, tr, settings, candidate)
@@ -1048,9 +1056,14 @@ local function worldCandidateFromTrace(tr, settings, resultCache, stableCache)
         end
     end
 
-    client.clearWorldBspCandidateCache(stableCache)
     candidate = geometry.traceCandidate(M.WORLD_TARGET, tr)
     client.storeWorldBspCandidateCacheEntry(resultCache, tr, settings, candidate)
+    if stableCacheReady then
+        client.clearWorldBspCandidateCache(stableCache)
+        client.storeWorldBspCandidateCacheEntry(stableCache, tr, settings, candidate)
+    else
+        client.clearWorldBspCandidateCache(stableCache)
+    end
     return candidate
 end
 
